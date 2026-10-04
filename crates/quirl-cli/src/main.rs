@@ -3890,7 +3890,13 @@ impl ExtensionCompleter for LocalAwareCompletionAdapter {
 
     fn complete_explicit(&mut self, line: &str, pos: usize) -> Vec<ExtensionSuggestion> {
         let mut suggestions = self.complete(line, pos);
-        suggestions.extend(self.zsh.complete(line, pos));
+        let zsh = self.zsh.complete(line, pos);
+        if zsh.is_empty() {
+            // Programs without a Zsh function may still complete themselves.
+            suggestions.extend(shell_completion::complete_with_tool(line, pos));
+        } else {
+            suggestions.extend(zsh);
+        }
         suggestions
     }
 }
@@ -3909,7 +3915,13 @@ impl ExtensionCompleter for ExplicitCompletionAdapter {
 
     fn complete_explicit(&mut self, line: &str, pos: usize) -> Vec<ExtensionSuggestion> {
         let mut suggestions = self.complete(line, pos);
-        suggestions.extend(self.zsh.complete(line, pos));
+        let zsh = self.zsh.complete(line, pos);
+        if zsh.is_empty() {
+            // Programs without a Zsh function may still complete themselves.
+            suggestions.extend(shell_completion::complete_with_tool(line, pos));
+        } else {
+            suggestions.extend(zsh);
+        }
         suggestions
     }
 }

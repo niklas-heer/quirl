@@ -2495,6 +2495,8 @@ pub enum SuggestionOrigin {
     Plugin,
     /// The user's installed Zsh completion system, queried live.
     Zsh,
+    /// The command's own completion protocol, such as Cobra's `__complete`.
+    Tool,
 }
 
 /// Stateful extension completion boundary used by Reedline and the rich surface.

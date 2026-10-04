@@ -1742,7 +1742,7 @@ fn merge_extension_items(
     // every file in the directory.
     let zsh_answers = extension
         .iter()
-        .filter(|item| item.origin == SuggestionOrigin::Zsh)
+        .filter(|item| matches!(item.origin, SuggestionOrigin::Zsh | SuggestionOrigin::Tool))
         .collect::<Vec<_>>();
     if !zsh_answers.is_empty() {
         items.retain(|existing| {
@@ -1765,14 +1765,16 @@ fn merge_extension_items(
         }) {
             continue;
         }
-        let kind = if item.origin == SuggestionOrigin::Zsh && item.value.ends_with('/') {
-            CompletionKind::Directory
-        } else {
-            infer_kind(&item.value)
+        let kind = match item.origin {
+            SuggestionOrigin::Zsh | SuggestionOrigin::Tool => {
+                zsh_item_kind(&item.display, &item.value)
+            }
+            SuggestionOrigin::Plugin => infer_kind(&item.value),
         };
         let (source, trust) = match item.origin {
             SuggestionOrigin::Plugin => ("plugin", "trusted"),
             SuggestionOrigin::Zsh => ("zsh", "local"),
+            SuggestionOrigin::Tool => ("tool", "local"),
         };
         let item = CompletionItem {
             value: item.value,
@@ -1918,6 +1920,30 @@ const fn trust_label(trust: Trust) -> &'static str {
         Trust::Imported => "imported",
         Trust::Heuristic => "heuristic",
     }
+}
+
+/// Kind of a live Zsh answer. Zsh reports plain words, so a `/` alone does
+/// not make a path: Git branches such as `feature/login` contain one too. A
+/// candidate is a path only when it names something that exists.
+fn zsh_item_kind(display: &str, value: &str) -> CompletionKind {
+    if value.ends_with('/') {
+        return CompletionKind::Directory;
+    }
+    match infer_kind(value) {
+        CompletionKind::Path if !names_existing_path(display) => CompletionKind::Value,
+        kind => kind,
+    }
+}
+
+fn names_existing_path(candidate: &str) -> bool {
+    let path = match candidate.strip_prefix("~/") {
+        Some(rest) => match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home).join(rest),
+            None => return false,
+        },
+        None => PathBuf::from(candidate),
+    };
+    fs::symlink_metadata(path).is_ok()
 }
 
 fn infer_kind(value: &str) -> CompletionKind {
@@ -2298,6 +2324,21 @@ mod tests {
                 .resource_notice()
                 .is_some_and(|notice| notice.contains("4096 query bytes"))
         );
+    }
+
+    #[test]
+    fn zsh_words_with_slashes_are_paths_only_when_they_exist() {
+        assert_eq!(
+            zsh_item_kind("feature/login-form", "feature/login-form"),
+            CompletionKind::Value
+        );
+        assert_eq!(zsh_item_kind("src/", "src/"), CompletionKind::Directory);
+        let file = std::env::temp_dir().join(format!("quirl-zsh-kind-{}", std::process::id()));
+        fs::write(&file, b"").unwrap();
+        let shown = file.display().to_string();
+        assert_eq!(zsh_item_kind(&shown, &shown), CompletionKind::Path);
+        fs::remove_file(file).unwrap();
+        assert_eq!(zsh_item_kind("--force", "--force"), CompletionKind::Flag);
     }
 
     #[test]

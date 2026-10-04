@@ -222,6 +222,18 @@ impl ArgumentQuery {
         &self,
         candidates: impl Iterator<Item = (String, Option<String>)>,
     ) -> Vec<ExtensionSuggestion> {
+        let detail = format!("Zsh completion for `{}`", self.command);
+        self.suggestions_from(SuggestionOrigin::Zsh, &detail, candidates)
+    }
+
+    /// Turn live candidates from `origin` into escaped suggestions that
+    /// extend the partial word, dropping duplicates and control characters.
+    fn suggestions_from(
+        &self,
+        origin: SuggestionOrigin,
+        detail: &str,
+        candidates: impl Iterator<Item = (String, Option<String>)>,
+    ) -> Vec<ExtensionSuggestion> {
         let mut suggestions = Vec::new();
         for (candidate, description) in candidates {
             // A bare suffix such as `=` (an assignment with no name) is an
@@ -253,10 +265,10 @@ impl ArgumentQuery {
                 display: candidate,
                 value,
                 summary: description.unwrap_or_default(),
-                detail: format!("Zsh completion for `{}`", self.command),
+                detail: detail.to_owned(),
                 replace_start: self.replace_start,
                 replace_end: self.replace_end,
-                origin: SuggestionOrigin::Zsh,
+                origin,
             });
         }
         suggestions
@@ -357,6 +369,135 @@ fn segment_words(before: &str) -> Option<(Vec<Word>, Option<Word>)> {
         }
     }
     Some((words, current))
+}
+
+/// Programs known to implement Cobra's `__complete` protocol. Asking any
+/// other program would pass `__complete` to it as an ordinary argument, so
+/// only these are ever queried.
+const COBRA_PROGRAMS: &[&str] = &[
+    "argocd",
+    "cosign",
+    "crane",
+    "docker",
+    "doctl",
+    "eksctl",
+    "flux",
+    "gh",
+    "glab",
+    "helm",
+    "hugo",
+    "istioctl",
+    "k3d",
+    "kind",
+    "kubectl",
+    "kustomize",
+    "linkerd",
+    "minikube",
+    "ollama",
+    "podman",
+    "skaffold",
+    "talosctl",
+    "tilt",
+    "velero",
+];
+/// Wall-time budget for one `__complete` request.
+const TOOL_COMPLETION_DEADLINE: Duration = Duration::from_millis(1_500);
+/// Largest `__complete` response retained.
+const TOOL_OUTPUT_BYTES_MAX: usize = 256 * 1024;
+/// Environment switch: `off`, `0`, `false`, or `no` disables tool queries.
+const TOOL_COMPLETION_VARIABLE: &str = "QUIRL_TOOL_COMPLETION";
+/// Cobra directive bit reporting that completion failed.
+const COBRA_DIRECTIVE_ERROR: u32 = 1;
+
+/// Ask a Cobra-based program such as `docker` or `kubectl` to complete its
+/// own arguments through `program __complete ARGS... PARTIAL`.
+///
+/// This runs only for an explicit Tab, only for [`COBRA_PROGRAMS`], with a
+/// contained process group, a deadline, and an output bound. Any failure
+/// yields no suggestions, leaving the other sources to answer.
+pub(crate) fn complete_with_tool(line: &str, cursor: usize) -> Vec<ExtensionSuggestion> {
+    if live_zsh_disabled(env::var_os(TOOL_COMPLETION_VARIABLE).as_deref()) {
+        return Vec::new();
+    }
+    let Some(query) = ArgumentQuery::parse(line, cursor) else {
+        return Vec::new();
+    };
+    if !COBRA_PROGRAMS.contains(&query.command.as_str()) {
+        return Vec::new();
+    }
+    let Some(program) = find_on_path(&query.command) else {
+        return Vec::new();
+    };
+    let mut command = std::process::Command::new(program);
+    command.arg("__complete").args(&query.arguments);
+    let Some(output) = run_bounded(&mut command) else {
+        return Vec::new();
+    };
+    let Some(candidates) = parse_cobra_output(&output) else {
+        return Vec::new();
+    };
+    let detail = format!("Completion from `{} __complete`", query.command);
+    query.suggestions_from(SuggestionOrigin::Tool, &detail, candidates.into_iter())
+}
+
+/// Parse `value<TAB>description` lines ending in a `:directive` line.
+/// Returns `None` when the program reported an error or the output is
+/// malformed.
+fn parse_cobra_output(output: &[u8]) -> Option<Vec<(String, Option<String>)>> {
+    let text = std::str::from_utf8(output).ok()?;
+    let mut lines = text.lines().collect::<Vec<_>>();
+    let directive = lines.pop()?.strip_prefix(':')?.trim().parse::<u32>().ok()?;
+    if directive & COBRA_DIRECTIVE_ERROR != 0 {
+        return None;
+    }
+    Some(
+        lines
+            .into_iter()
+            .filter(|line| !line.is_empty() && !line.starts_with("_activeHelp_"))
+            .map(|line| match line.split_once('\t') {
+                Some((value, description)) => (
+                    value.to_owned(),
+                    Some(description.to_owned()).filter(|text| !text.is_empty()),
+                ),
+                None => (line.to_owned(), None),
+            })
+            .collect(),
+    )
+}
+
+/// Run `command` with null stdin and discarded stderr, returning its stdout
+/// if it exits successfully within the deadline and output bound.
+fn run_bounded(command: &mut std::process::Command) -> Option<Vec<u8>> {
+    use std::io::Read;
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = quirl_process::ContainedChild::spawn(command).ok()?;
+    let stdout = child.child_mut().stdout.take()?;
+    // The reader ends when the contained process group exits or is killed,
+    // because every holder of the pipe belongs to that group.
+    let reader = std::thread::spawn(move || {
+        let limit = u64::try_from(TOOL_OUTPUT_BYTES_MAX.saturating_add(1)).unwrap_or(u64::MAX);
+        let mut bytes = Vec::new();
+        stdout.take(limit).read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < TOOL_COMPLETION_DEADLINE => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            _ => {
+                drop(child);
+                let _ = reader.join();
+                return None;
+            }
+        }
+    };
+    let bytes = reader.join().ok()?.ok()?;
+    (status.success() && bytes.len() <= TOOL_OUTPUT_BYTES_MAX).then_some(bytes)
 }
 
 fn live_zsh_disabled(value: Option<&std::ffi::OsStr>) -> bool {
@@ -491,6 +632,34 @@ mod tests {
         assert!(ArgumentQuery::parse("cat \"my", 7).is_none());
         assert!(ArgumentQuery::parse("quirl pl", 8).is_none());
         assert!(ArgumentQuery::parse("./run.sh ar", 11).is_none());
+    }
+
+    #[test]
+    fn cobra_output_parses_candidates_descriptions_and_directive() {
+        let parsed = parse_cobra_output(
+            b"attach\tAttach to a running container\nbuild\n_activeHelp_ hint\n:4\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                (
+                    "attach".to_owned(),
+                    Some("Attach to a running container".to_owned())
+                ),
+                ("build".to_owned(), None),
+            ]
+        );
+        assert_eq!(parse_cobra_output(b"anything\n:1\n"), None);
+        assert_eq!(parse_cobra_output(b"no directive\n"), None);
+        assert_eq!(parse_cobra_output(b":0\n"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn only_known_cobra_programs_are_ever_asked() {
+        // `ls __complete` would list a file named `__complete`.
+        assert!(complete_with_tool("ls ", 3).is_empty());
+        assert!(COBRA_PROGRAMS.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[test]

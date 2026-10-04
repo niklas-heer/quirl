@@ -3427,15 +3427,60 @@ fn default_bash_roots() -> Vec<PathBuf> {
     ]
 }
 
+/// Toolchains inspected for rustup's `_cargo` and `_rustup` functions.
+const RUSTUP_TOOLCHAINS_MAX: usize = 32;
+
 pub(crate) fn default_zsh_roots() -> Vec<PathBuf> {
     if let Some(roots) = configured_completion_roots("QUIRL_ZSH_PATH") {
         return roots;
     }
-    vec![
+    let mut roots = vec![
         PathBuf::from("/usr/share/zsh/site-functions"),
+        // Debian and Ubuntu packages install their functions here.
+        PathBuf::from("/usr/share/zsh/vendor-completions"),
         PathBuf::from("/usr/local/share/zsh/site-functions"),
         PathBuf::from("/opt/homebrew/share/zsh/site-functions"),
-    ]
+        PathBuf::from("/run/current-system/sw/share/zsh/site-functions"),
+    ];
+    let home = env::var_os("HOME").map(PathBuf::from);
+    if let Some(home) = &home {
+        // Per-user directories that Zsh setups conventionally add to fpath.
+        roots.push(home.join(".nix-profile/share/zsh/site-functions"));
+        roots.push(home.join(".zfunc"));
+        roots.push(home.join(".zsh/completions"));
+        roots.push(home.join(".zsh/completion"));
+    }
+    match env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
+        Some(data) => roots.push(data.join("zsh/site-functions")),
+        None => {
+            if let Some(home) = &home {
+                roots.push(home.join(".local/share/zsh/site-functions"));
+            }
+        }
+    }
+    // rustup ships `_cargo` with each toolchain rather than on fpath.
+    let rustup_home = env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|home| home.join(".rustup")));
+    if let Some(rustup_home) = rustup_home {
+        roots.extend(rustup_completion_roots(&rustup_home.join("toolchains")));
+    }
+    roots
+}
+
+/// The first toolchain, in name order, that ships Zsh functions. One is
+/// enough: every toolchain carries the same `_cargo` and `_rustup`.
+fn rustup_completion_roots(toolchains: &Path) -> Option<PathBuf> {
+    let mut names = fs::read_dir(toolchains)
+        .ok()?
+        .take(RUSTUP_TOOLCHAINS_MAX)
+        .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| toolchains.join(name).join("share/zsh/site-functions"))
+        .find(|root| root.is_dir())
 }
 
 fn configured_completion_roots(variable: &str) -> Option<Vec<PathBuf>> {

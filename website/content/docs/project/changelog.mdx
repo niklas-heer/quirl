@@ -44,8 +44,19 @@ which versions are published.
 - `where` accepts size literals: `ls | where size > 10kB`. Decimal (`kB`, `MB`)
   and binary (`KiB`, `MiB`) units are understood.
 
+- Tab completes `docker`, `kubectl`, `gh`, `helm`, `podman`, and other
+  Cobra-based tools by asking the program itself (`PROGRAM __complete`) when
+  Zsh has no function for it. Only a fixed list of known Cobra programs is
+  asked, within 1.5 seconds; set `QUIRL_TOOL_COMPLETION=off` to disable it.
+- Live Zsh completion finds more completion functions: rustup's `_cargo`
+  (`cargo b` offers `build` and `bench`), Debian's `vendor-completions`, Nix
+  profiles, and the per-user `~/.zfunc`, `~/.zsh/completions`, and
+  `~/.local/share/zsh/site-functions` directories.
+
 ### Changed
 
+- Git branches and other Zsh answers that contain `/` no longer show a
+  folder icon unless they name an existing path.
 - Comparing values of different kinds explains itself, such as "cannot
   compare a size with a string", and suggests writing `10kB` without quotes.
 - A lone size or time, such as the result of `math sum` over file sizes,

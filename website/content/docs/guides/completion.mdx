@@ -81,22 +81,41 @@ The request is deliberately contained:
   cleared environment, except `PATH`, `HOME`, `USER`, and `LOGNAME`.
 - Each request is bounded to 1.5 seconds and 1,024 candidates, and its whole
   process group is cleaned up afterwards.
-- Zsh's bundled completion functions take precedence. Site directories such as
-  Homebrew's `share/zsh/site-functions` add functions for commands Zsh does
-  not ship. Set `QUIRL_ZSH_PATH` to a `:`-separated list to replace the site
-  directories, for example to include a plugin manager's completion folder.
+- Zsh's bundled completion functions take precedence. Site directories add
+  functions for commands Zsh does not ship: the system, Debian
+  `vendor-completions`, Homebrew, and Nix `share/zsh/site-functions`
+  directories, the per-user `~/.zfunc`, `~/.zsh/completions`, and
+  `~/.local/share/zsh/site-functions`, and rustup's toolchain folder, which
+  carries `_cargo`. Set `QUIRL_ZSH_PATH` to a `:`-separated list to replace
+  the site directories, for example to include a plugin manager's folder.
 - Without Zsh, or for a command with no Zsh completion function, the other
   sources still answer on their own.
 - Set `QUIRL_ZSH_COMPLETION=off` before starting Quirl to disable live Zsh
   completion for the session.
 
 Results keep Zsh's display order: each group is sorted, unless Zsh added it
-unsorted on purpose, such as recent commits after branch names.
+unsorted on purpose, such as recent commits after branch names. A candidate
+containing `/`, such as the branch `feature/login`, is shown as a path only
+when it names an existing file or directory.
+
+### The command's own completion
+
+Many modern tools, including `docker`, `kubectl`, `gh`, `helm`, and `podman`,
+are built on [Cobra](https://cobra.dev/) and complete their own arguments
+through `PROGRAM __complete ARGS...`. When Zsh has no function for such a
+command, an explicit Tab asks the program itself, so `docker im` offers
+`image` and `images` with their descriptions.
+
+Only a fixed list of known Cobra programs is asked, because any other program
+would receive `__complete` as an ordinary argument. Each request runs only on
+Tab, in its own contained process group, within 1.5 seconds and 256 KiB of
+output; any failure simply contributes nothing. Set
+`QUIRL_TOOL_COMPLETION=off` before starting Quirl to disable these requests.
 
 ## Checking completion from a script
 
-`quirl complete` prints the candidates the catalog, plugins, and live Zsh
-return for a partial command line:
+`quirl complete` prints the candidates an explicit Tab offers for a partial
+command line, from the same engine and every source:
 
 ```console
 $ quirl complete "git checkout f"
