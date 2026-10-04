@@ -168,6 +168,9 @@ pub(super) fn data_value_from_syntax(
                         usage.observe_text(value.len(), limits)?;
                         output.push(DataValue::Decimal(value.clone()));
                     }
+                    SyntaxLiteralKind::Size(bytes) => {
+                        output.push(DataValue::Size { bytes: *bytes })
+                    }
                     SyntaxLiteralKind::String(value) => {
                         usage.observe_text(value.len(), limits)?;
                         output.push(DataValue::String(value.clone()));

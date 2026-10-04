@@ -32,8 +32,19 @@ which versions are published.
   one command, `export NAME` exports an existing variable, and `unset NAME`
   removes one.
 
+- Data mode speaks more of Nushell's vocabulary: `sort-by <field> [-r]`,
+  `first <n>`, `last [n]`, `skip <n>`, `reverse`, `reject <field>...`, `uniq`,
+  `group-by <field>`, `columns`, and `math sum|min|max|avg`. `math` adds
+  exactly, without floating-point rounding, and sizes keep their unit.
+- `where` accepts size literals: `ls | where size > 10kB`. Decimal (`kB`, `MB`)
+  and binary (`KiB`, `MiB`) units are understood.
+
 ### Changed
 
+- Comparing values of different kinds explains itself, such as "cannot
+  compare a size with a string", and suggests writing `10kB` without quotes.
+- A lone size or time, such as the result of `math sum` over file sizes,
+  prints like its table cell (`213.1 kB`) instead of raw bytes.
 - A script piped into a bare `quirl` now runs as POSIX shell code through
   `/bin/sh -s`, as with any shell. It used to run as Lua; use
   `quirl run --lang lua -` for that.

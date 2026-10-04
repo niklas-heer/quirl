@@ -134,8 +134,42 @@ pub enum DataSource {
 pub enum DataTransform {
     /// Count a supported value or stream.
     Length,
-    /// Select the first list or stream item.
-    First,
+    /// Select the first item, or with a count the first `count` items.
+    First {
+        /// Items to keep; `None` selects one item as an Option.
+        count: Option<Spanned<u64>>,
+    },
+    /// Select the last item, or with a count the last `count` items.
+    Last {
+        /// Items to keep; `None` selects one item as an Option.
+        count: Option<Spanned<u64>>,
+    },
+    /// Drop the first `count` items.
+    Skip {
+        /// Number of leading items dropped.
+        count: Spanned<u64>,
+    },
+    /// Reverse item order.
+    Reverse,
+    /// Remove named record fields.
+    Reject {
+        /// Non-empty bounded field names to remove.
+        fields: Vec<Spanned<String>>,
+    },
+    /// Keep the first occurrence of each distinct item.
+    Uniq,
+    /// Group records into a record keyed by a field's rendered value.
+    GroupBy {
+        /// Dotted field path whose value names each group.
+        field: Spanned<String>,
+    },
+    /// List the field names of a record or of record rows.
+    Columns,
+    /// Reduce a list of numbers, sizes, or durations.
+    Math {
+        /// Requested reduction.
+        operation: Spanned<MathOperation>,
+    },
     /// Select one dotted record path.
     Get {
         /// Dotted field path selected from a record or record stream.
@@ -166,6 +200,31 @@ pub enum DataTransform {
     FromJson,
     /// Serialize an explicit value-to-string JSON bridge.
     ToJson,
+}
+
+/// Reduction applied by `math`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MathOperation {
+    /// Exact total.
+    Sum,
+    /// Smallest item.
+    Min,
+    /// Largest item.
+    Max,
+    /// Arithmetic mean.
+    Avg,
+}
+
+impl MathOperation {
+    /// Source spelling of the operation.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Sum => "sum",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Avg => "avg",
+        }
+    }
 }
 
 /// Direction of a focused record sort.
@@ -245,6 +304,8 @@ pub enum SyntaxLiteralKind {
     UInt(u64),
     /// JSON decimal source text retained without binary conversion.
     Decimal(String),
+    /// Byte size written with a unit, such as `10kB` or `1.5MiB`.
+    Size(u64),
     /// Decoded UTF-8 JSON string.
     String(String),
     /// Ordered structured sequence.
@@ -287,6 +348,7 @@ impl SyntaxLiteral {
                         serde_json::from_str::<Number>(value)
                             .map_or_else(|_| Value::String(value.clone()), Value::Number),
                     ),
+                    SyntaxLiteralKind::Size(bytes) => output.push(Value::from(*bytes)),
                     SyntaxLiteralKind::String(value) => output.push(Value::String(value.clone())),
                     SyntaxLiteralKind::List(values) => {
                         work.push(Work::FinishList(values.len()));
@@ -327,6 +389,7 @@ impl SyntaxLiteral {
             SyntaxLiteralKind::Int(_) => DataType::Int,
             SyntaxLiteralKind::UInt(_) => DataType::UInt,
             SyntaxLiteralKind::Decimal(_) => DataType::Decimal,
+            SyntaxLiteralKind::Size(_) => DataType::Size,
             SyntaxLiteralKind::String(_) => DataType::String,
             SyntaxLiteralKind::List(values) => {
                 let mut values = values.iter();
@@ -988,7 +1051,88 @@ fn parse_transform(
     let command = token_text(source, command_token);
     let value = match command {
         "length" if tokens.len() == 1 => DataTransform::Length,
-        "first" if tokens.len() == 1 => DataTransform::First,
+        "first" if matches!(tokens.len(), 1 | 2) => DataTransform::First {
+            count: optional_count(source, tokens, "first")?,
+        },
+        "last" if matches!(tokens.len(), 1 | 2) => DataTransform::Last {
+            count: optional_count(source, tokens, "last")?,
+        },
+        "skip" if tokens.len() == 2 => DataTransform::Skip {
+            count: required_count(source, tokens, "skip")?,
+        },
+        "reverse" if tokens.len() == 1 => DataTransform::Reverse,
+        "uniq" if tokens.len() == 1 => DataTransform::Uniq,
+        "columns" if tokens.len() == 1 => DataTransform::Columns,
+        "reject" if tokens.len() >= 2 => {
+            let field_count = tokens.len().saturating_sub(1);
+            check_field_count(field_count, limits, span.clone())?;
+            DataTransform::Reject {
+                fields: tokens
+                    .get(1..)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|token| decode_bare_name(source, token, "reject field"))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }
+        }
+        "group-by" if tokens.len() == 2 => DataTransform::GroupBy {
+            field: decode_bare_name(
+                source,
+                tokens.get(1).ok_or_else(|| {
+                    usage_error(
+                        span.clone(),
+                        "group-by requires a field",
+                        "Use `group-by <field>`",
+                    )
+                })?,
+                "group-by field path",
+            )?,
+        },
+        "math" if tokens.len() == 2 => {
+            let token = tokens.get(1).ok_or_else(|| {
+                usage_error(span.clone(), "math requires an operation", MATH_USAGE)
+            })?;
+            let operation = match token_text(source, token) {
+                "sum" => MathOperation::Sum,
+                "min" => MathOperation::Min,
+                "max" => MathOperation::Max,
+                "avg" => MathOperation::Avg,
+                _ => {
+                    return Err(usage_error(
+                        token.span.clone(),
+                        "unknown math operation",
+                        MATH_USAGE,
+                    ));
+                }
+            };
+            DataTransform::Math {
+                operation: Spanned {
+                    value: operation,
+                    span: token.span.clone(),
+                },
+            }
+        }
+        "sort-by" if matches!(tokens.len(), 2 | 3) => {
+            let field_token = tokens.get(1).ok_or_else(|| {
+                usage_error(span.clone(), "sort-by requires a field path", SORT_BY_USAGE)
+            })?;
+            let field = decode_bare_name(source, field_token, "sort-by field path")?;
+            let direction = match tokens.get(2).map(|token| token_text(source, token)) {
+                None => SortDirection::Ascending,
+                Some("-r" | "--reverse") => SortDirection::Descending,
+                Some(_) => {
+                    let flag_span = tokens
+                        .get(2)
+                        .map_or_else(|| span.clone(), |token| token.span.clone());
+                    return Err(usage_error(
+                        flag_span,
+                        "sort-by accepts only `-r` or `--reverse`",
+                        SORT_BY_USAGE,
+                    ));
+                }
+            };
+            DataTransform::Sort { field, direction }
+        }
         "lines" if tokens.len() == 1 => DataTransform::Lines,
         "get" if tokens.len() == 2 => DataTransform::Get {
             path: decode_bare_name(
@@ -1090,7 +1234,24 @@ fn parse_transform(
         known
             if matches!(
                 known,
-                "length" | "first" | "lines" | "get" | "select" | "sort" | "take" | "from" | "to"
+                "length"
+                    | "first"
+                    | "last"
+                    | "skip"
+                    | "reverse"
+                    | "uniq"
+                    | "columns"
+                    | "reject"
+                    | "group-by"
+                    | "math"
+                    | "sort-by"
+                    | "lines"
+                    | "get"
+                    | "select"
+                    | "sort"
+                    | "take"
+                    | "from"
+                    | "to"
             ) =>
         {
             return Err(usage_error(
@@ -1104,14 +1265,23 @@ fn parse_transform(
                     "from" => "Use `from json` to parse a JSON string value",
                     "to" => "Use `to json` to serialize a typed value",
                     "length" => "Use `length` without arguments",
-                    "first" => "Use `first` without arguments",
+                    "first" => "Use `first` or `first <count>`",
+                    "last" => "Use `last` or `last <count>`",
+                    "skip" => "Use `skip <count>` with a non-negative integer",
+                    "reverse" => "Use `reverse` without arguments",
+                    "uniq" => "Use `uniq` without arguments",
+                    "columns" => "Use `columns` without arguments",
+                    "reject" => "Use `reject <field> [<field> ...]`",
+                    "group-by" => "Use `group-by <field>`",
+                    "math" => MATH_USAGE,
+                    "sort-by" => SORT_BY_USAGE,
                     "lines" => "Use `lines` without arguments",
                     _ => "Check the data transform syntax in `help data`",
                 },
             ));
         }
         _ => {
-            let default_help = "use `get`, `where`, `select`, `sort`, `take`, `first`, `length`, `lines`, `from json`, or `to json`";
+            let default_help = "use `get`, `where`, `select`, `reject`, `sort-by`, `first`, `last`, `skip`, `take`, `reverse`, `uniq`, `group-by`, `columns`, `math`, `length`, `lines`, `from json`, or `to json`";
             let help = match nearest_transform_keyword(command) {
                 Some(suggestion) => {
                     format!("Did you mean `{suggestion}`? Otherwise {default_help}")
@@ -1133,9 +1303,52 @@ fn parse_transform(
 
 /// Every top-level data transform keyword, used only to suggest a fix for a
 /// misspelled transform name; it is not the grammar's source of truth.
-const TRANSFORM_KEYWORDS: [&str; 10] = [
-    "get", "where", "select", "sort", "take", "first", "length", "lines", "from", "to",
+const TRANSFORM_KEYWORDS: [&str; 19] = [
+    "get", "where", "select", "sort", "take", "first", "length", "lines", "from", "to", "last",
+    "skip", "reverse", "uniq", "columns", "reject", "group-by", "math", "sort-by",
 ];
+
+const MATH_USAGE: &str = "Use `math sum`, `math min`, `math max`, or `math avg`";
+const SORT_BY_USAGE: &str = "Use `sort-by <field.path> [-r]`";
+
+/// Parse the optional count of `first` or `last`.
+fn optional_count(
+    source: &str,
+    tokens: &[Token],
+    stage: &str,
+) -> Result<Option<Spanned<u64>>, DataSyntaxDiagnostic> {
+    if tokens.len() < 2 {
+        return Ok(None);
+    }
+    required_count(source, tokens, stage).map(Some)
+}
+
+/// Parse the count operand of `skip`, `first <count>`, or `last <count>`.
+fn required_count(
+    source: &str,
+    tokens: &[Token],
+    stage: &str,
+) -> Result<Spanned<u64>, DataSyntaxDiagnostic> {
+    let span = token_range(tokens);
+    let token = tokens.get(1).ok_or_else(|| {
+        usage_error(
+            span,
+            format!("{stage} requires a count"),
+            format!("Use `{stage} <count>`"),
+        )
+    })?;
+    let value = token_text(source, token).parse::<u64>().map_err(|_| {
+        usage_error(
+            token.span.clone(),
+            format!("{stage} count must be a non-negative integer"),
+            format!("Use `{stage} <count>`"),
+        )
+    })?;
+    Ok(Spanned {
+        value,
+        span: token.span.clone(),
+    })
+}
 
 /// Return the closest transform keyword to `command` by edit distance, when
 /// one is close enough to plausibly be a typo (at most 2 edits, and no more
@@ -1634,6 +1847,9 @@ fn parse_literal(
 }
 
 fn parse_number(text: &str) -> Option<SyntaxLiteralKind> {
+    if let Some(bytes) = parse_size(text) {
+        return Some(SyntaxLiteralKind::Size(bytes));
+    }
     if let Ok(value) = text.parse::<i64>() {
         return Some(SyntaxLiteralKind::Int(value));
     }
@@ -1643,6 +1859,56 @@ fn parse_number(text: &str) -> Option<SyntaxLiteralKind> {
     serde_json::from_str::<Number>(text)
         .ok()
         .map(|_| SyntaxLiteralKind::Decimal(text.to_owned()))
+}
+
+/// Units accepted after a number in a size literal, case-insensitively.
+/// Decimal units count in thousands and binary `i` units in 1024s, as in
+/// the size column of `ls`.
+const SIZE_UNITS: [(&str, u64); 11] = [
+    ("b", 1),
+    ("kb", 1_000),
+    ("mb", 1_000_000),
+    ("gb", 1_000_000_000),
+    ("tb", 1_000_000_000_000),
+    ("pb", 1_000_000_000_000_000),
+    ("kib", 1 << 10),
+    ("mib", 1 << 20),
+    ("gib", 1 << 30),
+    ("tib", 1 << 40),
+    ("pib", 1 << 50),
+];
+
+/// Parse `10kB`, `1.5MiB`, or `512b` into bytes, rounding a fractional
+/// result to the nearest byte. Returns `None` for anything else, including
+/// sizes beyond the 64-bit range.
+fn parse_size(text: &str) -> Option<u64> {
+    let split = text.find(|character: char| character.is_ascii_alphabetic())?;
+    let (number, unit) = text.split_at(split);
+    let unit = unit.to_ascii_lowercase();
+    let multiplier = SIZE_UNITS
+        .iter()
+        .find_map(|(name, multiplier)| (*name == unit).then_some(*multiplier))?;
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    let digits_only = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
+    if whole.is_empty() || !digits_only(whole) || !digits_only(fraction) || fraction.len() > 18 {
+        return None;
+    }
+    let whole = whole.parse::<u128>().ok()?;
+    let scale = 10_u128.checked_pow(u32::try_from(fraction.len()).ok()?)?;
+    let fraction = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<u128>().ok()?
+    };
+    let multiplier = u128::from(multiplier);
+    let scaled = whole
+        .checked_mul(scale)?
+        .checked_add(fraction)?
+        .checked_mul(multiplier)?;
+    let bytes = scaled
+        .checked_add(scale.checked_div(2)?)?
+        .checked_div(scale)?;
+    u64::try_from(bytes).ok()
 }
 
 fn comparison_operator(token: &Token) -> Result<ComparisonOperator, DataSyntaxDiagnostic> {
@@ -1900,7 +2166,24 @@ fn format_source(source: &DataSource) -> String {
 fn format_transform(transform: &DataTransform) -> String {
     match transform {
         DataTransform::Length => "length".to_owned(),
-        DataTransform::First => "first".to_owned(),
+        DataTransform::First { count: None } => "first".to_owned(),
+        DataTransform::First { count: Some(count) } => format!("first {}", count.value),
+        DataTransform::Last { count: None } => "last".to_owned(),
+        DataTransform::Last { count: Some(count) } => format!("last {}", count.value),
+        DataTransform::Skip { count } => format!("skip {}", count.value),
+        DataTransform::Reverse => "reverse".to_owned(),
+        DataTransform::Uniq => "uniq".to_owned(),
+        DataTransform::Columns => "columns".to_owned(),
+        DataTransform::Reject { fields } => format!(
+            "reject {}",
+            fields
+                .iter()
+                .map(|field| field.value.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+        DataTransform::GroupBy { field } => format!("group-by {}", field.value),
+        DataTransform::Math { operation } => format!("math {}", operation.value.name()),
         DataTransform::Get { path } => format!("get {}", path.value),
         DataTransform::Where(predicate) => {
             let mut output = String::from("where ");
@@ -1958,6 +2241,7 @@ fn format_literal(literal: &SyntaxLiteral) -> String {
         SyntaxLiteralKind::Int(value) => value.to_string(),
         SyntaxLiteralKind::UInt(value) => value.to_string(),
         SyntaxLiteralKind::Decimal(value) => value.clone(),
+        SyntaxLiteralKind::Size(bytes) => format!("{bytes}b"),
         SyntaxLiteralKind::String(value) => json_string(value),
         SyntaxLiteralKind::List(values) => format!(
             "[{}]",
@@ -2012,7 +2296,16 @@ fn is_keyword(value: &str) -> bool {
             | "where"
             | "select"
             | "sort"
+            | "sort-by"
             | "take"
+            | "last"
+            | "skip"
+            | "reverse"
+            | "uniq"
+            | "columns"
+            | "reject"
+            | "group-by"
+            | "math"
             | "lines"
             | "from"
             | "to"
@@ -2134,6 +2427,23 @@ mod tests {
     }
 
     #[test]
+    fn size_literals_use_decimal_and_binary_units() {
+        assert_eq!(parse_size("10kB"), Some(10_000));
+        assert_eq!(parse_size("10KB"), Some(10_000));
+        assert_eq!(parse_size("1.5MiB"), Some(1_572_864));
+        assert_eq!(parse_size("512b"), Some(512));
+        assert_eq!(parse_size("0.0005kB"), Some(1));
+        assert_eq!(parse_size("10"), None);
+        assert_eq!(parse_size("kB"), None);
+        assert_eq!(parse_size("1e3kB"), None);
+        assert_eq!(parse_size("20000PB"), None);
+        assert_eq!(
+            parse_number("2GB"),
+            Some(SyntaxLiteralKind::Size(2_000_000_000))
+        );
+    }
+
+    #[test]
     fn malformed_transform_arguments_offer_the_exact_recovery_syntax() {
         for (stage, usage) in [
             ("get", "get <field.path>"),
@@ -2143,13 +2453,36 @@ mod tests {
             ("from", "from json"),
             ("to", "to json"),
             ("length extra", "length` without arguments"),
-            ("first extra", "first` without arguments"),
             ("lines extra", "lines` without arguments"),
+            ("skip", "skip <count>"),
+            ("group-by", "group-by <field>"),
+            ("math", "math sum"),
+            ("reject", "reject <field>"),
+            ("sort-by", "sort-by <field.path> [-r]"),
         ] {
             let source = format!("[] | {stage}");
             let error = parse(&source).unwrap_err();
             assert!(error.help.contains(usage), "{stage}: {}", error.help);
             assert_eq!(source.get(error.start..error.end), Some(stage));
+        }
+        // A non-numeric count points at the count itself.
+        for (stage, operand, usage) in [
+            ("first", "extra", "first <count>"),
+            ("last", "-1", "last <count>"),
+            ("skip", "x", "skip <count>"),
+        ] {
+            let source = format!("[] | {stage} {operand}");
+            let error = parse(&source).unwrap_err();
+            assert!(error.help.contains(usage), "{stage}: {}", error.help);
+            assert_eq!(source.get(error.start..error.end), Some(operand));
+        }
+        for (source, operand) in [("[] | math median", "median"), ("[] | sort-by a -x", "-x")] {
+            let error = parse(source).unwrap_err();
+            assert_eq!(
+                source.get(error.start..error.end),
+                Some(operand),
+                "{source}"
+            );
         }
         let error = parse("[] | help").unwrap_err();
         assert!(error.help.starts_with("Use `get`"));

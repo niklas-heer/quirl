@@ -13,6 +13,7 @@
     )
 )]
 
+mod math;
 pub mod syntax;
 mod value_boundary;
 
@@ -484,6 +485,25 @@ impl DataStream {
                     remaining = remaining.saturating_sub(1);
                 }
                 Ok(value)
+            },
+            limits,
+        )
+    }
+
+    fn skip(self, count: usize) -> Self {
+        let limits = self.limits();
+        let mut source = self;
+        let mut remaining = count;
+        Self::from_pull(
+            move |cancelled| {
+                while remaining > 0 {
+                    check_cancelled(cancelled)?;
+                    if source.next(cancelled)?.is_none() {
+                        return Ok(None);
+                    }
+                    remaining = remaining.saturating_sub(1);
+                }
+                source.next(cancelled)
             },
             limits,
         )
@@ -1164,7 +1184,7 @@ fn apply_output_transform(
                     &value, "to json", limits,
                 )?)));
             }
-            DataTransform::First => {
+            DataTransform::First { count: None } => {
                 let DataValue::List(values) = value else {
                     return Err(data_error("first", "first expects a list or stream"));
                 };
@@ -1172,6 +1192,18 @@ fn apply_output_transform(
                     values
                         .into_iter()
                         .next()
+                        .map(DataOutput::Value)
+                        .map(Box::new),
+                ));
+            }
+            DataTransform::Last { count: None } => {
+                let DataValue::List(values) = value else {
+                    return Err(data_error("last", "last expects a list or stream"));
+                };
+                return Ok(DataOutput::Option(
+                    values
+                        .into_iter()
+                        .next_back()
                         .map(DataOutput::Value)
                         .map(Box::new),
                 ));
@@ -1232,18 +1264,53 @@ fn apply_output_transform(
                 stream.map(move |row| get_field(row, &field, "get")),
             ))
         }
-        DataTransform::Take { count } => {
-            let count = usize::try_from(count.value).map_err(|_| {
-                limit_error(
-                    "take count exceeds the platform index range",
-                    "Use a smaller non-negative count",
-                )
-            })?;
-            Ok(DataOutput::Stream(stream.take(count)))
+        DataTransform::Take { count } | DataTransform::First { count: Some(count) } => {
+            Ok(DataOutput::Stream(stream.take(count_index(count.value)?)))
         }
-        DataTransform::First => Ok(DataOutput::Option(
+        DataTransform::Skip { count } => {
+            Ok(DataOutput::Stream(stream.skip(count_index(count.value)?)))
+        }
+        DataTransform::Reject { fields } => {
+            let fields = fields
+                .iter()
+                .map(|field| field.value.clone())
+                .collect::<Vec<_>>();
+            let span = transform.span.clone();
+            Ok(DataOutput::Stream(stream.map(move |row| {
+                reject_fields(row, &fields, "reject").map_err(|error| transform_error(error, &span))
+            })))
+        }
+        DataTransform::First { count: None } => Ok(DataOutput::Option(
             stream.next(cancelled)?.map(DataOutput::Value).map(Box::new),
         )),
+        DataTransform::Last { count: None } => {
+            let mut last = None;
+            while let Some(value) = stream.next(cancelled)? {
+                last = Some(value);
+            }
+            Ok(DataOutput::Option(
+                last.map(DataOutput::Value).map(Box::new),
+            ))
+        }
+        // These need every row, so they are collection boundaries bounded by
+        // the stream's row limit, as `sort` is.
+        DataTransform::Last { count: Some(_) }
+        | DataTransform::Reverse
+        | DataTransform::Uniq
+        | DataTransform::GroupBy { .. }
+        | DataTransform::Columns
+        | DataTransform::Math { .. } => {
+            let rows = stream.collect(cancelled)?;
+            let value = apply_transform(DataValue::List(rows), &transform.value, limits)
+                .map_err(|error| transform_error(error, &transform.span))?;
+            validate_data_value(&value, limits)?;
+            match value {
+                DataValue::List(rows) => {
+                    Ok(DataOutput::Stream(DataStream::from_values(rows, limits)))
+                }
+                value => Ok(DataOutput::Value(value)),
+            }
+        }
         DataTransform::Length => {
             let mut length = 0_u64;
             while stream.next(cancelled)?.is_some() {
@@ -2633,6 +2700,13 @@ fn render_table_to(
         DataValue::Record(record) => {
             render_record_table_to(writer, record, limits, width_cells_max)
         }
+        // A lone size or time reads like its table cell, such as `213.1 kB`
+        // for `math sum` over file sizes.
+        DataValue::Size { .. } | DataValue::DateTime(_) => {
+            let rendered = render_table_value(value, limits, unix_seconds_now())?;
+            write_output(writer, rendered.as_bytes())?;
+            write_output(writer, b"\n")
+        }
         _ => {
             write_plain_data_value(writer, value, limits)?;
             write_output(writer, b"\n")
@@ -3449,11 +3523,47 @@ fn apply_transform(
                 "length expects a list, record, or string",
             )),
         },
-        DataTransform::First => Err(ShellError::new(
-            ErrorCode::Data,
-            "first escaped its explicit Option output boundary",
-        )
-        .with_help("Report this internal focused-evaluator invariant failure")),
+        DataTransform::First { count: None } | DataTransform::Last { count: None } => {
+            Err(ShellError::new(
+                ErrorCode::Data,
+                "first or last escaped its explicit Option output boundary",
+            )
+            .with_help("Report this internal focused-evaluator invariant failure"))
+        }
+        DataTransform::First { count: Some(count) } => take_values(value, count.value, "first"),
+        DataTransform::Last { count: Some(count) } => {
+            let count = count_index(count.value)?;
+            let DataValue::List(mut values) = value else {
+                return Err(data_error("last", "last expects a list or stream"));
+            };
+            let start = values.len().saturating_sub(count);
+            Ok(DataValue::List(values.split_off(start)))
+        }
+        DataTransform::Skip { count } => {
+            let count = count_index(count.value)?;
+            let DataValue::List(values) = value else {
+                return Err(data_error("skip", "skip expects a list or stream"));
+            };
+            Ok(DataValue::List(values.into_iter().skip(count).collect()))
+        }
+        DataTransform::Reverse => {
+            let DataValue::List(mut values) = value else {
+                return Err(data_error("reverse", "reverse expects a list or stream"));
+            };
+            values.reverse();
+            Ok(DataValue::List(values))
+        }
+        DataTransform::Reject { fields } => {
+            let fields = fields
+                .iter()
+                .map(|field| field.value.clone())
+                .collect::<Vec<_>>();
+            reject_fields(value, &fields, "reject")
+        }
+        DataTransform::Uniq => unique_values(value, limits),
+        DataTransform::GroupBy { field } => group_rows(value, &field.value, limits),
+        DataTransform::Columns => column_names(value),
+        DataTransform::Math { operation } => math::math_values(value, operation.value),
         DataTransform::Get { path } => get_field(value, &path.value, "get"),
         DataTransform::Where(predicate) => filter_where(value, predicate, limits, "where"),
         DataTransform::Select { fields } => {
@@ -3674,22 +3784,24 @@ fn compare_values(
         | (DataValue::Size { bytes: left }, DataValue::Size { bytes: right }) => {
             Ok(left.cmp(right))
         }
-        (DataValue::Size { bytes: left }, right)
-        | (DataValue::Duration { nanoseconds: left }, right) => {
-            compare_unsigned_to_numeric(*left, right, stage)
-        }
-        (left, DataValue::Size { bytes: right })
-        | (left, DataValue::Duration { nanoseconds: right }) => {
-            compare_unsigned_to_numeric(*right, left, stage).map(Ordering::reverse)
-        }
-        _ => Err(data_error(
-            stage,
-            format!(
-                "cannot order {} and {} values",
-                value_kind(left),
-                value_kind(right)
-            ),
-        )),
+        (DataValue::Size { bytes: magnitude }, other)
+        | (
+            DataValue::Duration {
+                nanoseconds: magnitude,
+            },
+            other,
+        ) => compare_unsigned_to_numeric(*magnitude, other, stage)?
+            .ok_or_else(|| mismatch_error(left, right, stage)),
+        (other, DataValue::Size { bytes: magnitude })
+        | (
+            other,
+            DataValue::Duration {
+                nanoseconds: magnitude,
+            },
+        ) => compare_unsigned_to_numeric(*magnitude, other, stage)?
+            .map(Ordering::reverse)
+            .ok_or_else(|| mismatch_error(left, right, stage)),
+        _ => Err(mismatch_error(left, right, stage)),
     }
 }
 
@@ -3711,25 +3823,43 @@ fn is_numeric_value(value: &DataValue) -> bool {
     )
 }
 
+/// Order a size or duration magnitude against a plain number, or `None`
+/// when `right` is not a number.
 fn compare_unsigned_to_numeric(
     left: u64,
     right: &DataValue,
     stage: &str,
-) -> Result<Ordering, ShellError> {
+) -> Result<Option<Ordering>, ShellError> {
     match right {
-        DataValue::UInt(right) => Ok(left.cmp(right)),
-        DataValue::Int(right) => Ok(i64_u64_order(*right, left).reverse()),
-        DataValue::Decimal(right) => {
-            decimal_unsigned_order(right, left, stage).map(Ordering::reverse)
-        }
-        _ => Err(data_error(
-            stage,
-            format!(
-                "cannot order unsigned domain magnitude and {} values",
-                value_kind(right)
-            ),
-        )),
+        DataValue::UInt(right) => Ok(Some(left.cmp(right))),
+        DataValue::Int(right) => Ok(Some(i64_u64_order(*right, left).reverse())),
+        DataValue::Decimal(right) => decimal_unsigned_order(right, left, stage)
+            .map(Ordering::reverse)
+            .map(Some),
+        _ => Ok(None),
     }
+}
+
+/// Explain why two values cannot be compared, with a fix for the common
+/// case of a size or duration compared with quoted text.
+fn mismatch_error(left: &DataValue, right: &DataValue, stage: &str) -> ShellError {
+    let message = format!(
+        "cannot compare a {} with a {}",
+        value_kind(left),
+        value_kind(right)
+    );
+    let quoted_size = matches!(
+        (left, right),
+        (DataValue::Size { .. }, DataValue::String(_))
+            | (DataValue::String(_), DataValue::Size { .. })
+    );
+    let error = ShellError::new(ErrorCode::Data, message).with_context(format!("in `{stage}`"));
+    if quoted_size {
+        return error.with_help(
+            "Write the size with a unit and without quotes, such as `10kB` or `1.5MiB`",
+        );
+    }
+    error.with_help("Compare values of the same kind; `--format json` shows each field's type")
 }
 
 fn i64_u64_order(left: i64, right: u64) -> Ordering {
@@ -3964,6 +4094,119 @@ fn take_values(value: DataValue, count: u64, stage: &str) -> Result<DataValue, S
     };
     values.truncate(count);
     Ok(DataValue::List(values))
+}
+
+fn count_index(count: u64) -> Result<usize, ShellError> {
+    usize::try_from(count).map_err(|_| {
+        limit_error(
+            "count exceeds the platform index range",
+            "Use a smaller non-negative count",
+        )
+    })
+}
+
+/// Remove `fields` from a record or from every record row. A missing field
+/// is an error, so a typo cannot silently keep data the user meant to drop.
+fn reject_fields(
+    value: DataValue,
+    fields: &[String],
+    stage: &str,
+) -> Result<DataValue, ShellError> {
+    let reject = |mut record: IndexMap<String, DataValue>| {
+        for field in fields {
+            if record.shift_remove(field).is_none() {
+                let available = record.keys().cloned().collect::<Vec<_>>().join(", ");
+                return Err(data_error(
+                    stage,
+                    format!("row has no field `{field}`; available fields: {available}"),
+                ));
+            }
+        }
+        Ok(DataValue::Record(record))
+    };
+    match value {
+        DataValue::Record(record) => reject(record),
+        DataValue::List(rows) => rows
+            .into_iter()
+            .map(|row| match row {
+                DataValue::Record(record) => reject(record),
+                _ => Err(data_error(stage, "reject expects record rows")),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(DataValue::List),
+        _ => Err(data_error(stage, "reject expects a record or record rows")),
+    }
+}
+
+/// Keep the first occurrence of each distinct item. Items are compared by
+/// their typed JSON encoding, so `1` and `"1"` stay distinct.
+fn unique_values(value: DataValue, limits: DataLimits) -> Result<DataValue, ShellError> {
+    let DataValue::List(values) = value else {
+        return Err(data_error("uniq", "uniq expects a list or stream"));
+    };
+    let mut seen = std::collections::HashSet::with_capacity(values.len());
+    let mut unique = Vec::new();
+    for value in values {
+        let key = collect_rendered(limits.max_materialized_bytes, |writer| {
+            write_typed_json_value(writer, &value)
+        })?;
+        if seen.insert(key) {
+            unique.push(value);
+        }
+    }
+    Ok(DataValue::List(unique))
+}
+
+/// Group record rows into a record whose keys are the rendered values of
+/// `field`, in first-seen order, each holding its rows.
+fn group_rows(value: DataValue, field: &str, limits: DataLimits) -> Result<DataValue, ShellError> {
+    let DataValue::List(rows) = value else {
+        return Err(data_error("group-by", "group-by expects record rows"));
+    };
+    let mut groups: IndexMap<String, Vec<DataValue>> = IndexMap::new();
+    for row in rows {
+        if !matches!(row, DataValue::Record(_)) {
+            return Err(data_error("group-by", "group-by expects record rows"));
+        }
+        let key_value = get_path(&row, field)
+            .ok_or_else(|| data_error("group-by", format!("row has no field `{field}`")))?;
+        let key = collect_rendered(limits.max_materialized_bytes, |writer| {
+            write_plain_data_value(writer, key_value, limits)
+        })?;
+        groups.entry(key).or_default().push(row);
+    }
+    Ok(DataValue::Record(
+        groups
+            .into_iter()
+            .map(|(key, rows)| (key, DataValue::List(rows)))
+            .collect(),
+    ))
+}
+
+/// Field names of a record, or the union of field names across record rows
+/// in first-seen order.
+fn column_names(value: DataValue) -> Result<DataValue, ShellError> {
+    let mut names = IndexSet::new();
+    match value {
+        DataValue::Record(record) => names.extend(record.into_keys()),
+        DataValue::List(rows) => {
+            for row in rows {
+                let DataValue::Record(record) = row else {
+                    return Err(data_error("columns", "columns expects record rows"));
+                };
+                names.extend(record.into_keys());
+            }
+        }
+        _ => {
+            return Err(data_error(
+                "columns",
+                "columns expects a record or record rows",
+            ));
+        }
+    }
+    Ok(DataValue::List(
+        names.into_iter().map(DataValue::String).collect(),
+    ))
 }
 
 fn select_fields(
@@ -5613,6 +5856,128 @@ mod tests {
             assert_eq!(UnicodeWidthStr::width(line), 40, "{line}");
         }
         assert!(rendered.contains("x…"));
+    }
+
+    fn eval_json(source: &str) -> String {
+        let value = DataRuntime::new().eval_typed(source).unwrap();
+        collect_rendered(DataLimits::DEFAULT.max_materialized_bytes, |writer| {
+            write_json_compatible_value(writer, &value)
+        })
+        .unwrap()
+    }
+
+    const SERVICES: &str = r#"[{"name":"api","team":"core","cpu":3},{"name":"web","team":"edge","cpu":1},{"name":"db","team":"core","cpu":2}]"#;
+
+    #[test]
+    fn sort_by_orders_rows_and_reverses_with_a_flag() {
+        assert_eq!(
+            eval_json(&format!("{SERVICES} | sort-by cpu | get name")),
+            r#"["web","db","api"]"#
+        );
+        assert_eq!(
+            eval_json(&format!("{SERVICES} | sort-by cpu -r | get name")),
+            r#"["api","db","web"]"#
+        );
+    }
+
+    #[test]
+    fn first_last_and_skip_select_positions() {
+        assert_eq!(
+            eval_json(&format!("{SERVICES} | first 2 | get name")),
+            r#"["api","web"]"#
+        );
+        assert_eq!(
+            eval_json(&format!("{SERVICES} | last 2 | get name")),
+            r#"["web","db"]"#
+        );
+        assert_eq!(
+            eval_json(&format!("{SERVICES} | skip 2 | get name")),
+            r#"["db"]"#
+        );
+        assert_eq!(
+            eval_json(&format!("{SERVICES} | last 1 | get name")),
+            r#"["db"]"#
+        );
+        assert_eq!(eval_json(&format!("{SERVICES} | skip 9 | length")), "0");
+        assert_eq!(eval_json("[3, 1, 2] | reverse"), "[2,1,3]");
+    }
+
+    #[test]
+    fn reject_removes_fields_and_reports_typos() {
+        assert_eq!(
+            eval_json(&format!("{SERVICES} | reject team cpu | first 1")),
+            r#"[{"name":"api"}]"#
+        );
+        let error = DataRuntime::new()
+            .eval_typed(&format!("{SERVICES} | reject tema"))
+            .unwrap_err();
+        assert!(
+            error.message.contains("available fields: name, team, cpu"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn uniq_keeps_first_occurrences_of_distinct_typed_values() {
+        assert_eq!(eval_json(r#"[1, "1", 1, 2, "1"] | uniq"#), r#"[1,"1",2]"#);
+        assert_eq!(
+            eval_json(&format!("{SERVICES} | get team | uniq")),
+            r#"["core","edge"]"#
+        );
+    }
+
+    #[test]
+    fn group_by_collects_rows_under_their_rendered_key() {
+        assert_eq!(
+            eval_json(&format!("{SERVICES} | group-by team | columns")),
+            r#"["core","edge"]"#
+        );
+        assert_eq!(
+            eval_json(&format!("{SERVICES} | group-by team | get core | length")),
+            "2"
+        );
+    }
+
+    #[test]
+    fn math_reduces_exactly_after_get() {
+        assert_eq!(eval_json(&format!("{SERVICES} | get cpu | math sum")), "6");
+        assert_eq!(eval_json(&format!("{SERVICES} | get cpu | math avg")), "2");
+        assert_eq!(eval_json(&format!("{SERVICES} | get cpu | math max")), "3");
+        assert_eq!(eval_json("[0.1, 0.2] | math sum"), "0.3");
+    }
+
+    #[test]
+    fn size_literals_filter_file_sizes() {
+        let directory =
+            std::env::temp_dir().join(format!("quirl-size-literal-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("big.bin"), vec![0_u8; 2_000]).unwrap();
+        std::fs::write(directory.join("small.bin"), vec![0_u8; 10]).unwrap();
+        let source = format!(
+            "files {} | where size > 1kB | get name",
+            directory.display()
+        );
+
+        assert_eq!(eval_json(&source), r#"["big.bin"]"#);
+        let source = format!(
+            "files {} | where size <= 0.01KiB | get name",
+            directory.display()
+        );
+        assert_eq!(eval_json(&source), r#"["small.bin"]"#);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn comparing_a_size_with_text_suggests_a_size_literal() {
+        let error = DataRuntime::new()
+            .eval_typed(r#"[{"size":"10kB"}] | where size > 1"#)
+            .unwrap_err();
+        assert!(
+            !error.message.contains("domain magnitude"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

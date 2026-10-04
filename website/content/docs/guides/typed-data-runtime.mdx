@@ -27,14 +27,17 @@ description: "Canonical Quirl project documentation synced from docs/data-runtim
   nodes, retained text, and materialized bytes. A bridge fails with
   `ResourceLimit` before retaining the first value beyond its configured bound,
   and reports the configured limit and observed use when safe.
-- `sort`, table rendering, `DataOutput::into_envelope`, and the collected
-  convenience APIs are the only materializing stream operations. Lazy `lines`,
-  CSV, tar, `where`, `get`, `select`, and `take` retain an O(one-row) window.
+- `sort`/`sort-by`, `last`, `reverse`, `uniq`, `group-by`, `columns`,
+  `math`, table rendering, `DataOutput::into_envelope`, and the collected
+  convenience APIs are the only materializing stream operations, each bounded
+  by the row limit. Lazy `lines`, CSV, tar, `where`, `get`, `select`,
+  `reject`, `take`, `first <count>`, and `skip` retain an O(one-row) window.
 - Type mismatches and lossy conversions are operating errors. No adapter,
   transform, or renderer panics on user input, recurses over untrusted value
   structure, or performs a hidden JSON round trip.
-- `first` is the focused grammar's optional operation: an empty stream becomes
-  `Option::None` and a present row becomes `Option::Some`. Operating failures
+- `first` and `last` without a count are the focused grammar's optional
+  operations: an empty stream becomes `Option::None` and a present row becomes
+  `Option::Some`. With a count they return a list of at most that many rows. Operating failures
   remain `ShellError` unless a caller explicitly requests a result envelope.
   `Task` remains bounded declarative state; this runtime does not claim a
   scheduler or asynchronous execution.
@@ -84,6 +87,35 @@ The rich surface keeps every outline glyph in one subdued theme color and
 applies the accent only to heading text; redirected table output remains free
 of ANSI escapes.
 
+## Transforms
+
+The transform vocabulary follows Nushell's names where the behavior matches:
+
+| Transform | Result |
+| --- | --- |
+| `where <field> <op> <value> [and\|or ...]` | Rows whose fields compare as requested |
+| `select <field>...` / `reject <field>...` | Rows with only, or without, the named fields |
+| `get <field.path>` | The field's value from a record or from each row |
+| `sort-by <field> [-r]` (or `sort <field> [asc\|desc]`) | Rows ordered by a field |
+| `first [n]` / `last [n]` / `take <n>` / `skip <n>` | Rows by position |
+| `reverse` / `uniq` | Rows reversed, or the first of each distinct value |
+| `group-by <field>` | A record from each distinct field value to its rows |
+| `columns` | The field names of a record or of all rows |
+| `math sum\|min\|max\|avg` | One value reduced from a list |
+| `length` | The number of items |
+
+`where` compares sizes with size literals written with a unit and no quotes:
+`ls | where size > 10kB`. Decimal units (`kB`, `MB`, `GB`, `TB`, `PB`) count
+in thousands and binary units (`KiB`, `MiB`, `GiB`, `TiB`, `PiB`) in 1024s,
+case-insensitively. `reject` and `group-by` report a missing field instead of
+ignoring it, so a typo cannot silently keep data.
+
+`math` keeps numbers exact: integers and decimals add as decimal digits, never
+through binary floating point, and a total beyond 38 significant digits fails
+rather than rounding. An average is exact when the division terminates and
+otherwise rounds to 12 decimal places. Sizes and durations reduce only with
+their own kind and keep their unit; `min` and `max` also compare text and dates.
+
 ## Syntax ownership and analysis
 
 `quirl-data` owns the focused data lexer, AST, inert diagnostics, formatter,
@@ -104,7 +136,9 @@ callers can replace every syntax budget through `DataSyntaxLimits`.
 
 The AST describes the currently implemented `pwd`, `files`/`ls`, `open`, JSON
 literal, and `^external` sources; `lines`, `from json`, and `to json` bridges;
-and `get`, `where`, `select`, `sort`, `take`, `first`, and `length` transforms.
+and `get`, `where`, `select`, `reject`, `sort`/`sort-by`, `take`, `first`,
+`last`, `skip`, `reverse`, `uniq`, `group-by`, `columns`, `math`, and `length`
+transforms.
 Its `DataType` surface names existing scalar/domain `DataValue` forms plus
 `List`, `Record`, `Table`, `Option`, `Result`, `Task`, `Stream`, and `Command`.
 Those type nodes remain focused semantic vocabulary rather than general type
