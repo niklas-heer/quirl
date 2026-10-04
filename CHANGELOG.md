@@ -91,6 +91,9 @@ which versions are published.
 
 ### Fixed
 
+- `open` keeps the field order of JSON and TOML documents, as YAML already
+  did, instead of sorting fields alphabetically, so table columns appear in
+  the order the file lists them.
 - `mode d` and other commands whose argument has a fixed set of values no
   longer offer file names next to those values. Their menu descriptions read
   "One of `normal`, `data`, `ai`, or `toggle`" instead of internal wording.

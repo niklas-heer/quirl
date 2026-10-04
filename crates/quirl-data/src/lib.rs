@@ -5948,6 +5948,27 @@ mod tests {
     }
 
     #[test]
+    fn opened_documents_keep_their_field_order() {
+        let directory =
+            std::env::temp_dir().join(format!("quirl-field-order-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        for (file, contents) in [
+            ("order.json", r#"{"zeta":1,"alpha":2,"mid":3}"#),
+            ("order.toml", "zeta = 1\nalpha = 2\nmid = 3\n"),
+            ("order.yaml", "zeta: 1\nalpha: 2\nmid: 3\n"),
+        ] {
+            let path = directory.join(file);
+            std::fs::write(&path, contents).unwrap();
+            assert_eq!(
+                eval_json(&format!("open {} | columns", path.display())),
+                r#"["zeta","alpha","mid"]"#,
+                "{file}"
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn size_literals_filter_file_sizes() {
         let directory =
             std::env::temp_dir().join(format!("quirl-size-literal-{}", std::process::id()));
@@ -6306,9 +6327,10 @@ mod tests {
         })))
         .render(DataRenderFormat::Plain)
         .unwrap();
+        // Fields keep their document order, as the source wrote them.
         assert_eq!(
             output,
-            "{\"ports\":[8080,8443],\"service\":{\"name\":\"api\"}}\n"
+            "{\"service\":{\"name\":\"api\"},\"ports\":[8080,8443]}\n"
         );
         assert!(!output.contains("\"type\""));
     }
