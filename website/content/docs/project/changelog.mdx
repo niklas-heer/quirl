@@ -63,6 +63,8 @@ which versions are published.
 
 - `${NAME:=word}` and `${NAME=word}` set an unexported shell variable, as in
   `sh`, instead of exporting it.
+- Subcommands such as `quirl catalog | head` end quietly with status 141 when
+  the reader closes the pipe, instead of panicking.
 - Git branches and other Zsh answers that contain `/` no longer show a
   folder icon unless they name an existing path.
 - Comparing values of different kinds explains itself, such as "cannot

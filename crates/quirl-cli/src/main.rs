@@ -368,6 +368,9 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let wants_json = cli.wants_json();
+    if cli.command.is_some() {
+        exit_quietly_when_output_closes();
+    }
     match run(cli) {
         Ok(status) => ExitCode::from(u8::try_from(status.clamp(0, 255)).unwrap_or(u8::MAX)),
         Err(error) if wants_json => {
@@ -382,6 +385,37 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Exit status a Unix tool reports when killed by `SIGPIPE`.
+const BROKEN_PIPE_EXIT_STATUS: i32 = 141;
+
+/// Make `quirl catalog | head` end quietly, as Unix tools do, instead of
+/// panicking when the reader closes standard output early.
+///
+/// Rust ignores `SIGPIPE`, so printing to a closed pipe panics, and restoring
+/// the default handler would need `unsafe`. A panic hook is the safe
+/// equivalent: it exits with the `SIGPIPE` status for that one panic and
+/// reports every other panic as before. Only command-line subcommands use it;
+/// the interactive shell keeps the default behavior.
+#[allow(
+    clippy::exit,
+    reason = "a panic hook cannot return a status; exiting is how a closed pipe ends the command"
+)]
+fn exit_quietly_when_output_closes() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        if message.starts_with("failed printing to stdout") && message.contains("Broken pipe") {
+            std::process::exit(BROKEN_PIPE_EXIT_STATUS);
+        }
+        default_hook(info);
+    }));
 }
 
 /// Serve an invocation from a program that starts Quirl as its shell.
