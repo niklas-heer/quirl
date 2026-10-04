@@ -1504,6 +1504,29 @@ fn execute_command_or_dialect_island(
     .map(|outcome| command_outcome_projection(&outcome))
 }
 
+/// Wrap a Normal-mode line that uses a shell control form the native grammar
+/// leaves to a reference shell, such as `for ...; do ...; done`, `{ ...; }`,
+/// `[[ ... ]]`, or `{a,b}`, in an `eval` island. The line then runs exactly
+/// as `/bin/sh` runs it, and the session keeps its exports and directory, as
+/// pasting it into Bash or Zsh would. Function definitions are rejected
+/// instead: a function cannot outlive the island that defines it.
+fn posix_control_island(source: &str) -> Result<Option<String>, ShellError> {
+    let Some(form) = quirl_syntax::dialect_control_form(source) else {
+        return Ok(None);
+    };
+    if form.defines_function {
+        return Err(ShellError::new(
+            ErrorCode::InvalidCommand,
+            "shell functions do not persist in Quirl",
+        )
+        .with_command(source)
+        .with_help(
+            "Define and call the function together in one `bash { ... }` block, or put it in a script and run the script",
+        ));
+    }
+    Ok(Some(format!("eval '{}'", source.replace('\'', r"'\''"))))
+}
+
 /// Return whether a parsed native command list directly invokes Git.
 ///
 /// This is only a cheap refresh hint after execution, not a security decision:
@@ -1533,6 +1556,19 @@ fn execute_command_or_dialect_island_with_extensions(
     installed: Option<&extensions::InstalledPluginCommand>,
     observer: Option<&mut OutputObserver<'_>>,
 ) -> Result<ExecutionOutcome, ShellError> {
+    let original_source = source;
+    let island_source;
+    let source = if installed.is_none() && interactive_dialect_island(source).is_none() {
+        match posix_control_island(source)? {
+            Some(wrapped) => {
+                island_source = wrapped;
+                island_source.as_str()
+            }
+            None => source,
+        }
+    } else {
+        source
+    };
     if output_mode == ExecutionOutputMode::RichViewport
         && installed.is_none()
         && interactive_dialect_island(source).is_none()
@@ -1627,7 +1663,7 @@ fn execute_command_or_dialect_island_with_extensions(
     };
     execute_execution_request_streaming(executor, request, extensions, observer).map_err(
         |mut error| {
-            error.details.command = Some(source.to_owned());
+            error.details.command = Some(original_source.to_owned());
             error
         },
     )
@@ -6069,6 +6105,41 @@ mod tests {
         .unwrap();
         let reference = reference_outcome("bash", "printf value; printf warning >&2; exit 7;");
         assert_same_outcome("bash interactive island", &native, &reference);
+    }
+
+    #[test]
+    fn native_lines_need_no_island_and_control_forms_become_quoted_evals() {
+        assert_eq!(
+            posix_control_island("git status && echo done").unwrap(),
+            None
+        );
+        assert_eq!(
+            posix_control_island(r#"for f in a; do echo "it's"; done"#).unwrap(),
+            Some(r#"eval 'for f in a; do echo "it'\''s"; done'"#.to_owned())
+        );
+        let error = posix_control_island("greet() { echo hi; }").unwrap_err();
+        assert!(error.message.contains("functions do not persist"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_form_lines_run_like_sh_and_keep_their_exports() {
+        let mut executor = NativeExecutor::default();
+        let outcome = execute_command_or_dialect_island(
+            &mut executor,
+            "for word in a 'b c'; do printf '[%s]' \"$word\"; done; export QUIRL_LOOP_EXPORT=kept",
+            ExecutionOutputMode::Capture,
+        )
+        .unwrap();
+        assert_eq!(outcome.status, 0);
+        assert_eq!(outcome.stdout.as_deref(), Some("[a][b c]"));
+        let outcome = execute_command_or_dialect_island(
+            &mut executor,
+            "printf %s \"$QUIRL_LOOP_EXPORT\"",
+            ExecutionOutputMode::Capture,
+        )
+        .unwrap();
+        assert_eq!(outcome.stdout.as_deref(), Some("kept"));
     }
 
     #[test]

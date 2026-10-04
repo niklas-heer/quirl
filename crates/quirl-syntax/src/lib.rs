@@ -580,25 +580,54 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
     })
 }
 
+/// A Bash/Zsh form outside the native grammar, found by [`dialect_control_form`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialectControlForm {
+    /// Source text of the reserved word or brace-expansion word.
+    pub text: String,
+    /// Inclusive start byte offset in the input.
+    pub start: usize,
+    /// Exclusive end byte offset in the input.
+    pub end: usize,
+    /// Whether the form defines a shell function (`name()` or `function`),
+    /// which cannot outlive the shell that runs it.
+    pub defines_function: bool,
+}
+
+/// Return the first compound or expansion form that Quirl's native grammar
+/// leaves to a reference shell, such as `for`, `{ ...; }`, `[[`, or `{a,b}`.
+/// Returns `None` for native input and for input that does not tokenize.
+pub fn dialect_control_form(input: &str) -> Option<DialectControlForm> {
+    first_dialect_form(&lex_command(input).ok()?)
+}
+
 /// Keep the native grammar deliberately unambiguous: compound dialect syntax cannot silently
-/// become a process name. Those forms retain exact Bash/Zsh semantics only inside an explicit
-/// bounded island.
+/// become a process name. Those forms retain exact shell semantics in a reference-shell island.
 fn reject_reserved_dialect_forms(tokens: &[Token]) -> Result<(), CommandSyntaxError> {
+    match first_dialect_form(tokens) {
+        Some(form) => Err(CommandSyntaxError {
+            message: format!("unsupported C1 dialect control form `{}`", form.text),
+            start: form.start,
+            end: form.end,
+            help: "Run it as `bash { ... }` or `zsh { ... }`; the bounded reference island preserves the selected dialect's control semantics".to_owned(),
+        }),
+        None => Ok(()),
+    }
+}
+
+fn first_dialect_form(tokens: &[Token]) -> Option<DialectControlForm> {
     let mut command_position = true;
     let mut redirect_target = false;
     for token in tokens {
         if let TokenKind::Word(word) = &token.kind
             && contains_unquoted_brace_expansion(word)
         {
-            return Err(CommandSyntaxError {
-                    message: format!(
-                        "unsupported C1 dialect control form `{}`",
-                        word.text()
-                    ),
-                    start: token.start,
-                    end: token.end,
-                    help: "Run it as `bash { ... }` or `zsh { ... }`; the bounded reference island preserves the selected dialect's control semantics".to_owned(),
-                });
+            return Some(DialectControlForm {
+                text: word.text(),
+                start: token.start,
+                end: token.end,
+                defines_function: false,
+            });
         }
         if redirect_target {
             redirect_target = false;
@@ -610,40 +639,39 @@ fn reject_reserved_dialect_forms(tokens: &[Token]) -> Result<(), CommandSyntaxEr
             | TokenKind::And
             | TokenKind::Or
             | TokenKind::Semicolon
-            | TokenKind::Newline => {
-                command_position = true;
-            }
-            TokenKind::Background => command_position = true,
+            | TokenKind::Newline
+            | TokenKind::Background => command_position = true,
             TokenKind::Word(word) => {
                 let value = word.text();
+                let defines_function = value == "function" || value.ends_with("()");
                 let reserved = command_position
-                    && (matches!(
-                        value.as_str(),
-                        "for"
-                            | "while"
-                            | "until"
-                            | "if"
-                            | "case"
-                            | "select"
-                            | "function"
-                            | "{"
-                            | "}"
-                    ) || value == "[["
-                        || value == "(("
-                        || value.ends_with("()"));
+                    && (defines_function
+                        || matches!(
+                            value.as_str(),
+                            "for"
+                                | "while"
+                                | "until"
+                                | "if"
+                                | "case"
+                                | "select"
+                                | "{"
+                                | "}"
+                                | "[["
+                                | "(("
+                        ));
                 if reserved {
-                    return Err(CommandSyntaxError {
-                        message: format!("unsupported C1 dialect control form `{value}`"),
+                    return Some(DialectControlForm {
+                        text: value,
                         start: token.start,
                         end: token.end,
-                        help: "Run it as `bash { ... }` or `zsh { ... }`; the bounded reference island preserves the selected dialect's control semantics".to_owned(),
+                        defines_function,
                     });
                 }
                 command_position = false;
             }
         }
     }
-    Ok(())
+    None
 }
 
 /// Brace expansion is intentionally not part of native C1.  Treat only the
@@ -1807,6 +1835,27 @@ mod tests {
             assert!(error.help.contains("bash { ... }"));
             assert!(error.help.contains("zsh { ... }"));
         }
+    }
+
+    #[test]
+    fn dialect_control_forms_are_reported_with_function_definitions_marked() {
+        let form = dialect_control_form("cd /tmp && for f in *; do echo $f; done").unwrap();
+        assert_eq!(form.text, "for");
+        assert!(!form.defines_function);
+        assert_eq!(dialect_control_form("{ echo a; } > out").unwrap().text, "{");
+        assert_eq!(dialect_control_form("echo {a,b}").unwrap().text, "{a,b}");
+        assert!(
+            dialect_control_form("greet() { echo hi; }")
+                .unwrap()
+                .defines_function
+        );
+        assert!(
+            dialect_control_form("function greet { echo hi; }")
+                .unwrap()
+                .defines_function
+        );
+        assert_eq!(dialect_control_form("echo for '{a,b}' ${HOME}"), None);
+        assert_eq!(dialect_control_form("echo 'unclosed"), None);
     }
 
     #[test]

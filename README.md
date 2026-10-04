@@ -144,8 +144,10 @@ A build is an official release only when it comes from an immutable GitHub
 tag and release that name its exact commit; other checkouts are development
 builds. Current limits worth knowing:
 
-- Here-documents, process substitution, loops, functions, and other dialect
-  control forms run in explicit Bash or Zsh islands.
+- Loops, conditionals, `{ ...; }` groups, and brace expansion run through
+  `/bin/sh` automatically and keep their exports and `cd`. Shell functions do
+  not persist; here-documents and process substitution need an explicit
+  `bash { ... }` or `zsh { ... }` block.
 - `quirl -c` and piped scripts run in `/bin/sh`, and `eval` and `source` keep
   the variables shell setup code exports, so Quirl is safe as a login shell
   for SSH, `scp`, `rsync`, Git, and editors. Functions and aliases from

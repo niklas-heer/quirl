@@ -119,7 +119,16 @@ pub(crate) struct SessionEnvironment {
 
 impl Default for SessionEnvironment {
     fn default() -> Self {
-        Self::capture(std::env::vars_os())
+        let mut environment = Self::capture(std::env::vars_os());
+        // POSIX shells set `PPID` at startup as an unexported variable.
+        #[cfg(unix)]
+        if !environment.variables.contains_key(OsStr::new("PPID")) {
+            environment.locals.insert(
+                OsString::from("PPID"),
+                OsString::from(std::os::unix::process::parent_id().to_string()),
+            );
+        }
+        environment
     }
 }
 
@@ -2618,7 +2627,7 @@ mod platform {
                 let assigned =
                     self.expand_default_word(word, limit, request, previous_status, budget)?;
                 self.environment
-                    .set_variables(&[(name.to_owned(), assigned.clone())])?;
+                    .assign_variables(&[(name.to_owned(), assigned.clone())])?;
                 return Ok(assigned);
             }
             if let Some(word) = operator.strip_prefix('=') {
@@ -2628,7 +2637,7 @@ mod platform {
                 let assigned =
                     self.expand_default_word(word, limit, request, previous_status, budget)?;
                 self.environment
-                    .set_variables(&[(name.to_owned(), assigned.clone())])?;
+                    .assign_variables(&[(name.to_owned(), assigned.clone())])?;
                 return Ok(assigned);
             }
             if let Some(word) = operator.strip_prefix(":?") {
@@ -9302,6 +9311,37 @@ mod backend_contract_tests {
         executor.execute_capture(&format!("export {name}")).unwrap();
         assert_eq!(read_test_environment(&mut executor, name), "a b");
         assert!(std::env::var_os(name).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ppid_names_the_parent_process_without_being_exported() {
+        let mut executor = NativeExecutor::default();
+        let parent = std::os::unix::process::parent_id().to_string();
+        assert_eq!(
+            capture_stdout(&mut executor, "echo $PPID"),
+            format!("{parent}\n")
+        );
+        // `sh` would report its own parent, so inspect the exported list.
+        let exported = capture_stdout(&mut executor, "env");
+        assert!(!exported.lines().any(|line| line.starts_with("PPID=")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_assignment_expansion_sets_an_unexported_variable() {
+        let mut executor = NativeExecutor::default();
+        executor
+            .execute_capture("echo \"${QUIRL_DEFAULT_ASSIGNED:=value}\"")
+            .unwrap();
+        assert_eq!(
+            capture_stdout(&mut executor, "echo $QUIRL_DEFAULT_ASSIGNED"),
+            "value\n"
+        );
+        assert_eq!(
+            read_test_environment(&mut executor, "QUIRL_DEFAULT_ASSIGNED"),
+            ""
+        );
     }
 
     #[cfg(unix)]

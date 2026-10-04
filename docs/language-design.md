@@ -17,8 +17,10 @@ artifact is the immutable
 untagged source remains candidate or development work:
 
 - On Linux and macOS, the native C1-core includes byte pipelines, redirects,
-  boolean lists, bounded expansion/substitution, jobs, and explicit Bash/Zsh
-  islands for unsupported control syntax. Windows remains best-effort process
+  boolean lists, shell variables, bounded expansion/substitution, and jobs.
+  Unsupported control syntax runs in an implicit `/bin/sh` island or an
+  explicit Bash/Zsh island, and `quirl -c`, piped scripts, `eval`, and
+  `source` follow POSIX `sh`. Windows remains best-effort process
   portability rather than a supported interactive target.
 - Rich Normal mode gives foreground native programs an embedded terminal,
   including terminal detection, redraws, key input, resize, and local terminal
@@ -367,7 +369,12 @@ bash ./legacy-deploy.sh   # explicit always wins
 - Here-documents, process substitution, loops, functions, conditionals, and
   dialect control syntax are intentionally C2 islands for 1.0, not an unfinished
   native-syntax promise. See [ADR 0010](decisions/2026-08-16_192326022_freeze-the-1-0-release-scope-around-unix-and-explicit-dialec.md).
-- `source` accepts Quirl modules and a portable subset. `source --bash` and `source --zsh` import only representable state.
+  In interactive Normal mode, loops, conditionals, `{ ...; }` groups, and brace
+  expansion run as an implicit `/bin/sh` island that keeps exports and the
+  working directory; function definitions are rejected because they cannot
+  persist. See the [POSIX invocation decision](decisions/2026-10-04_044214653_non-interactive-invocations-and-shell-setup-code-run-in-posi.md).
+- `source`, `.`, and `eval` run POSIX setup code in `/bin/sh` and import its
+  exported variables and working directory.
 - Behavior is versioned in a machine-readable matrix and backed by differential tests.
 
 ## 6. Command and data surface

@@ -89,6 +89,7 @@ const documents = [
   ['docs/decisions/2026-09-06_192326212_embedded-foreground-terminals.md', 'architecture/decisions/0038-embedded-foreground-terminals.mdx'],
   ['docs/decisions/2026-09-06_192326220_managed-project-cloning.md', 'architecture/decisions/0039-managed-project-cloning.mdx'],
   ['docs/decisions/2026-09-30_002231168_complete-like-zsh-and-ask-zsh-for-arguments.md', 'architecture/decisions/0040-zsh-reference-completion.mdx'],
+  ['docs/decisions/2026-10-04_044214653_non-interactive-invocations-and-shell-setup-code-run-in-posi.md', 'architecture/decisions/0041-posix-shell-invocation.mdx'],
 ];
 
 const pageBySource = new Map(documents);

@@ -30,6 +30,7 @@
     "0037-navigation-completion-space",
     "0038-embedded-foreground-terminals",
     "0039-managed-project-cloning",
-    "0040-zsh-reference-completion"
+    "0040-zsh-reference-completion",
+    "0041-posix-shell-invocation"
   ]
 }

@@ -47,6 +47,10 @@ const DUMP_BYTES_MAX: usize = crate::SESSION_ENVIRONMENT_BYTES_MAX + 64 * 1024;
 /// island rather than the session.
 const SHELL_MAINTAINED_VARIABLES: [&str; 2] = ["_", "SHLVL"];
 
+/// Session locals the island's shell sets itself and treats as read-only,
+/// so passing them in would fail before the user's code runs.
+const SHELL_READONLY_VARIABLES: [&str; 3] = ["PPID", "UID", "EUID"];
+
 /// Wrapper run by `sh -c`. Positional parameters are the dump path, the
 /// island kind, the code or file, then arguments for sourced code. The
 /// session's local variables are spliced in at `@LOCALS@` as quoted data.
@@ -225,7 +229,7 @@ fn local_assignments<'a>(locals: impl Iterator<Item = (&'a OsString, &'a OsStrin
         let (Some(name), Some(value)) = (name.to_str(), value.to_str()) else {
             continue;
         };
-        if !is_shell_name(name) {
+        if !is_shell_name(name) || SHELL_READONLY_VARIABLES.contains(&name) {
             continue;
         }
         rendered.push_str(name);
@@ -306,7 +310,10 @@ mod tests {
         let name = OsString::from("GREETING");
         let value = OsString::from("it's $(rm -rf /)");
         let invalid = OsString::from("not-a-name");
-        let rendered = local_assignments([(&name, &value), (&invalid, &value)].into_iter());
+        let readonly = OsString::from("PPID");
+        let rendered = local_assignments(
+            [(&name, &value), (&invalid, &value), (&readonly, &value)].into_iter(),
+        );
         assert_eq!(rendered, "GREETING='it'\\''s $(rm -rf /)'\n");
     }
 

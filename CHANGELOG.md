@@ -28,6 +28,12 @@ which versions are published.
   "$(ssh-agent -s)"`, `eval "$(brew shellenv)"`, `source .venv/bin/activate`,
   and `source .env` now work. Functions and aliases the code defines stay
   inside it.
+- Pasted loops, conditionals, `{ ...; }` groups, `[[ ... ]]`, and brace
+  expansion such as `{a,b}` run in Normal mode without a `bash { ... }`
+  wrapper. Quirl runs the line in `/bin/sh` and keeps the exports and working
+  directory it leaves. Function definitions explain that functions do not
+  persist.
+- `$PPID` names the shell's parent process.
 - `NAME=value` sets a shell variable, `NAME=value command` sets a variable for
   one command, `export NAME` exports an existing variable, and `unset NAME`
   removes one.
@@ -50,6 +56,8 @@ which versions are published.
 
 ### Changed
 
+- `${NAME:=word}` and `${NAME=word}` set an unexported shell variable, as in
+  `sh`, instead of exporting it.
 - Git branches and other Zsh answers that contain `/` no longer show a
   folder icon unless they name an existing path.
 - Comparing values of different kinds explains itself, such as "cannot
