@@ -495,7 +495,7 @@ struct Permit;
 impl Permit {
     fn acquire() -> Result<Arc<Self>, ShellError> {
         ACTIVE_SESSIONS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < PTY_SESSIONS_MAX).then(|| active.saturating_add(1))
             })
             .map_err(|active| {

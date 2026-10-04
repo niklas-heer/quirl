@@ -68,6 +68,8 @@ which versions are published.
 
 ### Changed
 
+- Quirl builds with Rust 1.99.0. Captured command output is decoded without
+  an extra copy of the bytes.
 - `${NAME:=word}` and `${NAME=word}` set an unexported shell variable, as in
   `sh`, instead of exporting it.
 - Subcommands such as `quirl catalog | head` end quietly with status 141 when

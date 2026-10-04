@@ -102,7 +102,7 @@ struct ExtensionRuntimeSlot {
 impl ExtensionRuntimeSlot {
     fn new(runtime: LuaRuntime, registrations: PluginRegistrations) -> Result<Self, ShellError> {
         let key = NEXT_RUNTIME_KEY
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(1)
             })
             .map_err(|observed| {

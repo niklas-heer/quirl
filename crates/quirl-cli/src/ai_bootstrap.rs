@@ -1068,7 +1068,7 @@ impl Read for ChannelReader {
 
 fn increment_counter(counter: &AtomicU64, name: &str) -> Result<u64, ShellError> {
     counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
             value.checked_add(1)
         })
         .map(|previous| previous.saturating_add(1))

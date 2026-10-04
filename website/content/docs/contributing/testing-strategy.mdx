@@ -27,14 +27,14 @@ CI runs the canonical gate on both Ubuntu and macOS and verifies both reference
 shells are available.
 
 ```sh
-docker build -f scripts/linux-check.Dockerfile -t quirl-linux-check:1.97.1 scripts
+docker build -f scripts/linux-check.Dockerfile -t quirl-linux-check:1.99.0 scripts
 QUIRL_GIT_COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir)
 docker run --rm --init --cpus 4 --memory 6g --pids-limit 1024 \
   --mount "type=bind,source=$PWD,target=/workspace,readonly" \
   --mount "type=bind,source=$QUIRL_GIT_COMMON_DIR,target=$QUIRL_GIT_COMMON_DIR,readonly" \
   --mount type=volume,source=quirl-linux-cargo-1971,target=/home/quirl/.cargo \
   --mount type=volume,source=quirl-linux-target-1971,target=/home/quirl/target \
-  quirl-linux-check:1.97.1
+  quirl-linux-check:1.99.0
 ```
 
 Run from the workspace root. The common Git directory mount also supports linked

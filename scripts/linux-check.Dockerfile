@@ -1,6 +1,6 @@
 # Keep this version aligned with rust-toolchain.toml. The digest fixes the
 # multi-platform base image while allowing native ARM64 and x86-64 execution.
-FROM rust:1.97.1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97
+FROM rust:1.99.0-bookworm@sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends zsh locales procps \

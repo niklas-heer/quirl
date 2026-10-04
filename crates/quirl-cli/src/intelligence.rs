@@ -3210,12 +3210,12 @@ fn bytes_to_vector(bytes: &[u8], dimensions: usize) -> Result<Vec<f32>, ShellErr
         ))
         .with_help("Run `quirl ai index` to rebuild semantic embeddings"));
     }
-    let vector = bytes
-        .chunks_exact(4)
-        .map(|chunk| {
-            let encoded: [u8; 4] = chunk.try_into().unwrap_or_default();
-            f32::from_le_bytes(encoded)
-        })
+    // The length check above makes the remainder empty, and fixed-size
+    // chunks need no fallible conversion that could invent zero bytes.
+    let (chunks, _) = bytes.as_chunks::<4>();
+    let vector = chunks
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect::<Vec<_>>();
     if vector.iter().any(|value| !value.is_finite()) {
         return Err(ShellError::new(

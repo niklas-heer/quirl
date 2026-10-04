@@ -1237,7 +1237,7 @@ fn wait_for_refresh_request(
 
 fn increment_generation(counter: &AtomicU64, name: &str) -> Result<u64, ShellError> {
     counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
             value.checked_add(1)
         })
         .map(|value| value.saturating_add(1))

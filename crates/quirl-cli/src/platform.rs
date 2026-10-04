@@ -145,7 +145,6 @@ pub fn execute_events(command: EventsCommand) -> Result<i32, ShellError> {
                     println!("contributions: {}", names(&schema.contributions)?);
                 }
             }
-            Ok(0)
         }
         EventsCommand::Validate { file, format } => {
             let trace = read_trace(&file)?;
@@ -162,9 +161,9 @@ pub fn execute_events(command: EventsCommand) -> Result<i32, ShellError> {
                     trace.events.len()
                 ),
             }
-            Ok(0)
         }
     }
+    Ok(0)
 }
 
 pub fn execute_view(command: ViewCommand) -> Result<i32, ShellError> {

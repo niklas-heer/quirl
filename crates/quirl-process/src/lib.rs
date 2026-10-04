@@ -4625,7 +4625,7 @@ mod platform {
         if capture.discarded_bytes > 0 {
             return Err(capture_limit_error(description, &capture));
         }
-        Ok(String::from_utf8_lossy(&capture.bytes).into_owned())
+        Ok(String::from_utf8_lossy_owned(capture.bytes))
     }
 
     fn join_reader_task(
@@ -4675,7 +4675,7 @@ mod platform {
         if capture.discarded_bytes > 0 {
             return Err(capture_limit_error(description, &capture));
         }
-        Ok(String::from_utf8_lossy(&capture.bytes).into_owned())
+        Ok(String::from_utf8_lossy_owned(capture.bytes))
     }
 
     fn join_writers(writers: Vec<WriterTask>) -> Result<(), ShellError> {
@@ -8481,7 +8481,7 @@ mod platform {
                         Err(_) => {}
                     }
                 }
-                failure.map_or(Ok(String::from_utf8_lossy(&bytes).into_owned()), Err)
+                failure.map_or_else(|| Ok(String::from_utf8_lossy_owned(bytes)), Err)
             } else {
                 Ok(String::new())
             };
@@ -8489,7 +8489,7 @@ mod platform {
             let stderr = stderr?;
             Ok(CommandOutcome {
                 status,
-                stdout: stdout.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+                stdout: stdout.map(String::from_utf8_lossy_owned),
                 stderr: capture.then_some(stderr),
             })
         }

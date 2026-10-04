@@ -31,6 +31,7 @@
     "0038-embedded-foreground-terminals",
     "0039-managed-project-cloning",
     "0040-zsh-reference-completion",
-    "0041-posix-shell-invocation"
+    "0041-posix-shell-invocation",
+    "0042-rust-1.99-compatibility"
   ]
 }

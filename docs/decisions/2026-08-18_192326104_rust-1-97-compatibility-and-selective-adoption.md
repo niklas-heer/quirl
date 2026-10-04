@@ -3,10 +3,10 @@ schema_version = 1
 id = "01M2XHZ70RA4C5EHWFZ8JHTZ1D"
 title = "Rust 1.97 compatibility and selective adoption"
 date = "2026-08-18"
-status = "accepted"
+status = "superseded"
 tags = ["rust"]
 supersedes = []
-superseded_by = []
+superseded_by = ["01M43VRB9PNBGEJHG0FF0M67PY"]
 depends_on = []
 related_to = []
 +++

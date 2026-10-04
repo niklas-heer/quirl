@@ -952,7 +952,7 @@ fn estimate_payload_tokens(context: &AgentContext) -> Result<usize, ShellError> 
 }
 
 fn token_count_to_wire(count: usize) -> u64 {
-    u64::try_from(count).map_or(u64::MAX, |count| count)
+    u64::try_from(count).unwrap_or(u64::MAX)
 }
 
 fn validate_typed<T: DeserializeOwned>(

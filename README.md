@@ -9,7 +9,7 @@
   sandboxed Lua SDK, folded into a single fast Rust binary.
 
   [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-  [![Rust](https://img.shields.io/badge/rust-1.97.1%2B-orange.svg)](rust-toolchain.toml)
+  [![Rust](https://img.shields.io/badge/rust-1.99.0%2B-orange.svg)](rust-toolchain.toml)
   [![Release](https://img.shields.io/github/v/release/niklas-heer/quirl?label=release)](https://github.com/niklas-heer/quirl/releases/latest)
   [![CI](https://github.com/niklas-heer/quirl/actions/workflows/ci.yml/badge.svg)](https://github.com/niklas-heer/quirl/actions/workflows/ci.yml)
 
@@ -168,7 +168,7 @@ apply only to the artifacts they name:
 
 ## Contributing
 
-The repository pins Rust 1.97.1; no system Lua is required.
+The repository pins Rust 1.99.0; no system Lua is required.
 
 ```console
 git clone https://github.com/niklas-heer/quirl.git

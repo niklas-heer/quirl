@@ -1759,7 +1759,7 @@ fn canonicalize_params_decstbm(
 }
 
 fn u16_to_u8(i: u16) -> Option<u8> {
-    if i > u16::from(u8::max_value()) {
+    if i > u16::from(u8::MAX) {
         None
     } else {
         // safe because we just ensured that the value fits in a u8
