@@ -103,6 +103,8 @@ export QUIRL_DEMO_BIN
 # developer normally requests monochrome command output.
 unset NO_COLOR
 cd "$repo_dir"
+# VHS does not create output directories.
+mkdir -p assets/screenshots target/screenshots
 vhs scripts/demo.tape
 vhs scripts/screenshots.tape
 # The website serves the same images the README embeds.

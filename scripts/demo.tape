@@ -53,12 +53,6 @@ Tab
 Sleep 3500ms
 Escape
 Ctrl+U
-Type "git log --one"
-Sleep 600ms
-Tab
-Sleep 2500ms
-Escape
-Ctrl+U
 
 # 2 · Pasted Bash keeps working, including setup code that changes the session.
 Hide
@@ -75,8 +69,11 @@ Type `source .env && echo "deploying to $DEPLOY_REGION via $API_URL"`
 Sleep 800ms
 Enter
 Sleep 2500ms
-Type@22ms `for svc in api worker search; do echo "✓ $svc deployed to $DEPLOY_REGION"; done`
-Sleep 800ms
+# Present the loop as a paste: it arrives whole, then runs.
+Hide
+Type@2ms `for svc in api worker search; do echo "✓ $svc deployed to $DEPLOY_REGION"; done`
+Show
+Sleep 1200ms
 Enter
 Sleep 3s
 Type `eval "$(ssh-agent -s)" && ssh-add -l`

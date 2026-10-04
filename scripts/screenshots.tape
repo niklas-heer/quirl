@@ -10,7 +10,7 @@ Set WaitTimeout 120s
 Set FontFamily "JetBrainsMono Nerd Font"
 Set FontSize 18
 Set Width 1200
-Set Height 600
+Set Height 700
 Set Padding 28
 Set Margin 16
 Set MarginFill "#070a10"
@@ -36,6 +36,8 @@ Sleep 2s
 Show
 Sleep 300ms
 Screenshot assets/screenshots/completion.png
+# VHS captures on the next rendered frame; stay visible until it has.
+Sleep 700ms
 Hide
 Escape
 Ctrl+U
@@ -51,6 +53,8 @@ Sleep 1500ms
 Show
 Sleep 300ms
 Screenshot assets/screenshots/posix-habits.png
+# VHS captures on the next rendered frame; stay visible until it has.
+Sleep 700ms
 Hide
 
 # Typed data: a colored table straight from a file.
@@ -63,6 +67,8 @@ Sleep 1500ms
 Show
 Sleep 300ms
 Screenshot assets/screenshots/data-table.png
+# VHS captures on the next rendered frame; stay visible until it has.
+Sleep 700ms
 Hide
 
 # A readable pipeline, grouping, and exact math.
@@ -79,6 +85,8 @@ Sleep 1500ms
 Show
 Sleep 300ms
 Screenshot assets/screenshots/data-pipeline.png
+# VHS captures on the next rendered frame; stay visible until it has.
+Sleep 700ms
 Hide
 
 # History search: Ctrl-R ranks this directory's commands first.
@@ -92,6 +100,8 @@ Sleep 1500ms
 Show
 Sleep 300ms
 Screenshot assets/screenshots/history.png
+# VHS captures on the next rendered frame; stay visible until it has.
+Sleep 700ms
 Hide
 Escape
 Sleep 500ms
