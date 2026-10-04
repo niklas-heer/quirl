@@ -143,6 +143,27 @@ printf '%s\n' \
   '  answer = 6 * 7,' \
   '  runtime = _VERSION,' \
   '}' >"$demo_workspace/hello.lua"
+printf '%s\n' \
+  '# Exported settings for the demo services' \
+  'export API_URL=https://api.example.test' \
+  'export DEPLOY_REGION=fra' >"$demo_workspace/.env"
+# A small repository gives branch completion real names to offer. Git runs
+# with fixed identities and no user or system configuration.
+if command -v git >/dev/null 2>&1; then
+  demo_git() {
+    env -i PATH=/usr/bin:/bin:/opt/homebrew/bin HOME="$demo_home" \
+      GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+      GIT_AUTHOR_NAME=Demo GIT_AUTHOR_EMAIL=demo@example.test \
+      GIT_COMMITTER_NAME=Demo GIT_COMMITTER_EMAIL=demo@example.test \
+      git -C "$demo_workspace" "$@" >/dev/null 2>&1
+  }
+  demo_git init -q -b main
+  demo_git add notes.txt services.json
+  demo_git commit -q -m 'Add demo services'
+  demo_git branch feature/latency-alerts
+  demo_git branch feature/search-cache
+  demo_git branch release/0.5
+fi
 cp "$demo_script_dir/demo-card.sh" "$demo_workspace/tour"
 chmod 700 "$demo_workspace/tour"
 cat >"$demo_workspace/prepare-search" <<'PREPARE_SEARCH'

@@ -104,3 +104,7 @@ export QUIRL_DEMO_BIN
 unset NO_COLOR
 cd "$repo_dir"
 vhs scripts/demo.tape
+vhs scripts/screenshots.tape
+# The website serves the same images the README embeds.
+mkdir -p website/public/screenshots
+cp assets/screenshots/*.png website/public/screenshots/

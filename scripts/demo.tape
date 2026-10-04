@@ -1,5 +1,6 @@
-# Run through scripts/record-demo.sh. It verifies the prebuilt candidate digest,
+# Run through scripts/record-demo.sh. It verifies the prebuilt release digest,
 # VHS/ttyd/ffmpeg, and the JetBrainsMono Nerd Font before opening this tape.
+# scripts/preview-demo.sh renders a development build to target/demo-preview.
 Output assets/quirl-demo.gif
 Output website/public/quirl-demo.mp4
 Output website/public/quirl-demo.webm
@@ -7,7 +8,7 @@ Output website/public/quirl-demo.webm
 Require bash
 
 Set Shell "bash"
-Set WaitTimeout 370s
+Set WaitTimeout 120s
 Set FontFamily "JetBrainsMono Nerd Font"
 Set FontSize 18
 Set Width 1200
@@ -24,37 +25,71 @@ Set CursorBlink false
 Set Theme { "name": "Quirl", "black": "#17202a", "red": "#ff6b6b", "green": "#7ee787", "yellow": "#f2cc60", "blue": "#79c0ff", "magenta": "#d2a8ff", "cyan": "#56d4dd", "white": "#f0f6fc", "brightBlack": "#6e7681", "brightRed": "#ff7b72", "brightGreen": "#aff5b4", "brightYellow": "#e3b341", "brightBlue": "#a5d6ff", "brightMagenta": "#e2c5ff", "brightCyan": "#a2f2f2", "brightWhite": "#ffffff", "background": "#0d1117", "foreground": "#f0f6fc", "selection": "#264f78", "cursor": "#56d4dd" }
 
 Hide
-Type `scripts/demo-session.sh --nerd-font --ai-ready "$QUIRL_DEMO_BIN"`
+Type `scripts/demo-session.sh --nerd-font "$QUIRL_DEMO_BIN"`
 Enter
-Wait+Screen /v[0-9]+\.[0-9]+\.[0-9]+/
 Wait+Screen /Alt-Q Quirl/
 Set WaitTimeout 40s
 
 # Open on a brand card instead of an empty prompt.
 Type "./tour intro"
 Enter
-Wait+Screen /BASH MUSCLE MEMORY/
+Wait+Screen /YOUR SHELL HABITS/
 Show
 Sleep 4s
 
-# Normal mode starts with the shell grammar people already know.
+# 1 · Familiar commands, and completion that knows the project.
 Hide
 Ctrl+L
 Show
-Type "# familiar commands · native pipes · real process status"
+Type "# familiar commands · completion that knows your project"
 Sleep 2s
 Ctrl+U
-Type `printf 'api\nworker\njobs\n' | wc -l && echo 'pipeline: healthy'`
+Type `printf 'api\nworker\nsearch\n' | wc -l && echo 'pipeline: healthy'`
 Enter
-Sleep 3s
-Type "git commit --am"
+Sleep 2500ms
+Type "git checkout fe"
+Sleep 600ms
 Tab
-Sleep 3s
+Sleep 3500ms
+Escape
+Ctrl+U
+Type "git log --one"
+Sleep 600ms
+Tab
+Sleep 2500ms
 Escape
 Ctrl+U
 
-# Give typed data its own hero beat and name every verb before it moves.
+# 2 · Pasted Bash keeps working, including setup code that changes the session.
 Hide
+Ctrl+L
+Type "./tour habits"
+Enter
+Wait+Screen /PASTE IT/
+Show
+Sleep 4s
+Hide
+Ctrl+L
+Show
+Type `source .env && echo "deploying to $DEPLOY_REGION via $API_URL"`
+Sleep 800ms
+Enter
+Sleep 2500ms
+Type@22ms `for svc in api worker search; do echo "✓ $svc deployed to $DEPLOY_REGION"; done`
+Sleep 800ms
+Enter
+Sleep 3s
+Type `eval "$(ssh-agent -s)" && ssh-add -l`
+Sleep 800ms
+Enter
+Sleep 3s
+Hide
+Type "kill $SSH_AGENT_PID"
+Enter
+Sleep 500ms
+
+# 3 · Typed data, named once, then readable verbs.
+Ctrl+L
 Type "./tour data"
 Enter
 Wait+Screen /DATA THAT STAYS DATA/
@@ -65,73 +100,39 @@ Ctrl+L
 Ctrl+Space
 Wait+Screen /DATA/
 Show
-
-# First show JSON as JSON so syntax color and typed literals are unmistakable.
-Type@20ms `[{"service":"search","latency":91},{"service":"billing","latency":54}]`
-Sleep 1500ms
-Enter
-Sleep 3s
-
-# Then reveal the file adapter as a typed source, before transforming it.
-Hide
-Ctrl+L
-Show
 Type "open services.json"
-Sleep 1s
+Sleep 800ms
 Enter
 Sleep 3s
 Hide
 Ctrl+L
 Show
-Type `open services.json | where status == "degraded"`
-Sleep 1s
+Type@22ms "open services.json | where latency > 50 | sort-by latency -r | select service region latency"
+Sleep 1200ms
+Enter
+Sleep 3500ms
+Type "open services.json | group-by status"
+Sleep 800ms
 Enter
 Sleep 3s
-Hide
-Ctrl+L
-Show
-Type@22ms "open services.json | where latency > 50 | sort latency desc | select service region latency"
-Sleep 1500ms
+Type "open services.json | get latency | math avg"
+Sleep 800ms
 Enter
-Sleep 4s
+Sleep 3s
 
-# Local command search is a CLI tool, separate from authenticated Codex planning.
+# Lua is the small, resource-bounded extension surface.
 Hide
 Ctrl+L
 Type "mode normal"
 Enter
 Wait+Screen /NORMAL/
-# Rebuild only after real startup discovery; the helper fails instead of
-# presenting stale lexical results as semantic search. Its output stays hidden.
-Type "./prepare-search"
-Enter
-Wait+Screen /DEMO_HYBRID_READY/
 Show
-Type "# discover candidates · review suggestions before choosing"
-Sleep 2s
-Ctrl+U
-Type `quirl ai search "copy a directory while preserving permissions" --limit 3`
-Enter
-Wait+Screen /hybrid/
-Sleep 6s
-
-# Full Bash compatibility stays explicit and visible.
-Hide
-Ctrl+L
-Show
-Type "# full Bash when you need it · explicit when you cross the boundary"
-Sleep 2s
-Ctrl+U
-Type `bash { cat <(printf 'Bash, on purpose.\n') }`
-Enter
-Sleep 3s
-
-# Lua is the small, resource-bounded extension surface.
 Type `lua return { answer = 6 * 7, runtime = _VERSION, sandboxed = true }`
+Sleep 800ms
 Enter
 Sleep 3s
 
-# End with stable product boundaries; measurements belong to exact artifacts.
+# End on the product boundaries and the install line.
 Hide
 Ctrl+L
 Type "./tour proof"
