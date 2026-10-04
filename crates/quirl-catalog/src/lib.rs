@@ -1899,6 +1899,59 @@ impl Catalog {
             .is_some()
     }
 
+    /// Whether the word ending `segment` names another command, as the
+    /// argument of `help` does. Such a word is never a file name.
+    pub fn completes_command_name(&self, segment: &str) -> bool {
+        command_name_argument(segment.trim_start()).is_some()
+    }
+
+    /// Complete a command name for `help <word>`: the distinct first words
+    /// of every command path, each with its own summary when it has one.
+    fn complete_command_name(
+        &self,
+        token: &str,
+        token_start: usize,
+        cursor: usize,
+        limit: usize,
+    ) -> Vec<ContextualCompletion> {
+        let mut seen = std::collections::HashSet::new();
+        // Imported Bash completions can register computed names such as
+        // `$bat`; those are shell expressions, not commands to explain.
+        let names = self.commands.iter().filter_map(|command| {
+            let name = command.path.split_whitespace().next()?;
+            let expression = name.starts_with('$');
+            (!expression && seen.insert(name)).then_some(name)
+        });
+        let names = names.collect::<Vec<_>>();
+        bounded_ranked_completions(
+            names.into_iter().filter_map(|name| {
+                let (score, indices) = fuzzy_match(token, name)?;
+                let command = self.commands.iter().find(|command| command.path == name);
+                Some((
+                    score,
+                    ContextualCompletion {
+                        completion: Completion {
+                            value: name.to_owned(),
+                            display: name.to_owned(),
+                            summary: command
+                                .map(|command| command.summary.clone())
+                                .unwrap_or_default(),
+                            detail: "Command to explain with `help`".to_owned(),
+                            replace_start: token_start,
+                            replace_end: cursor,
+                            match_indices: indices,
+                        },
+                        command_id: command
+                            .map(|command| command.id.clone())
+                            .unwrap_or_default(),
+                        argument_index: None,
+                    },
+                ))
+            }),
+            limit,
+        )
+    }
+
     fn complete_contextual(
         &self,
         input: &str,
@@ -1911,6 +1964,16 @@ impl Catalog {
         let leading_whitespace = segment.len().saturating_sub(segment.trim_start().len());
         let query_start = segment_start.saturating_add(leading_whitespace);
         let query = segment.trim_start();
+
+        if let Some(token_offset) = command_name_argument(query) {
+            let token = query.get(token_offset..).unwrap_or_default();
+            return self.complete_command_name(
+                token,
+                query_start.saturating_add(token_offset),
+                cursor,
+                limit,
+            );
+        }
 
         if let Some((command, option, token_start, token, values)) = self
             .static_value_context(query, query_start)
@@ -2865,6 +2928,19 @@ fn option(names: &[&str], value: Option<&str>, summary: &str) -> OptionSpec {
     }
 }
 
+/// Commands whose single argument names another command.
+const COMMAND_NAME_ARGUMENT_COMMANDS: [&str; 1] = ["help"];
+
+/// Byte offset of the word being typed when `query` is exactly one of
+/// [`COMMAND_NAME_ARGUMENT_COMMANDS`] followed by its first argument.
+fn command_name_argument(query: &str) -> Option<usize> {
+    let token_start = query.rfind(char::is_whitespace)?.saturating_add(1);
+    let head = query.get(..token_start)?.trim_end();
+    COMMAND_NAME_ARGUMENT_COMMANDS
+        .contains(&head)
+        .then_some(token_start)
+}
+
 /// Completion-menu prose for a signature positional: its accepted values when
 /// the signature lists them, otherwise the placeholder the signature names.
 fn positional_documentation(value: &str) -> String {
@@ -3183,6 +3259,27 @@ mod tests {
         assert!(catalog.completes_finite_positional("mode d"));
         assert!(catalog.completes_finite_positional("  mode "));
         assert!(!catalog.completes_finite_positional("cat d"));
+    }
+
+    #[test]
+    fn help_completes_command_names_once_each() {
+        let catalog = Catalog::builtin();
+        assert!(catalog.completes_command_name("help mo"));
+        assert!(catalog.completes_command_name("help "));
+        assert!(!catalog.completes_command_name("help mode extra"));
+        assert!(!catalog.completes_command_name("cat help"));
+        let values = catalog
+            .complete("help mo", 7)
+            .into_iter()
+            .map(|completion| completion.value)
+            .collect::<Vec<_>>();
+        assert_eq!(values, ["mode"]);
+        let quirl = catalog
+            .complete("help qui", 8)
+            .into_iter()
+            .filter(|completion| completion.value == "quirl")
+            .count();
+        assert_eq!(quirl, 1);
     }
 
     #[test]

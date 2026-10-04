@@ -1283,7 +1283,10 @@ fn filesystem_completion_context(
     if !explicit_path && catalog_has_subcommand_prefix(catalog, segment, raw_token) {
         return None;
     }
-    if !explicit_path && catalog.is_some_and(|catalog| catalog.completes_finite_positional(segment))
+    if !explicit_path
+        && catalog.is_some_and(|catalog| {
+            catalog.completes_finite_positional(segment) || catalog.completes_command_name(segment)
+        })
     {
         return None;
     }
