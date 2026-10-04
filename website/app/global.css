@@ -337,3 +337,22 @@ kbd {
   html { scroll-behavior: auto; }
   .button { transition: none; }
 }
+
+.gallery-grid {
+  display: grid;
+  gap: 1.2rem;
+  grid-template-columns: repeat(2, 1fr);
+  margin-top: 2.6rem;
+}
+
+.gallery-shot { margin: 0; overflow: hidden; }
+.gallery-shot .cassette-label { font-size: 0.68rem; }
+.gallery-shot:nth-child(1) .cassette-label { background: var(--lp-magenta); }
+.gallery-shot:nth-child(2) .cassette-label { background: var(--lp-cyan); }
+.gallery-shot:nth-child(3) .cassette-label { background: var(--lp-amber); }
+.gallery-shot:nth-child(4) .cassette-label { background: var(--lp-lime); }
+.gallery-shot img { display: block; height: auto; width: 100%; }
+
+@media (max-width: 900px) {
+  .gallery-grid { grid-template-columns: 1fr; }
+}

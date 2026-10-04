@@ -1,79 +1,85 @@
 {
   "schema_version": 1,
-  "quirl_version": "0.3.0",
-  "source_commit": "dfb43e54320d166ebe195bb5a0255b8aacbb11e5",
+  "quirl_version": "0.5.1",
+  "source_commit": "3f0064cbd2af644630b7a50e75a57103186b8a91",
   "target": "aarch64-apple-darwin",
   "source_dirty": false,
-  "binary_bytes": 10612336,
-  "binary_sha256": "30a6edce509a6220cfb4c505fe0192598d56174336a8720ffd0e2042be1c53d8",
+  "binary_bytes": 10745104,
+  "binary_sha256": "09674fb203ca10a367a435a3450f44feb20997a436fe908c0bf9a59c7818400a",
   "vhs_version": "0.11.0",
-  "recorded_recipe_sha256": "5d5a4fcc69bee59f21ed0b18be6cb5031dae76cb03bafe4f203cd806836d10da",
-  "recipe_change": "None; recorded an identical private copy of the checked-in scripts/demo.tape.",
+  "recorded_recipe_sha256": "388bffec9da24bd9bb9bb2d174c4e4cd6dd69150247642a61e60812c4ff3145c",
+  "recipe_change": "None; recorded the checked-in scripts/demo.tape and scripts/screenshots.tape through scripts/record-demo.sh.",
   "recording_support_sha256": {
-    "scripts/record-demo.sh": "a0ee10e45fabd90fe3d6a8d68ba8da5596a5b637d1b9304cb263588b5f154003",
-    "scripts/demo-session.sh": "02ba027e6cc4af8acc5c9e9890ac1547d09674ae577c34f6cc2bf1de562188f1",
-    "scripts/demo-card.sh": "29478b57402f1b7eb48519bf14f424e6c8f4c1fa91bcd29abc199f07e9a03d41"
+    "scripts/record-demo.sh": "a26917fd57d161dee41bf96f5ca57d3d2464664116dc75f3179b0f0e0f0bcc34",
+    "scripts/demo-session.sh": "30bf56b08591d2c7b433ab6c221faacac325de866c7be560e1bae6405f646f1f",
+    "scripts/demo-card.sh": "ceed7007a3715e60d1e89ba39882bd3d7970e7c9df3abdba635855a2fbb7eca0",
+    "scripts/screenshots.tape": "f8e787d0a9101c2cff4ca7d059abbe1b42eefa44e79d50deb485f879320b10d3"
   },
   "width": 1200,
   "height": 720,
-  "duration_seconds": 71.12,
+  "duration_seconds": 69.2,
   "media": {
     "gif": {
       "source_file": "assets/quirl-demo.gif",
       "publication_file": "assets/quirl-demo.gif",
-      "bytes": 3908939,
-      "sha256": "f188ccb05853eda56b38aeebd2fcb1e789b48eef922b29a657723ec806779945"
+      "bytes": 1935059,
+      "sha256": "bd05a25c744c956fc7c00910c1f642a231e9b7964114139dbf4b9cc50db3f929"
     },
     "mp4": {
       "source_file": "website/public/quirl-demo.mp4",
       "publication_file": "website/public/quirl-demo.mp4",
-      "bytes": 1797568,
-      "sha256": "451e49a54083ac5f57dbf12a64bef180a83cde24442ed674417e2e0cbb7c6d90"
+      "bytes": 991980,
+      "sha256": "768a1bd1a4156c0c4c40029a53e398d2b13d9becc116f71a5d2f5e58d5efe246"
     },
     "webm": {
       "source_file": "website/public/quirl-demo.webm",
       "publication_file": "website/public/quirl-demo.webm",
-      "bytes": 1854592,
-      "sha256": "ebfd791ca435007c4027bfcaa2235968213488b7ee17447267390d7ee6aeea38"
+      "bytes": 1063859,
+      "sha256": "516c01f08e08b21aed0a46cf3c55948347d9a3d35cbc0a8e94d85aec227bf1cb"
     },
     "poster": {
       "source_file": "website/public/quirl-demo-poster.png",
       "publication_file": "website/public/quirl-demo-poster.png",
-      "bytes": 107132,
-      "sha256": "040fcf4caeb2951f9055e874ec479ee04dabe8a1ea68a05ebdd4170c7c610994"
+      "bytes": 123798,
+      "sha256": "6cf043d2bb074c5cfb3ed487e59f4e69ca7f2a627f6373ad878d3dff84addfbe"
     }
   },
-  "sampled_review_frame_count": 36,
-  "sampled_review_interval_seconds": 2,
-  "full_size_review_seconds": [
-    2,
-    14,
-    38,
-    46,
-    47,
-    50,
-    64,
-    68
-  ],
-  "review_method": "AI visual inspection of frames sampled across the complete MP4, plus eight full-resolution frames. MP4 and WebM fully decoded without errors. VHS screen assertions verified startup and semantic retrieval readiness.",
+  "screenshots": {
+    "completion.png": {
+      "bytes": 95281,
+      "sha256": "2e956f92f4224ab72d268db04fad95c2e45bf95281b2fb8c9636eba7f17bb2c2"
+    },
+    "data-pipeline.png": {
+      "bytes": 155806,
+      "sha256": "de158be61412656ed90f969ea1d37a074d87fce7d96d983fc66f2156f6ac18a3"
+    },
+    "data-table.png": {
+      "bytes": 99706,
+      "sha256": "a7b741dfb9fe153b03c47ba0ff937f270be2b88ba5c5c62445d41ad33dc986aa"
+    },
+    "history.png": {
+      "bytes": 123516,
+      "sha256": "a041b73c0bda4efa5a0c4c7dab064821d96e997532862bc15f772dccd589893f"
+    },
+    "posix-habits.png": {
+      "bytes": 137687,
+      "sha256": "abf231c040145c7ff650f323680f33ac22b93c6e9fa4ebd3622df67aca2ec070"
+    }
+  },
+  "review_method": "AI visual inspection of a contact sheet sampled every 4 seconds across the complete MP4 and of every screenshot at full resolution. MP4 and WebM decoded without errors. VHS screen assertions verified startup and each title card.",
   "physical_terminal_qa": false,
   "human_qa": false,
   "official_release_profile": true,
   "artifact_origin": "published_release_asset",
-  "release_workflow_run_id": 34054071682,
-  "release_package_file": "quirl-v0.3.0-aarch64-apple-darwin.tar",
-  "release_package_sha256": "ab116b02c2bc41143453d09c679eb99dcb7312234ec10057d4fd347de5f343c2",
-  "release_package_provenance_sha256": "ec8e0f6c8b6f13adf2f8676135eeeea9f8f7be10f10161a0dba54247dd2e0275",
-  "native_performance_report_sha256": "082c1afceaa1a48900a3306e5552df841ded357e78392babffb0f7eb25112fa4",
+  "release_workflow_run_id": 37223859049,
+  "release_package_file": "quirl-v0.5.1-aarch64-apple-darwin.tar",
+  "release_package_sha256": "c10017d5e4db0dc40b439beac0d4718bbf6c3fd1cad4634971fd4733a06a7d85",
+  "release_package_provenance_sha256": "bfbb64c75f7a1119f1713aeccf1aea8a52c534cdce5895077905941f277f173f",
+  "native_performance_report_sha256": "e37a0725580184e33958631c95c66dc8b8eb508530b7bffa1e9e710e07fd59ed",
   "published_release_asset": true,
-  "artifact_scope": "Recorded the exact executable extracted from the hosted macOS ARM package subsequently published in the immutable v0.3.0 GitHub release. The public archive SHA-256 matches the verified recording package, and its executable matches the original passing native performance report. No local rebuild was used.",
-  "runtime_assets": {
-    "original_manifest_sha256": "5c14f0cad6c9d3d0f08b5b44af33531470b329b98ac228ae930885f7145664c7",
-    "local_manifest_sha256": "bff0e0e54ef93c591dbedcc8011f2c2c48c55e35a2082d2dba787ad12d4dcafe",
-    "source": "Verified version-matched runtime assets from the same release workflow; only asset URLs were changed to private local fixture paths."
-  },
-  "session_scope": "Isolated temporary HOME, config, history, plugin directories, and cache. Real PTY and key input through VHS/ttyd. No authenticated AI planning was invoked.",
-  "presentation_notes": "The full-resolution 47-second frame shows the running status and submitted command without a new shell prompt. The completed frame restores the prompt after output and status. Ctrl-L retains terminal history in this version. A transient diagnostic appears while the Bash island is incomplete; the completed command succeeds. Visible timings describe this local recording session, not release benchmark measurements.",
-  "release_url": "https://github.com/niklas-heer/quirl/releases/tag/v0.3.0",
-  "release_asset_url": "https://github.com/niklas-heer/quirl/releases/download/v0.3.0/quirl-v0.3.0-aarch64-apple-darwin.tar"
+  "artifact_scope": "Recorded the exact executable extracted from the macOS ARM package published in the immutable v0.5.1 GitHub release. Its digest matches the passing native performance report.",
+  "session_scope": "Isolated temporary HOME, config, history, plugin directories, cache, a small Git repository, and a .env file. Real PTY and key input through VHS/ttyd. No authenticated AI planning was invoked.",
+  "presentation_notes": "The loop is typed out of view and appears whole, as a paste would. The agent line ends with an echo because ssh-add -l exits 1 when the new agent holds no keys. Ctrl-L hides earlier output from view in this version.",
+  "release_url": "https://github.com/niklas-heer/quirl/releases/tag/v0.5.1",
+  "release_asset_url": "https://github.com/niklas-heer/quirl/releases/download/v0.5.1/quirl-v0.5.1-aarch64-apple-darwin.tar"
 }

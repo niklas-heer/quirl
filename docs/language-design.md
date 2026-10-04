@@ -1,6 +1,6 @@
 # Quirl language and product design
 
-**Product direction with an evidence-bounded current contract · Quirl 0.3.0**
+**Product direction with an evidence-bounded current contract · Quirl 0.5.1**
 
 > **The development environment in your terminal.** Your shell should feel as smart as your editor.
 
@@ -9,11 +9,11 @@ performance, and a well-tooled Lua extension language with an IDE-grade editing
 experience. Completion, diagnostics, documentation, prompt context, and
 interactive views are one product—not a pile of plugins.
 
-## Current 0.3 release contract
+## Current 0.5 release contract
 
-This is the implemented contract for the 0.3 release line. The supported
+This is the implemented contract for the 0.5 release line. The supported
 artifact is the immutable
-[`v0.3.0` GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.3.0);
+[`v0.5.1` GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.5.1);
 untagged source remains candidate or development work:
 
 - On Linux and macOS, the native C1-core includes byte pipelines, redirects,
@@ -48,8 +48,8 @@ untagged source remains candidate or development work:
   separate immutable SQLite artifact; neither replaces the CLI-owned mutable
   intelligence cache.
 
-The implemented product line is **0.3.x**. Version 0.3.0 names immutable commit
-`dfb43e54320d166ebe195bb5a0255b8aacbb11e5`. The historical 0.1.0 release names
+The implemented product line is **0.5.x**. Version 0.5.1 names immutable commit
+`3f0064cbd2af644630b7a50e75a57103186b8a91`. The historical 0.1.0 release names
 commit `168f9f2e2f2899f7910ca64831561c8885d9ef24`. A source checkout is not a
 supported release merely because its workspace version matches one. In
 this document, “1.0” is either a historical/accepted scope label from an ADR or

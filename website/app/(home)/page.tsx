@@ -26,7 +26,7 @@ export default function HomePage() {
       <section className="hero">
         <div className="pill">
           <span className="dot" />
-          v0.4.0 · Linux and macOS
+          v0.5.1 · Linux and macOS
         </div>
         <p className="kicker">A well-stirred shell</p>
         <h1 className="glitch-h1">
@@ -38,10 +38,10 @@ export default function HomePage() {
           </span>
         </h1>
         <p className="lede">
-          Quirl keeps the Bash and Zsh commands you already know and completes
-          them the way Zsh does, then adds explicit typed data pipelines and
-          one sandboxed Lua 5.5.1 SDK for configuration, scripts, prompts,
-          completions, and plugins.
+          Quirl keeps the Bash and Zsh habits you already have, from pasted
+          loops to <code>source .env</code>, completes the way Zsh does, and
+          adds Nushell-style typed data and one sandboxed Lua 5.5.1 SDK for
+          configuration, scripts, prompts, completions, and plugins.
         </p>
         <div className="actions">
           <Link
@@ -67,19 +67,18 @@ export default function HomePage() {
       <div className="demo-wrap">
         <div
           className="cassette demo-cassette"
-          aria-label="Quirl v0.3.0 recording"
+          aria-label="Quirl v0.5.1 recording"
         >
           <div className="cassette-label">
-            <span>SIDE A — QUIRL v0.3.0</span>
+            <span>SIDE A — QUIRL v0.5.1</span>
             <CassetteReels />
           </div>
           <HeroDemo />
           <p id="demo-recording-context" style={{ padding: '1rem', margin: 0 }}>
-            Recorded with the published macOS ARM release package for v0.3.0 from commit <code>dfb43e5</code>.
+            Recorded with the published macOS ARM release package for v0.5.1 from commit <code>3f0064c</code>.
             {' '}See the <a href="/quirl-demo-provenance.json">recording provenance</a>,
             {' '}<Link href="/docs/getting-started/first-session">first-session guide</Link>,
-            {' '}and <Link href="/docs/research/benchmarks/release-v0.3.0">release measurements</Link>.
-            {' '}Search results are candidates to review.
+            {' '}and <Link href="/docs/research/benchmarks/release-v0.5.1">release measurements</Link>.
           </p>
         </div>
       </div>
@@ -102,10 +101,11 @@ export default function HomePage() {
               <CassetteReels />
             </div>
             <div className="cassette-body">
-              <h3>Familiar command mode</h3>
+              <h3>Your habits, intact</h3>
               <p>
-                Quoting, redirects, byte pipes, boolean lists, and jobs run
-                natively, with Bash and Zsh islands for the rest.
+                Pipes, redirects, jobs, and variables run natively. Pasted
+                loops, <code>source</code>, and <code>eval</code> run through{' '}
+                <code>/bin/sh</code> and keep their variables.
               </p>
             </div>
           </article>
@@ -117,8 +117,9 @@ export default function HomePage() {
             <div className="cassette-body">
               <h3>Typed data pipelines</h3>
               <p>
-                Switch explicitly into structured values and use focused
-                transforms instead of parsing columns with text tools.
+                <code>where</code>, <code>sort-by</code>, <code>group-by</code>,
+                and exact <code>math</code> over JSON, YAML, TOML, CSV, and
+                files, in colored tables that fit your terminal.
               </p>
             </div>
           </article>
@@ -143,12 +144,45 @@ export default function HomePage() {
             <div className="cassette-body">
               <h3>Completion like Zsh</h3>
               <p>
-                Tab inserts, extends, and lists exactly as Zsh does, asks your
-                installed Zsh for branches, targets, and hosts, and documents
-                every candidate from one semantic catalog.
+                Tab inserts, extends, and lists as Zsh does, asks Zsh and tools
+                like <code>docker</code> and <code>kubectl</code> for values,
+                and documents every candidate.
               </p>
             </div>
           </article>
+        </div>
+      </section>
+
+      <section aria-labelledby="gallery-title">
+        <p className="section-label">See it</p>
+        <div className="section-heading">
+          <h2 id="gallery-title">Real sessions, real output.</h2>
+          <p>
+            Every image comes from the published release binary running an
+            isolated demo workspace.
+          </p>
+        </div>
+        <div className="gallery-grid">
+          {[
+            ['completion', 'Completion with documentation', 'Tab after git checkout lists the project\'s feature branches with documentation beside them.'],
+            ['posix-habits', 'Pasted Bash keeps working', 'source .env sets variables that a pasted for-loop then uses.'],
+            ['data-table', 'Typed data from a file', 'open services.json renders a colored table of services, regions, latencies, and statuses.'],
+            ['data-pipeline', 'Readable pipelines', 'A where, sort-by, and select pipeline, a group-by, and an exact math avg.'],
+          ].map(([name, title, alt]) => (
+            <figure key={name} className="cassette gallery-shot">
+              <div className="cassette-label">
+                <span>{title}</span>
+                <CassetteReels />
+              </div>
+              <Image
+                src={`/screenshots/${name}.png`}
+                width={1200}
+                height={600}
+                alt={alt}
+                sizes="(max-width: 900px) 100vw, 50vw"
+              />
+            </figure>
+          ))}
         </div>
       </section>
 
@@ -289,12 +323,14 @@ export default function HomePage() {
             <CassetteReels />
           </div>
           <div className="cassette-body">
-            <h2>The 0.4 release is here.</h2>
+            <h2>The 0.5 release is here.</h2>
             <p>
-              Quirl 0.4.0 completes the way Zsh does, from unique matches and
-              shared prefixes to live Git branches, Make targets, and SSH hosts.
-              It is available for Linux and macOS through Homebrew and
-              immutable native release archives.
+              Quirl 0.5 is safe as your login shell: <code>ssh</code>,{' '}
+              <code>scp</code>, <code>rsync</code>, and editors get exact POSIX
+              behavior, and pasted loops, <code>source</code>, and{' '}
+              <code>eval</code> just work. Data mode gains Nushell&apos;s verbs
+              and tables that fit, and Tab asks <code>docker</code>,{' '}
+              <code>kubectl</code>, and <code>gh</code> for completions.
             </p>
             <Link href="/docs" className="text-link">
               Explore everything →
