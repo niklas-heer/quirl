@@ -897,22 +897,23 @@ fn transcript_line_is_selected(
 }
 
 fn table_transcript_line(text: &str, theme: Theme) -> Line<'static> {
-    let content_style = if table_heading_line(text) {
-        theme.accent(Mode::Command)
-    } else {
-        Style::default()
-    };
+    let heading = table_heading_line(text);
     let mut spans = Vec::new();
     let mut content_start = 0_usize;
+    let mut column = 0_usize;
     for (index, character) in text.char_indices() {
         if character != '│' {
             continue;
         }
         if content_start < index {
-            spans.push(Span::styled(
-                escape_terminal_line(text.get(content_start..index).unwrap_or_default()),
-                content_style,
-            ));
+            let cell = text.get(content_start..index).unwrap_or_default();
+            let style = if heading {
+                theme.accent(Mode::Command)
+            } else {
+                table_cell_style(cell.trim(), column, theme)
+            };
+            spans.push(Span::styled(escape_terminal_line(cell), style));
+            column = column.saturating_add(1);
         }
         spans.push(Span::styled("│", theme.border()));
         content_start = index.saturating_add(character.len_utf8());
@@ -920,10 +921,57 @@ fn table_transcript_line(text: &str, theme: Theme) -> Line<'static> {
     if content_start < text.len() {
         spans.push(Span::styled(
             escape_terminal_line(text.get(content_start..).unwrap_or_default()),
-            content_style,
+            Style::default(),
         ));
     }
     Line::from(spans)
+}
+
+/// Color one table body cell by what its rendered text shows, the way
+/// Nushell colors values: a dim row index, accented record keys, numbers and
+/// sizes in the number color, times in the secondary context color, and
+/// empty values, summaries, and elisions dimmed.
+fn table_cell_style(cell: &str, column: usize, theme: Theme) -> Style {
+    if column == 0 {
+        // Tables number their rows; records list their keys first.
+        return if cell.bytes().all(|byte| byte.is_ascii_digit()) {
+            theme.dim()
+        } else {
+            theme.accent(Mode::Command)
+        };
+    }
+    let summary = ["[list ", "[table ", "{record "]
+        .iter()
+        .any(|prefix| cell.starts_with(prefix));
+    if summary || matches!(cell, "—" | "·" | "…") {
+        return theme.dim();
+    }
+    if cell == "✓" {
+        return theme.highlight(HighlightKind::StringDouble);
+    }
+    if table_cell_is_quantity(cell) {
+        return theme.highlight(HighlightKind::Number);
+    }
+    if cell == "now" || cell.ends_with(" ago") || cell.starts_with("in ") {
+        return theme.context_secondary();
+    }
+    Style::default()
+}
+
+/// Whether a cell shows a number, optionally with a size unit (`12.3 kB`).
+fn table_cell_is_quantity(cell: &str) -> bool {
+    let (number, unit) = cell.split_once(' ').unwrap_or((cell, ""));
+    let number = number.strip_prefix('-').unwrap_or(number);
+    let numeric = !number.is_empty()
+        && number
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        && number
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_digit());
+    let sized = matches!(unit, "" | "B" | "kB" | "MB" | "GB" | "TB" | "PB" | "EB");
+    numeric && sized
 }
 
 fn table_heading_line(text: &str) -> bool {
@@ -1652,8 +1700,41 @@ mod tests {
 
         let row = table_transcript_line("│ 0 │ file │", theme);
         assert_eq!(row.spans[0].style, theme.border());
-        assert_eq!(row.spans[1].style, Style::default());
+        assert_eq!(row.spans[1].style, theme.dim());
         assert_eq!(row.spans[2].style, theme.border());
+        assert_eq!(row.spans[3].style, Style::default());
+    }
+
+    #[test]
+    fn table_values_are_colored_by_what_they_show() {
+        let theme = Theme::new(true);
+        let row = table_transcript_line(
+            "│ 3 │ api │ 16.4 kB │ 2 weeks ago │ ✓ │ — │ [list 2 items] │ -12.5 │",
+            theme,
+        );
+        let styles = row
+            .spans
+            .iter()
+            .filter(|span| span.content != "│")
+            .map(|span| span.style)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            styles,
+            [
+                theme.dim(),
+                Style::default(),
+                theme.highlight(HighlightKind::Number),
+                theme.context_secondary(),
+                theme.highlight(HighlightKind::StringDouble),
+                theme.dim(),
+                theme.dim(),
+                theme.highlight(HighlightKind::Number),
+            ]
+        );
+        let record = table_transcript_line("│ owner │ ada │", theme);
+        assert_eq!(record.spans[1].style, theme.accent(Mode::Command));
+        assert!(!table_cell_is_quantity("v1.2"));
+        assert!(!table_cell_is_quantity("12 apples"));
     }
 
     fn rendered_model_in_mode(
