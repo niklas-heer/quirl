@@ -24,6 +24,7 @@ mod package;
 mod pick;
 mod platform;
 mod plugin;
+mod posix_invocation;
 mod project_clone;
 mod projects;
 mod protocol;
@@ -61,9 +62,7 @@ use quirl_core::{
     escape_json_terminal_controls, escape_terminal_controls, reject_terminal_controls,
 };
 use quirl_data::{DataEnvelope, DataOutput, DataRenderFormat, DataRuntime};
-use quirl_lua::{
-    LuaPolicy, MAX_LUA_SOURCE_BYTES, ProjectsConfig, QuirlConfig, sdk_json, sdk_lua, sdk_markdown,
-};
+use quirl_lua::{LuaPolicy, ProjectsConfig, QuirlConfig, sdk_json, sdk_lua, sdk_markdown};
 use quirl_picker::{
     ItemKind, MAX_PICKER_ITEM_TEXT_BYTES, MAX_PICKER_ITEM_VALUE_BYTES, MAX_PICKER_ITEMS,
     MAX_PICKER_QUERY_BYTES, MAX_PICKER_REQUEST_BYTES, PICKER_PROTOCOL_VERSION, PickItem,
@@ -90,7 +89,7 @@ use recovery::RecoveryCommand;
 use script::ScriptLanguage;
 use std::{
     collections::{BTreeMap, VecDeque},
-    io::{self, IsTerminal, Read, Write},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{Arc, Mutex, RwLock, atomic::AtomicBool, mpsc},
@@ -332,10 +331,18 @@ fn main() -> ExitCode {
             Err(_) => ExitCode::FAILURE,
         };
     }
+    // Programs that start Quirl as a shell use POSIX options (`-c`, `-l`, a
+    // `-quirl` argv0). Recognize them before Clap so they stay cheap.
+    let mut arguments = std::env::args_os();
+    let argv0 = arguments.next().unwrap_or_default();
+    let arguments: Vec<_> = arguments.collect();
+    if let Some(invocation) = posix_invocation::PosixInvocation::parse(&argv0, &arguments) {
+        return run_posix_invocation(&invocation);
+    }
     // An empty invocation has no switches to validate. Keep command-tree
     // construction out of shell startup; every supplied argument still goes
     // through Clap, and `run` retains interactive versus stdin selection.
-    let cli = if std::env::args_os().nth(1).is_none() {
+    let cli = if arguments.is_empty() {
         Cli::default()
     } else {
         Cli::parse()
@@ -373,6 +380,40 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("{}", render_stderr_error(&error));
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Serve an invocation from a program that starts Quirl as its shell.
+fn run_posix_invocation(invocation: &posix_invocation::PosixInvocation) -> ExitCode {
+    let action = match invocation.action(io::stdin().is_terminal()) {
+        Ok(action) => action,
+        Err(error) => {
+            eprintln!("{}", render_stderr_error(&error));
+            return ExitCode::from(2);
+        }
+    };
+    match action {
+        posix_invocation::PosixAction::DelegateToShell => {
+            let error = posix_invocation::delegate_to_shell(invocation);
+            eprintln!("{}", render_stderr_error(&error));
+            ExitCode::from(127)
+        }
+        posix_invocation::PosixAction::Interactive { login } => {
+            if login {
+                // Returns only when adopting the login environment failed;
+                // the session still starts, with the inherited environment.
+                let error = posix_invocation::reexecute_with_login_environment();
+                eprintln!("{}", render_stderr_error(&error));
+            }
+            let host = LuaExtensionHost::discover();
+            match repl(Arc::new(Mutex::new(host))) {
+                Ok(status) => ExitCode::from(u8::try_from(status.clamp(0, 255)).unwrap_or(u8::MAX)),
+                Err(error) => {
+                    eprintln!("{}", render_stderr_error(&error));
+                    ExitCode::FAILURE
+                }
+            }
         }
     }
 }
@@ -539,7 +580,11 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
         Some(Command::Watch { command }) => platform::execute_watch(command),
         Some(Command::Recover { command }) => recovery::execute(command),
         Some(Command::Exec { source, .. }) => run_exec_with_recovery(&source),
-        None if !io::stdin().is_terminal() => run_stdin(),
+        // A script on standard input is POSIX shell code, as for `sh`.
+        None if !io::stdin().is_terminal() => {
+            let invocation = posix_invocation::PosixInvocation::standard_input();
+            Err(posix_invocation::delegate_to_shell(&invocation))
+        }
         None => {
             let host = LuaExtensionHost::discover();
             repl(Arc::new(Mutex::new(host)))
@@ -4296,49 +4341,6 @@ fn eval_lua(
     let outcome = deadline_guard.finish(result, &plan, "during interactive Lua execution")?;
     plan.ensure_active("before interactive Lua outcome commit")?;
     Ok(outcome)
-}
-
-fn run_stdin() -> Result<i32, ShellError> {
-    let mut bytes = Vec::new();
-    io::stdin()
-        .take(u64::try_from(MAX_LUA_SOURCE_BYTES.saturating_add(1)).unwrap_or(u64::MAX))
-        .read_to_end(&mut bytes)
-        .map_err(|error| {
-            ShellError::new(ErrorCode::Io, "could not read standard input")
-                .with_context(error.to_string())
-                .with_help(
-                    "Check that standard input is connected and not closed by the calling shell",
-                )
-        })?;
-    if bytes.len() > MAX_LUA_SOURCE_BYTES {
-        return Err(ShellError::new(
-            ErrorCode::ResourceLimit,
-            "standard-input Lua source exceeds its read limit",
-        )
-        .with_context(format!(
-            "bytes: {}; limit: {MAX_LUA_SOURCE_BYTES}",
-            bytes.len()
-        ))
-        .with_help("Keep executable source below 4 MiB and load data through bounded inputs"));
-    }
-    let source = String::from_utf8(bytes).map_err(|error| {
-        ShellError::new(
-            ErrorCode::ScriptRead,
-            "standard-input Lua source is not valid UTF-8",
-        )
-        .with_context(error.to_string())
-        .with_help("Encode Lua source as UTF-8")
-    })?;
-    let request = execution_request(
-        "<stdin>",
-        &source,
-        ExecutionMode::Lua,
-        ExecutionOutputTarget::Value,
-        ExecutionEffects::from_effects(&[ExecutionEffect::SpawnProcess]),
-    )?;
-    let outcome = execute_execution_request(&mut NativeExecutor::default(), request, None)?;
-    print_execution_value(&outcome)?;
-    Ok(outcome.status_code())
 }
 
 fn print_catalog(catalog: &Catalog) {

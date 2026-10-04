@@ -146,6 +146,10 @@ builds. Current limits worth knowing:
 
 - Here-documents, process substitution, loops, functions, and other dialect
   control forms run in explicit Bash or Zsh islands.
+- `quirl -c` and piped scripts run in `/bin/sh`, and `eval` and `source` keep
+  the variables shell setup code exports, so Quirl is safe as a login shell
+  for SSH, `scp`, `rsync`, Git, and editors. Functions and aliases from
+  sourced code stay inside it.
 - Wasm packages validate but do not execute, and package publishing is a local
   dry run.
 - Windows interactive terminal behavior is outside the supported targets.

@@ -5,6 +5,21 @@ description: "Generated builtin command contracts from Quirl; installed completi
 
 {/* Generated from Quirl's compiled builtin contracts in an empty profile. Run npm run sync:reference; do not edit this page by hand. */}
 
+## `. <file> [args...]`
+
+Run a shell script and keep its variables
+
+The POSIX spelling of `source`, with the same behavior.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
+Options:
+
+- `args` — The `args` argument
+- `file` — The `file` argument
+
 ## `bg [%job]`
 
 Resume a stopped job in the background
@@ -33,11 +48,25 @@ Options:
 
 - `path` — The `path` argument
 
-## `export NAME=value...`
+## `eval <code...>`
+
+Run shell setup code and keep its variables
+
+Joins its arguments with spaces and runs them in the system POSIX shell, `/bin/sh`, as a foreground command. Afterwards the session adopts the exported environment and working directory the code ended with, so `eval "$(ssh-agent -s)"` and `eval "$(brew shellenv)"` work as in Bash or Zsh. Session variables are visible to the code. Variables it sets without `export`, functions, and aliases stay inside it.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
+Options:
+
+- `code` — The `code` argument
+
+## `export NAME[=value]...`
 
 Set environment variables for later commands
 
-The Preview grammar accepts explicit NAME=value assignments without shell expansion.
+`export NAME=value` sets and exports a variable. `export NAME` exports a variable an earlier bare `NAME=value` set, as setup code such as `ssh-agent -s` prints. A bare `NAME=value` sets a shell variable that later expansions see but child processes do not, and `NAME=value command` sets a variable for that one command.
 
 - Input: `Nothing`
 - Output: `Bytes`
@@ -1131,3 +1160,28 @@ Options:
 - `--format` — Choose live lines or a bounded JSON snapshot
 - `--interval-ms` — Set the cancellable refresh interval
 - `--samples` — Set a bounded sample count
+
+## `source <file> [args...]`
+
+Run a shell script and keep its variables
+
+Runs the file in the system POSIX shell, `/bin/sh`, with any arguments as its positional parameters. Afterwards the session adopts the exported environment and working directory the script ended with, so `source .venv/bin/activate` or `source .env` work. A name without a slash refers to the file in the current directory when one exists. Variables set without `export`, functions such as a virtual environment's `deactivate`, and aliases stay inside the script.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
+Options:
+
+- `args` — The `args` argument
+- `file` — The `file` argument
+
+## `unset NAME...`
+
+Remove shell and environment variables
+
+Removes each named variable from the session, whether exported or not. Names that are not set are ignored. Quirl has no shell functions, so `unset -f` is rejected.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`

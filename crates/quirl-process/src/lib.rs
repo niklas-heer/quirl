@@ -20,6 +20,8 @@ mod builtin;
 mod developer_context;
 pub mod local_completion;
 #[cfg(unix)]
+mod posix_island;
+#[cfg(unix)]
 pub mod pty;
 mod spawn_lock;
 
@@ -100,9 +102,17 @@ pub struct TerminalPipelineRequest<'a> {
 pub type OutputObserver<'a> =
     dyn FnMut(ObservedActivity<'_>) -> Result<(), quirl_core::ShellError> + 'a;
 
+/// Shell variables of one session, split by POSIX export attribute.
+///
+/// Invariant: a name appears in at most one of `variables` and `locals`.
+/// Children receive only `variables`; parameter expansion sees both. The
+/// variable and byte limits bound the two maps together.
 #[derive(Clone)]
 pub(crate) struct SessionEnvironment {
+    /// Exported variables passed to every child process.
     variables: BTreeMap<OsString, OsString>,
+    /// Unexported shell variables, such as those set by a bare `NAME=value`.
+    locals: BTreeMap<OsString, OsString>,
     initialization_error: Option<quirl_core::ShellError>,
     generation: u64,
 }
@@ -130,11 +140,13 @@ impl SessionEnvironment {
         match Self::from_iter_with_limits(variables, variables_max, bytes_max) {
             Ok(variables) => Self {
                 variables,
+                locals: BTreeMap::new(),
                 initialization_error: None,
                 generation: 0,
             },
             Err(error) => Self {
                 variables: BTreeMap::new(),
+                locals: BTreeMap::new(),
                 initialization_error: Some(error),
                 generation: 0,
             },
@@ -178,10 +190,14 @@ impl SessionEnvironment {
     }
 
     fn value(&self, name: &str) -> String {
-        self.variables
-            .get(OsStr::new(name))
+        self.lookup(name)
             .and_then(|value| value.to_str().map(str::to_owned))
             .unwrap_or_default()
+    }
+
+    fn lookup(&self, name: &str) -> Option<&OsString> {
+        let name = OsStr::new(name);
+        self.variables.get(name).or_else(|| self.locals.get(name))
     }
 
     /// Whether `name` has any recorded value, distinguishing an unset
@@ -190,7 +206,13 @@ impl SessionEnvironment {
     /// `${VAR=word}`, `${VAR?word}`) need this distinction; `value` alone
     /// cannot provide it because it returns an empty string for both.
     fn is_set(&self, name: &str) -> bool {
-        self.variables.contains_key(OsStr::new(name))
+        self.lookup(name).is_some()
+    }
+
+    /// Unexported variables, for code handed to a POSIX shell so it observes
+    /// the same parameters this session expands.
+    fn local_variables(&self) -> impl Iterator<Item = (&OsString, &OsString)> {
+        self.locals.iter()
     }
 
     fn resolve_executable(&self, program: &str) -> Option<std::path::PathBuf> {
@@ -211,34 +233,114 @@ impl SessionEnvironment {
         })
     }
 
+    /// Set and export variables, as `export NAME=value` does.
     fn set_variables(
         &mut self,
         assignments: &[(String, String)],
     ) -> Result<(), quirl_core::ShellError> {
         self.ensure_valid()?;
-        let mut staged = self.variables.clone();
+        let mut exported = self.variables.clone();
+        let mut locals = self.locals.clone();
         for (name, value) in assignments {
             validate_environment_assignment(name, value)?;
-            staged.insert(OsString::from(name), OsString::from(value));
+            locals.remove(OsStr::new(name));
+            exported.insert(OsString::from(name), OsString::from(value));
         }
-        let retained_bytes = staged.iter().fold(0_usize, |retained, (name, value)| {
-            retained
-                .saturating_add(name.len())
-                .saturating_add(value.len())
-        });
-        if staged.len() > SESSION_ENVIRONMENT_VARIABLES_MAX {
+        self.commit(exported, locals)
+    }
+
+    /// Assign variables as a bare `NAME=value` does: an exported variable
+    /// keeps its export attribute, and any other becomes an unexported local.
+    fn assign_variables(
+        &mut self,
+        assignments: &[(String, String)],
+    ) -> Result<(), quirl_core::ShellError> {
+        self.ensure_valid()?;
+        let mut exported = self.variables.clone();
+        let mut locals = self.locals.clone();
+        for (name, value) in assignments {
+            validate_environment_assignment(name, value)?;
+            let name = OsString::from(name);
+            if let Some(current) = exported.get_mut(&name) {
+                *current = OsString::from(value);
+            } else {
+                locals.insert(name, OsString::from(value));
+            }
+        }
+        self.commit(exported, locals)
+    }
+
+    /// Give existing variables the export attribute, as `export NAME` does.
+    /// A name with no value stays unset, matching `export NAME` in `sh`.
+    fn export_names(&mut self, names: &[String]) -> Result<(), quirl_core::ShellError> {
+        self.ensure_valid()?;
+        let mut exported = self.variables.clone();
+        let mut locals = self.locals.clone();
+        for name in names {
+            validate_environment_assignment(name, "")?;
+            if let Some(value) = locals.remove(OsStr::new(name)) {
+                exported.insert(OsString::from(name), value);
+            }
+        }
+        self.commit(exported, locals)
+    }
+
+    /// Remove variables, as `unset NAME` does. Unknown names are ignored.
+    fn unset_names(&mut self, names: &[String]) -> Result<(), quirl_core::ShellError> {
+        self.ensure_valid()?;
+        let mut exported = self.variables.clone();
+        let mut locals = self.locals.clone();
+        for name in names {
+            validate_environment_assignment(name, "")?;
+            exported.remove(OsStr::new(name));
+            locals.remove(OsStr::new(name));
+        }
+        self.commit(exported, locals)
+    }
+
+    /// Replace the exported variables with the environment a POSIX shell
+    /// ended with, keeping locals the shell did not export.
+    fn import_exported(
+        &mut self,
+        imported: BTreeMap<OsString, OsString>,
+    ) -> Result<(), quirl_core::ShellError> {
+        self.ensure_valid()?;
+        let mut locals = self.locals.clone();
+        locals.retain(|name, _| !imported.contains_key(name));
+        self.commit(imported, locals)
+    }
+
+    /// Validate both maps against the shared limits, then publish them.
+    fn commit(
+        &mut self,
+        exported: BTreeMap<OsString, OsString>,
+        locals: BTreeMap<OsString, OsString>,
+    ) -> Result<(), quirl_core::ShellError> {
+        let variable_count = exported.len().saturating_add(locals.len());
+        if variable_count > SESSION_ENVIRONMENT_VARIABLES_MAX {
             return Err(environment_variable_limit_error(
                 SESSION_ENVIRONMENT_VARIABLES_MAX,
-                staged.len(),
+                variable_count,
             ));
         }
+        let retained_bytes =
+            exported
+                .iter()
+                .chain(locals.iter())
+                .fold(0_usize, |retained, (name, value)| {
+                    retained
+                        .saturating_add(name.len())
+                        .saturating_add(value.len())
+                });
         if retained_bytes > SESSION_ENVIRONMENT_BYTES_MAX {
             return Err(environment_byte_limit_error(
                 SESSION_ENVIRONMENT_BYTES_MAX,
                 retained_bytes,
             ));
         }
-        if staged != self.variables {
+        // Children observe only exported variables, so only those advance
+        // the generation that tells observers to refresh derived state.
+        if exported != self.variables {
             let generation = self.generation.checked_add(1).ok_or_else(|| {
                 quirl_core::ShellError::new(
                     quirl_core::ErrorCode::ResourceLimit,
@@ -246,9 +348,10 @@ impl SessionEnvironment {
                 )
                 .with_help("Restart Quirl before applying another environment update")
             })?;
-            self.variables = staged;
+            self.variables = exported;
             self.generation = generation;
         }
+        self.locals = locals;
         Ok(())
     }
 }
@@ -288,6 +391,38 @@ fn validate_environment_assignment(name: &str, value: &str) -> Result<(), quirl_
         return Err(interior_nul_error("environment value"));
     }
     Ok(())
+}
+
+/// Program that applies `NAME=value` words before a command, as `sh` does.
+#[cfg(unix)]
+const PREFIX_ASSIGNMENT_RUNNER: &str = "/usr/bin/env";
+
+/// Split a `NAME=value` assignment word into its name and value word.
+///
+/// Only an unquoted `NAME=` at the start of the word makes an assignment,
+/// as in `sh`: `"A=1"` and `$X` that expands to `A=1` are ordinary words.
+#[cfg(unix)]
+fn assignment_parts(word: &quirl_syntax::Word) -> Option<(String, quirl_syntax::Word)> {
+    let first = word.parts.first()?;
+    if first.quoting != quirl_syntax::Quoting::Unquoted {
+        return None;
+    }
+    let (name, rest) = first.text.split_once('=')?;
+    let mut characters = name.chars();
+    let valid_name = characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric());
+    if !valid_name {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(word.parts.len());
+    parts.push(quirl_syntax::WordPart {
+        text: rest.to_owned(),
+        quoting: quirl_syntax::Quoting::Unquoted,
+    });
+    parts.extend(word.parts.iter().skip(1).cloned());
+    Some((name.to_owned(), quirl_syntax::Word { parts }))
 }
 
 fn noninteractive_process_error(source: &str, message: &str) -> quirl_core::ShellError {
@@ -1872,6 +2007,11 @@ mod platform {
             if let Some(request) = request {
                 request.ensure_active()?;
             }
+            if let Some(result) =
+                self.execute_assignment_only(pipeline, source, request, previous_status)?
+            {
+                return Ok(result);
+            }
             let pipeline = self.expand_pipeline(pipeline, request, previous_status)?;
             let pipeline = &pipeline;
             if self.noninteractive_host && pipeline.background {
@@ -1888,21 +2028,17 @@ mod platform {
                     )
                     .with_help("Provide at least one command in each pipeline"));
                 };
-                if self.noninteractive_host
-                    && command.words.first().is_some_and(|name| {
-                        matches!(name.as_str(), "cd" | "export" | "jobs" | "fg" | "bg")
-                    })
-                {
+                let stateful = command
+                    .words
+                    .first()
+                    .is_some_and(|name| builtin::is_stateful(name));
+                if self.noninteractive_host && stateful {
                     return Err(super::noninteractive_process_error(
                         source,
                         "stateful and job-control built-ins are unavailable to isolated Lua",
                     ));
                 }
-                if pipeline.background
-                    && command.words.first().is_some_and(|name| {
-                        matches!(name.as_str(), "cd" | "export" | "jobs" | "fg" | "bg")
-                    })
-                {
+                if pipeline.background && stateful {
                     return Err(ShellError::new(
                         ErrorCode::InvalidArgument,
                         "stateful built-ins cannot run in the background",
@@ -1910,10 +2046,31 @@ mod platform {
                     .with_command(source)
                     .with_help("Run the built-in without `&`"));
                 }
+                if let Some(kind) = command
+                    .words
+                    .first()
+                    .and_then(|name| super::posix_island::IslandKind::for_builtin(name))
+                {
+                    return self
+                        .execute_posix_island(kind, command, source, capture, request, observer);
+                }
                 if let Some(result) = self.execute_control_builtin(command, capture, request)? {
                     return Ok(result);
                 }
             }
+            self.run_external_pipeline(pipeline, source, capture, request, observer)
+        }
+
+        /// Run an expanded pipeline of external programs, offering it to a
+        /// terminal owner first when one observes captured execution.
+        fn run_external_pipeline(
+            &mut self,
+            pipeline: &Pipeline,
+            source: &str,
+            capture: bool,
+            request: Option<RequestContext<'_>>,
+            observer: Option<&OutputObserverHandle<'_>>,
+        ) -> Result<CommandOutcome, ShellError> {
             if capture
                 && !pipeline.background
                 && let Some(observer) = observer
@@ -1934,6 +2091,139 @@ mod platform {
                 }
             }
             self.spawn_pipeline(pipeline, source, capture, request, observer)
+        }
+
+        /// Run `eval` or `source` in `/bin/sh` as one foreground pipeline,
+        /// then import the exported environment and directory it reported.
+        fn execute_posix_island(
+            &mut self,
+            kind: super::posix_island::IslandKind,
+            command: &SimpleCommand,
+            source: &str,
+            capture: bool,
+            request: Option<RequestContext<'_>>,
+            observer: Option<&OutputObserverHandle<'_>>,
+        ) -> Result<CommandOutcome, ShellError> {
+            self.environment.ensure_valid()?;
+            let state = super::posix_island::IslandState::create()?;
+            let operands = command.words.get(1..).unwrap_or_default();
+            let words = state.command_words(kind, operands, self.environment.local_variables())?;
+            let word_ir = words
+                .iter()
+                .map(|word| Word {
+                    parts: vec![quirl_syntax::WordPart {
+                        text: word.clone(),
+                        quoting: quirl_syntax::Quoting::Single,
+                    }],
+                })
+                .collect();
+            let island = Pipeline {
+                commands: vec![SimpleCommand {
+                    words,
+                    word_ir,
+                    redirects: command.redirects.clone(),
+                }],
+                background: false,
+            };
+            let outcome =
+                self.run_external_pipeline(&island, source, capture, request, observer)?;
+            if let Some(reported) = state.outcome()? {
+                self.import_island(reported)?;
+            }
+            Ok(outcome)
+        }
+
+        /// Adopt what a POSIX shell island ended with. Variables whose names
+        /// a shell cannot express are kept, since the island could not have
+        /// changed them and may simply have dropped them.
+        fn import_island(
+            &mut self,
+            reported: super::posix_island::IslandOutcome,
+        ) -> Result<(), ShellError> {
+            let mut exported = reported.exported;
+            for (name, value) in &self.environment.variables {
+                let expressible = name
+                    .to_str()
+                    .is_some_and(super::posix_island::is_shell_name);
+                if !expressible {
+                    exported
+                        .entry(name.clone())
+                        .or_insert_with(|| value.clone());
+                }
+            }
+            self.environment.import_exported(exported)?;
+            let current = std::env::current_dir().ok();
+            if current.as_deref() != Some(reported.directory.as_path()) {
+                builtin::change_directory(&reported.directory)?;
+            }
+            Ok(())
+        }
+
+        /// Handle a lone command made only of `NAME=value` words, which sets
+        /// shell variables instead of running anything. Values receive the
+        /// usual expansions but never pathname expansion, as in `sh`.
+        fn execute_assignment_only(
+            &mut self,
+            pipeline: &Pipeline,
+            source: &str,
+            request: Option<RequestContext<'_>>,
+            previous_status: i32,
+        ) -> Result<Option<CommandOutcome>, ShellError> {
+            let [command] = pipeline.commands.as_slice() else {
+                return Ok(None);
+            };
+            if command.word_ir.is_empty()
+                || !command
+                    .word_ir
+                    .iter()
+                    .all(|word| crate::assignment_parts(word).is_some())
+            {
+                return Ok(None);
+            }
+            if pipeline.background || !command.redirects.is_empty() {
+                return Err(ShellError::new(
+                    ErrorCode::InvalidArgument,
+                    "a variable assignment cannot run in the background or be redirected",
+                )
+                .with_command(source)
+                .with_help("Write the assignment on its own, e.g. `NAME=value`"));
+            }
+            if self.noninteractive_host {
+                return Err(super::noninteractive_process_error(
+                    source,
+                    "shell variable assignments are unavailable to isolated Lua",
+                ));
+            }
+            let assignments =
+                self.expand_assignments(&command.word_ir, request, previous_status)?;
+            self.environment.assign_variables(&assignments)?;
+            Ok(Some(outcome(0, Some(String::new()), Some(String::new()))))
+        }
+
+        /// Expand leading `NAME=value` words into name/value pairs.
+        fn expand_assignments(
+            &mut self,
+            forms: &[Word],
+            request: Option<RequestContext<'_>>,
+            previous_status: i32,
+        ) -> Result<Vec<(String, String)>, ShellError> {
+            const MAX_SUBSTITUTION_BYTES: usize = 16 * 1024;
+            let mut budget = ExpansionBudget::new();
+            let mut assignments = Vec::with_capacity(forms.len());
+            for form in forms {
+                let Some((name, value)) = crate::assignment_parts(form) else {
+                    break;
+                };
+                let expanded = self.expand_word(
+                    &value,
+                    MAX_SUBSTITUTION_BYTES,
+                    request,
+                    previous_status,
+                    &mut budget,
+                )?;
+                assignments.push((name, expanded.value));
+            }
+            Ok(assignments)
         }
 
         fn expand_pipeline(
@@ -1959,8 +2249,33 @@ mod platform {
                     }
                     continue;
                 }
+                // Leading `NAME=value` words before a command name set that
+                // command's environment. `env` applies them with exact POSIX
+                // semantics on every spawn path, including terminal handoff.
+                let assignment_count = forms
+                    .iter()
+                    .take_while(|word| crate::assignment_parts(word).is_some())
+                    .count();
+                let prefixed = assignment_count > 0 && assignment_count < forms.len();
                 let mut words = Vec::new();
-                for word in &forms {
+                if prefixed {
+                    words.push(crate::PREFIX_ASSIGNMENT_RUNNER.to_owned());
+                }
+                for (index, word) in forms.iter().enumerate() {
+                    if prefixed
+                        && index < assignment_count
+                        && let Some((name, value)) = crate::assignment_parts(word)
+                    {
+                        let expanded = self.expand_word(
+                            &value,
+                            MAX_SUBSTITUTION_BYTES,
+                            request,
+                            previous_status,
+                            &mut budget,
+                        )?;
+                        words.push(format!("{name}={}", expanded.value));
+                        continue;
+                    }
                     let ExpandedWord {
                         value,
                         pathname,
@@ -1987,6 +2302,17 @@ mod platform {
                     }
                 }
                 command.words = words;
+                if prefixed {
+                    command.word_ir.insert(
+                        0,
+                        Word {
+                            parts: vec![quirl_syntax::WordPart {
+                                text: crate::PREFIX_ASSIGNMENT_RUNNER.to_owned(),
+                                quoting: Quoting::Single,
+                            }],
+                        },
+                    );
+                }
                 for redirect in &mut command.redirects {
                     let expanded_target = self.expand_word(
                         &redirect.target,
@@ -2363,32 +2689,21 @@ mod platform {
             let Some(name) = command.words.first().map(String::as_str) else {
                 return Ok(None);
             };
-            if !matches!(name, "cd" | "export" | "jobs" | "fg" | "bg") {
+            if !builtin::is_stateful(name) {
                 return Ok(None);
             }
             validate_control_redirects(command, request)?;
             let result = match name {
                 "cd" => Some(builtin::execute_cd(&command.words)?),
                 "export" => {
-                    if command.words.len() == 1 {
-                        return Err(ShellError::new(
-                            ErrorCode::InvalidArgument,
-                            "export needs at least one NAME=value assignment",
-                        )
-                        .with_help("Use `export NAME=value`"));
-                    }
-                    let mut assignments = Vec::with_capacity(command.words.len().saturating_sub(1));
-                    for assignment in command.words.iter().skip(1) {
-                        let Some((name, value)) = assignment.split_once('=') else {
-                            return Err(ShellError::new(
-                                ErrorCode::InvalidArgument,
-                                format!("invalid export assignment `{assignment}`"),
-                            )
-                            .with_help("Use `export NAME=value`"));
-                        };
-                        assignments.push((name.to_owned(), value.to_owned()));
-                    }
-                    self.environment.set_variables(&assignments)?;
+                    let operands = builtin::export_operands(&command.words)?;
+                    self.environment.set_variables(&operands.assignments)?;
+                    self.environment.export_names(&operands.names)?;
+                    Some(outcome(0, Some(String::new()), Some(String::new())))
+                }
+                "unset" => {
+                    let names = builtin::unset_operands(&command.words)?;
+                    self.environment.unset_names(&names)?;
                     Some(outcome(0, Some(String::new()), Some(String::new())))
                 }
                 "jobs" => {
@@ -7873,9 +8188,10 @@ mod platform {
             }
             if pipeline.commands.len() == 1 {
                 if self.noninteractive_host
-                    && pipeline.commands[0].words.first().is_some_and(|name| {
-                        matches!(name.as_str(), "cd" | "export" | "jobs" | "fg" | "bg")
-                    })
+                    && pipeline.commands[0]
+                        .words
+                        .first()
+                        .is_some_and(|name| builtin::is_stateful(name))
                 {
                     return Err(super::noninteractive_process_error(
                         source,
@@ -7883,9 +8199,10 @@ mod platform {
                     ));
                 }
                 if pipeline.background
-                    && pipeline.commands[0].words.first().is_some_and(|name| {
-                        matches!(name.as_str(), "cd" | "export" | "jobs" | "fg" | "bg")
-                    })
+                    && pipeline.commands[0]
+                        .words
+                        .first()
+                        .is_some_and(|name| builtin::is_stateful(name))
                 {
                     return Err(ShellError::new(
                         ErrorCode::InvalidArgument,
@@ -7922,24 +8239,29 @@ mod platform {
             match name {
                 "cd" => Ok(Some(builtin::execute_cd(&command.words)?)),
                 "export" => {
-                    let mut assignments = Vec::with_capacity(command.words.len().saturating_sub(1));
-                    for assignment in command.words.iter().skip(1) {
-                        let Some((name, value)) = assignment.split_once('=') else {
-                            return Err(ShellError::new(
-                                ErrorCode::InvalidArgument,
-                                format!("invalid export assignment `{assignment}`"),
-                            )
-                            .with_help("Use `export NAME=value`"));
-                        };
-                        assignments.push((name.to_owned(), value.to_owned()));
-                    }
-                    self.environment.set_variables(&assignments)?;
+                    let operands = builtin::export_operands(&command.words)?;
+                    self.environment.set_variables(&operands.assignments)?;
+                    self.environment.export_names(&operands.names)?;
                     Ok(Some(CommandOutcome {
                         status: 0,
                         stdout: None,
                         stderr: None,
                     }))
                 }
+                "unset" => {
+                    let names = builtin::unset_operands(&command.words)?;
+                    self.environment.unset_names(&names)?;
+                    Ok(Some(CommandOutcome {
+                        status: 0,
+                        stdout: None,
+                        stderr: None,
+                    }))
+                }
+                "eval" | "source" | "." => Err(ShellError::new(
+                    ErrorCode::InvalidCommand,
+                    format!("`{name}` needs a POSIX shell, which Windows does not provide"),
+                )
+                .with_help("Run the code inside a `bash { ... }` island instead")),
                 "jobs" => {
                     let text = self
                         .jobs()
@@ -8953,6 +9275,161 @@ mod backend_contract_tests {
 
         assert_eq!(read_test_environment(&mut executor, name), "owned");
         assert!(std::env::var_os(name).is_none());
+    }
+
+    #[cfg(unix)]
+    fn capture_stdout(executor: &mut NativeExecutor, source: &str) -> String {
+        executor
+            .execute_capture(source)
+            .unwrap()
+            .stdout
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bare_assignments_set_locals_that_children_do_not_inherit() {
+        let name = "QUIRL_BARE_ASSIGNMENT_LOCAL";
+        let mut executor = NativeExecutor::default();
+
+        executor.execute_capture(&format!("{name}='a b'")).unwrap();
+
+        assert_eq!(
+            capture_stdout(&mut executor, &format!("echo \"${name}\"")),
+            "a b\n"
+        );
+        assert_eq!(read_test_environment(&mut executor, name), "");
+        executor.execute_capture(&format!("export {name}")).unwrap();
+        assert_eq!(read_test_environment(&mut executor, name), "a b");
+        assert!(std::env::var_os(name).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn assigning_an_exported_variable_keeps_it_exported() {
+        let name = "QUIRL_REASSIGNED_EXPORT";
+        let mut executor = NativeExecutor::default();
+        executor
+            .execute_capture(&format!("export {name}=one"))
+            .unwrap();
+
+        executor.execute_capture(&format!("{name}=two")).unwrap();
+
+        assert_eq!(read_test_environment(&mut executor, name), "two");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prefix_assignments_reach_only_their_command() {
+        let name = "QUIRL_PREFIX_ASSIGNMENT";
+        let mut executor = NativeExecutor::default();
+
+        let output = capture_stdout(
+            &mut executor,
+            &format!("{name}=\"$HOME/x y\" sh -c 'printf %s \"${name}\"'"),
+        );
+
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(output, format!("{home}/x y"));
+        assert_eq!(read_test_environment(&mut executor, name), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quoted_or_expanded_assignment_words_are_commands_not_assignments() {
+        let mut executor = NativeExecutor::default();
+        let error = executor.execute_capture("\"A=1\"").unwrap_err();
+        assert_eq!(error.code, ErrorCode::ProcessSpawn);
+        assert_eq!(capture_stdout(&mut executor, "echo \"[$A]\""), "[]\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unset_removes_exported_and_local_variables() {
+        let mut executor = NativeExecutor::default();
+        executor
+            .execute_capture("export QUIRL_UNSET_EXPORTED=1; QUIRL_UNSET_LOCAL=2")
+            .unwrap();
+
+        executor
+            .execute_capture("unset QUIRL_UNSET_EXPORTED QUIRL_UNSET_LOCAL QUIRL_NEVER_SET")
+            .unwrap();
+
+        assert_eq!(
+            capture_stdout(
+                &mut executor,
+                "echo \"[$QUIRL_UNSET_EXPORTED][$QUIRL_UNSET_LOCAL]\""
+            ),
+            "[][]\n"
+        );
+        let error = executor.execute_capture("unset -f name").unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eval_imports_exports_like_ssh_agent_setup_and_sees_locals() {
+        let mut executor = NativeExecutor::default();
+        executor.execute_capture("QUIRL_EVAL_LOCAL=seen").unwrap();
+
+        let outcome = executor
+            .execute_capture(
+                "eval 'QUIRL_EVAL_SOCK=/tmp/agent.1; export QUIRL_EVAL_SOCK; echo \"$QUIRL_EVAL_LOCAL\"; exit 4'",
+            )
+            .unwrap();
+
+        assert_eq!(outcome.status, 4);
+        assert_eq!(outcome.stdout.as_deref(), Some("seen\n"));
+        assert_eq!(
+            read_test_environment(&mut executor, "QUIRL_EVAL_SOCK"),
+            "/tmp/agent.1"
+        );
+        assert!(std::env::var_os("QUIRL_EVAL_SOCK").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_runs_a_file_with_arguments_and_keeps_unexported_values_inside() {
+        let directory =
+            std::env::temp_dir().join(format!("quirl-source-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let script = directory.join("setup.sh");
+        std::fs::write(
+            &script,
+            "export QUIRL_SOURCED=\"$1\"\nQUIRL_SOURCED_LOCAL=hidden\nunset QUIRL_SOURCE_REMOVED\n",
+        )
+        .unwrap();
+        let mut executor = NativeExecutor::default();
+        executor
+            .execute_capture("export QUIRL_SOURCE_REMOVED=present")
+            .unwrap();
+
+        for builtin in ["source", "."] {
+            executor
+                .execute_capture(&format!("{builtin} '{}' first", script.display()))
+                .unwrap();
+            assert_eq!(
+                read_test_environment(&mut executor, "QUIRL_SOURCED"),
+                "first"
+            );
+        }
+
+        assert_eq!(
+            capture_stdout(
+                &mut executor,
+                "echo \"[$QUIRL_SOURCED_LOCAL][$QUIRL_SOURCE_REMOVED]\""
+            ),
+            "[][]\n"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn island_builtins_cannot_run_in_the_background() {
+        let mut executor = NativeExecutor::default();
+        let error = executor.execute_capture("eval true &").unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
     }
 
     #[test]

@@ -1,0 +1,88 @@
++++
+schema_version = 1
+id = "01M42KGFQXE3Q6FB1DY16BMBYW"
+title = "Non-interactive invocations and shell setup code run in POSIX sh"
+date = "2026-10-04"
+status = "accepted"
+tags = ["compatibility", "process"]
+supersedes = []
+superseded_by = []
+depends_on = []
+related_to = ["01M2XHZ6Y69RDWA9BNV5SMG7Y8"]
++++
+## Decision
+
+When another program starts Quirl as a shell, Quirl behaves exactly like
+`/bin/sh`, because that program wrote POSIX shell code:
+
+- `quirl -c 'code' [name [argument...]]` replaces itself with
+  `/bin/sh -c 'code' [name [argument...]]`. `-l` and `--login` pass through as
+  `-l`; `-i` is accepted and ignored when a command is given. Clusters such as
+  `-lc` and `-ilc` are recognized.
+- A script on standard input (`quirl` with a non-terminal stdin, or `-s`)
+  runs as `/bin/sh -s`. This replaces the earlier behavior of reading Lua from
+  standard input; `quirl run --lang lua -` keeps that capability explicit.
+- An interactive login session (argv0 beginning with `-`, or `quirl -l` at a
+  terminal) first captures the environment `/bin/sh -l` exports, under a
+  5-second deadline and the session byte limit, then re-executes Quirl with
+  it. Failure keeps the inherited environment and reports why.
+
+These options are parsed before Clap and only when the argument vector begins
+with them, so Quirl's own command-line interface is unchanged.
+
+In an interactive or `quirl exec` session, shell setup code also runs in
+`/bin/sh`: `eval word...` and `source file [arg...]` (or `. file`) start one
+foreground `/bin/sh` pipeline whose `EXIT` trap reports the working directory
+and exported environment. Quirl then adopts both. Session locals are passed in
+as single-quoted assignments; variables set without `export`, functions, and
+aliases stay inside the island.
+
+Quirl's native grammar gains the POSIX variable forms people type daily: a
+bare `NAME=value` sets an unexported shell variable (or updates an exported
+one), `NAME=value command` sets a variable for one command (run through
+`/usr/bin/env`, so every spawn path applies it identically), `export NAME`
+exports an existing variable, and `unset NAME` removes one. Only an unquoted
+`NAME=` prefix makes an assignment, as in `sh`.
+
+## Context
+
+Quirl advertised Bash muscle memory, yet `FOO=1 cmd`, `A=1`, `eval`, `source`,
+`.`, and `unset` all failed, and `-c` did not exist. That breaks far more than
+typing habits:
+
+- `sshd` runs remote commands as `$SHELL -c '...'`, so `ssh host cmd`, `scp`,
+  `rsync`, and Git over SSH fail against a host whose login shell is Quirl.
+- Editors resolve a login environment with `$SHELL -l -i -c ...`; coding
+  agents and build tools run `$SHELL -c`.
+- Common setup idioms (`eval "$(ssh-agent -s)"`, `eval "$(brew shellenv)"`,
+  `source .venv/bin/activate`, `source .env`) are POSIX code generated for
+  `sh`-family shells. Their absence is a frequently cited reason people return
+  from Nushell to Zsh.
+
+Alternatives considered:
+
+- **Interpret `-c` with Quirl's native grammar, falling back to `sh` for
+  unsupported syntax.** Rejected: native execution is verified only for the
+  C1 subset, and a caller cannot know which engine ran its code. Machines
+  need one exact contract.
+- **Emulate `eval` and `source` natively.** Rejected for the same reason:
+  setup scripts use functions, conditionals, and dialect details; partial
+  emulation would fail unpredictably. A real `sh` plus an explicit import
+  boundary is exact for everything the session can represent.
+- **Import variables set without `export`.** Rejected: `sh` gives no portable,
+  unambiguous way to list them, and children would not see them in Bash or
+  Zsh either.
+
+## Consequences
+
+- Quirl is safe as a login shell for SSH, file transfer, Git, editors, and
+  agents, with `sh` exit statuses and streams preserved byte for byte.
+- `eval` and `source` cost one `/bin/sh` start (milliseconds) and cannot
+  define functions or aliases in Quirl; their catalog entries say so. A
+  virtual environment's `deactivate` is therefore unavailable.
+- Piping Lua into a bare `quirl` no longer works; use `quirl run --lang lua -`.
+- Windows has no `/bin/sh`: `-c`, standard-input scripts, `eval`, and
+  `source` report that a POSIX shell is required.
+- Login environments come from `/etc/profile` and `~/.profile`, not Zsh's
+  startup files. Users moving from Zsh should keep login-wide variables in
+  `~/.profile`.

@@ -54,6 +54,27 @@ brew uninstall quirl
 Your Quirl configuration, history, and downloaded data are stored separately
 from the installed binary.
 
+## Use Quirl as your login shell
+
+Once Quirl feels right for whole sessions, you can make it your login shell.
+Programs that start your shell for their own work keep working, because Quirl
+runs their POSIX code in `/bin/sh` unchanged. This covers `ssh host command`,
+`scp`, `rsync`, Git over SSH, editors reading your environment with
+`$SHELL -l -i -c`, and coding agents using `$SHELL -c`.
+
+```sh
+command -v quirl | sudo tee -a /etc/shells
+chsh -s "$(command -v quirl)"
+```
+
+A login session takes its environment from `/etc/profile` and `~/.profile`,
+including macOS `path_helper` entries. Quirl does not read `~/.zprofile` or
+`~/.zshrc`, so move variables you need everywhere, such as `PATH` additions,
+into `~/.profile`. Setup lines like `eval "$(brew shellenv)"` work there and at
+Quirl's prompt.
+
+To switch back, run `chsh -s /bin/zsh` (or your previous shell).
+
 ## Direct release archive
 
 Download the package for your operating system and architecture from the

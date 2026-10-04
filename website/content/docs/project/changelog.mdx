@@ -17,7 +17,31 @@ which versions are published.
 
 ## [Unreleased]
 
+### Added
+
+- Quirl works as a login shell for SSH, file transfer, Git, editors, and
+  agents. `quirl -c 'code' [name [arg...]]` runs the code exactly as
+  `/bin/sh -c` would, so `ssh host cmd`, `scp`, `rsync`, and Git over SSH work
+  against a host whose shell is Quirl. `-l`, `--login`, `-i`, `-s`, and
+  clusters such as `-ilc` are accepted, as editors use to read your
+  environment.
+- An interactive login session (`-quirl` as argv0, or `quirl -l`) adopts the
+  environment `/bin/sh -l` sets up from `/etc/profile` and `~/.profile`, such
+  as macOS `path_helper` entries.
+- `eval` and `source` (or `.`) run shell setup code in `/bin/sh` and keep the
+  exported variables and working directory it leaves behind. `eval
+  "$(ssh-agent -s)"`, `eval "$(brew shellenv)"`, `source .venv/bin/activate`,
+  and `source .env` now work. Functions and aliases the code defines stay
+  inside it.
+- `NAME=value` sets a shell variable, `NAME=value command` sets a variable for
+  one command, `export NAME` exports an existing variable, and `unset NAME`
+  removes one.
+
 ### Changed
+
+- A script piped into a bare `quirl` now runs as POSIX shell code through
+  `/bin/sh -s`, as with any shell. It used to run as Lua; use
+  `quirl run --lang lua -` for that.
 
 - Data mode in the interactive shell renders records as tables, as
   `quirl data` already did, instead of one JSON line per row. Record streams
