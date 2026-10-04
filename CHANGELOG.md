@@ -12,6 +12,8 @@ which versions are published.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-04
+
 ### Added
 
 - Quirl works as a login shell for SSH, file transfer, Git, editors, and
@@ -44,14 +46,12 @@ which versions are published.
 - `NAME=value` sets a shell variable, `NAME=value command` sets a variable for
   one command, `export NAME` exports an existing variable, and `unset NAME`
   removes one.
-
 - Data mode speaks more of Nushell's vocabulary: `sort-by <field> [-r]`,
   `first <n>`, `last [n]`, `skip <n>`, `reverse`, `reject <field>...`, `uniq`,
   `group-by <field>`, `columns`, and `math sum|min|max|avg`. `math` adds
   exactly, without floating-point rounding, and sizes keep their unit.
 - `where` accepts size literals: `ls | where size > 10kB`. Decimal (`kB`, `MB`)
   and binary (`KiB`, `MiB`) units are understood.
-
 - Tab completes `docker`, `kubectl`, `gh`, `helm`, `podman`, and other
   Cobra-based tools by asking the program itself (`PROGRAM __complete`) when
   Zsh has no function for it. Only a fixed list of known Cobra programs is
@@ -78,7 +78,6 @@ which versions are published.
 - A script piped into a bare `quirl` now runs as POSIX shell code through
   `/bin/sh -s`, as with any shell. It used to run as Lua; use
   `quirl run --lang lua -` for that.
-
 - Data mode in the interactive shell renders records as tables, as
   `quirl data` already did, instead of one JSON line per row. Record streams
   render in batches of up to 256 rows, so the first rows appear early.
