@@ -1119,6 +1119,9 @@ mod platform {
         next_job_id: u32,
         previous_status: i32,
         substitution_depth: u8,
+        /// Standard error written by `$(...)` substitutions while expanding the
+        /// current pipeline, shown before its own output as `sh` would.
+        substitution_stderr: String,
         noninteractive_host: bool,
         environment: SessionEnvironment,
         #[cfg(test)]
@@ -1598,6 +1601,7 @@ mod platform {
                 next_job_id: 1,
                 previous_status: 0,
                 substitution_depth: 0,
+                substitution_stderr: String::new(),
                 noninteractive_host: false,
                 environment: SessionEnvironment::default(),
                 #[cfg(test)]
@@ -2004,7 +2008,49 @@ mod platform {
             Ok(last)
         }
 
+        /// Execute one pipeline, then surface any standard error its `$(...)`
+        /// substitutions wrote: prepended to captured stderr, or written to the
+        /// terminal for inherited output.
         fn execute_pipeline(
+            &mut self,
+            pipeline: &Pipeline,
+            source: &str,
+            capture: bool,
+            request: Option<RequestContext<'_>>,
+            observer: Option<&OutputObserverHandle<'_>>,
+            previous_status: i32,
+        ) -> Result<CommandOutcome, ShellError> {
+            // Nested substitutions run pipelines too; keep the enclosing
+            // pipeline's collected stderr aside until this one finishes.
+            let enclosing = std::mem::take(&mut self.substitution_stderr);
+            let result = self.execute_pipeline_expanded(
+                pipeline,
+                source,
+                capture,
+                request,
+                observer,
+                previous_status,
+            );
+            let substitution_stderr = std::mem::replace(&mut self.substitution_stderr, enclosing);
+            if substitution_stderr.is_empty() {
+                return result;
+            }
+            if !capture {
+                io_write_all(
+                    std::io::stderr(),
+                    substitution_stderr.as_bytes(),
+                    "standard error",
+                )?;
+                return result;
+            }
+            result.map(|mut outcome| {
+                let own = outcome.stderr.take().unwrap_or_default();
+                outcome.stderr = Some(substitution_stderr + &own);
+                outcome
+            })
+        }
+
+        fn execute_pipeline_expanded(
             &mut self,
             pipeline: &Pipeline,
             source: &str,
@@ -2474,6 +2520,14 @@ mod platform {
                     self.previous_status = host_previous_status;
                     self.substitution_depth = self.substitution_depth.saturating_sub(1);
                     let nested = nested?;
+                    let stderr = nested.stderr.unwrap_or_default();
+                    let room = DEFAULT_CAPTURE_BYTES.saturating_sub(self.substitution_stderr.len());
+                    let mut end = stderr.len().min(room);
+                    while !stderr.is_char_boundary(end) {
+                        end = end.saturating_sub(1);
+                    }
+                    self.substitution_stderr
+                        .push_str(stderr.get(..end).unwrap_or_default());
                     let stdout = nested.stdout.unwrap_or_default();
                     if stdout.len() > limit {
                         return Err(expansion_error(
@@ -9315,6 +9369,24 @@ mod backend_contract_tests {
         executor.execute_capture(&format!("export {name}")).unwrap();
         assert_eq!(read_test_environment(&mut executor, name), "a b");
         assert!(std::env::var_os(name).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn substitution_stderr_reaches_the_command_output() {
+        let mut executor = NativeExecutor::default();
+        let outcome = executor
+            .execute_capture(
+                "printf '[%s]' \"$(sh -c 'echo inner >&2; echo out')\"; sh -c 'echo after >&2'",
+            )
+            .unwrap();
+        assert_eq!(outcome.stdout.as_deref(), Some("[out]"));
+        assert_eq!(outcome.stderr.as_deref(), Some("inner\nafter\n"));
+
+        let nested = executor
+            .execute_capture("echo \"$(echo \"$(sh -c 'echo deep >&2')\"; sh -c 'echo mid >&2')\"")
+            .unwrap();
+        assert_eq!(nested.stderr.as_deref(), Some("deep\nmid\n"));
     }
 
     #[cfg(unix)]

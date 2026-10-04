@@ -17,6 +17,12 @@ which versions are published.
 
 ## [Unreleased]
 
+### Fixed
+
+- Errors a `$(...)` substitution writes to standard error now appear, as in
+  Bash and Zsh. They were discarded, so a failing `eval "$(ssh-agent -s)"`
+  ended silently.
+
 ## [0.5.1] - 2026-10-04
 
 ### Fixed
