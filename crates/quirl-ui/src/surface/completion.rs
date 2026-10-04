@@ -1740,6 +1740,8 @@ fn merge_extension_items(
     extension: Vec<ExtensionSuggestion>,
     line: &str,
 ) {
+    // Items present before this merge came from the catalog and filesystem.
+    let existing_count = items.len();
     // Plain file listing is only a fallback. When Zsh's own function for the
     // command answered, its choice wins: `git add` offers changed files, not
     // every file in the directory.
@@ -1800,6 +1802,32 @@ fn merge_extension_items(
         retained_bytes = retained_bytes.saturating_add(item_bytes);
         items.push(item);
     }
+    retain_best_catalog_tier(items, existing_count, line);
+}
+
+/// Keep the catalog's best tier across sources, as it already does on its
+/// own: once any candidate extends what was typed, a fuzzy catalog match
+/// such as `--config-env` for `--one` is noise next to Zsh's `--oneline`.
+/// Answers from Zsh, tools, and plugins stay, because their own matchers
+/// (for example case-insensitive or substring matching) chose them.
+fn retain_best_catalog_tier(items: &mut Vec<CompletionItem>, catalog_count: usize, line: &str) {
+    let extends_typed = |item: &CompletionItem| {
+        line.get(item.replace_start..item.replace_end)
+            .is_some_and(|typed| {
+                item.value
+                    .get(..typed.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(typed))
+            })
+    };
+    if !items.iter().any(extends_typed) {
+        return;
+    }
+    let mut index = 0_usize;
+    items.retain(|item| {
+        let from_catalog = index < catalog_count && item.source != "filesystem";
+        index = index.saturating_add(1);
+        !from_catalog || extends_typed(item)
+    });
 }
 
 /// Whether `existing` and a suggestion replacing from `start` with `value`
@@ -2327,6 +2355,33 @@ mod tests {
                 .resource_notice()
                 .is_some_and(|notice| notice.contains("4096 query bytes"))
         );
+    }
+
+    #[test]
+    fn fuzzy_matches_drop_out_once_a_source_extends_the_typed_word() {
+        let line = "git log --one";
+        let fuzzy = spanned_item("--config-env", 8, 13, CompletionKind::Flag);
+        let mut items = vec![fuzzy.clone()];
+        let answer = ExtensionSuggestion {
+            value: "--oneline".to_owned(),
+            display: "--oneline".to_owned(),
+            summary: String::new(),
+            detail: String::new(),
+            replace_start: 8,
+            replace_end: 13,
+            origin: SuggestionOrigin::Zsh,
+        };
+        merge_extension_items(&mut items, vec![answer], line);
+        let values = items
+            .iter()
+            .map(|item| item.value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(values, ["--oneline"]);
+
+        // With no prefix match anywhere, fuzzy candidates remain useful.
+        let mut items = vec![fuzzy];
+        merge_extension_items(&mut items, Vec::new(), line);
+        assert_eq!(items.len(), 1);
     }
 
     #[test]

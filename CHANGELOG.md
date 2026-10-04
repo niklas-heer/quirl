@@ -23,6 +23,8 @@ which versions are published.
   dialect control form" error while it runs fine. The editor shows a quiet
   hint that the line runs through `/bin/sh`; function definitions keep an
   error that explains why they cannot persist.
+- Tab no longer ranks a fuzzy catalog match above a candidate that extends
+  what you typed from Zsh: `git log --one` offers `--oneline` alone.
 
 ## [0.5.0] - 2026-10-04
 
