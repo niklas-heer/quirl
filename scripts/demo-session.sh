@@ -84,7 +84,9 @@ if [ "$demo_ai_ready" = true ]; then
 fi
 
 umask 077
-demo_temp_base_input=${TMPDIR:-/tmp}
+# macOS TMPDIR paths are long enough that sockets below the private HOME,
+# such as ssh-agent's, exceed the Unix socket path limit; /tmp keeps them short.
+demo_temp_base_input=${QUIRL_DEMO_TMPDIR:-/tmp}
 demo_temp_base=$(CDPATH='' cd "$demo_temp_base_input" 2>/dev/null && pwd -P) || {
   echo "Demo temporary directory not found: $demo_temp_base_input" >&2
   exit 1

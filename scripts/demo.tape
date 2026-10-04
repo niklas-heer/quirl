@@ -76,7 +76,7 @@ Show
 Sleep 1200ms
 Enter
 Sleep 3s
-Type `eval "$(ssh-agent -s)" && ssh-add -l`
+Type `eval "$(ssh-agent -s)" && echo "agent $SSH_AGENT_PID is ready"`
 Sleep 800ms
 Enter
 Sleep 3s
