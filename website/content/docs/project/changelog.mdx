@@ -17,6 +17,14 @@ which versions are published.
 
 ## [Unreleased]
 
+### Fixed
+
+- `eval "$(ssh-agent -s)"` in the interactive shell could lose the agent it
+  started, so `ssh-add` then reported "Connection refused". The terminal
+  cleanup that ends a foreground command could kill the agent before it
+  detached. `eval` and `source` now run outside that cleanup, so daemons
+  they start keep running.
+
 ## [0.5.0] - 2026-10-04
 
 ### Added

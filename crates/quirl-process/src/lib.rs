@@ -2134,8 +2134,12 @@ mod platform {
                 }],
                 background: false,
             };
-            let outcome =
-                self.run_external_pipeline(&island, source, capture, request, observer)?;
+            // Spawn directly rather than offering the island to a terminal
+            // owner: an embedded terminal kills the whole process group when
+            // the command ends, and setup code such as `ssh-agent -s` leaves a
+            // daemon that only escapes the group after forking. The daemon must
+            // outlive `eval`, as it does in any shell.
+            let outcome = self.spawn_pipeline(&island, source, capture, request, observer)?;
             if let Some(reported) = state.outcome()? {
                 self.import_island(reported)?;
             }
