@@ -1339,6 +1339,7 @@ fn validate_editor_source(source: &str) -> Result<String, ShellError> {
         }
         InteractiveLine::Empty
         | InteractiveLine::Exit
+        | InteractiveLine::Clear
         | InteractiveLine::ChangeMode(_)
         | InteractiveLine::ToggleMode
         | InteractiveLine::Help(_)

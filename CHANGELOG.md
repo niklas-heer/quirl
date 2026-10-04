@@ -35,6 +35,9 @@ which versions are published.
   persist.
 - `$PPID` names the shell's parent process.
 - `help ` completes command names instead of file names.
+- `clear` empties the interactive shell's output, and Ctrl-L clears the screen
+  as in Zsh while earlier output stays reachable with PageUp. Both used to
+  leave the transcript in place.
 - Data tables in the interactive shell color their values: numbers and sizes
   in the number color, times in the secondary color, record keys in the
   accent, and row numbers, empty values, and nested summaries dimmed.

@@ -61,6 +61,9 @@ pub(super) struct Transcript {
     retained_bytes: usize,
     /// `None` follows the tail; `Some(index)` anchors the viewport from the front.
     scroll_top: Option<usize>,
+    /// Lines before this index are hidden from the tail view after Ctrl-L,
+    /// as a terminal scrolls them away, but stay reachable by scrolling up.
+    cleared_before: usize,
     selection: Option<Selection>,
 }
 
@@ -82,8 +85,27 @@ impl Transcript {
             lines: VecDeque::new(),
             retained_bytes: 0,
             scroll_top: None,
+            cleared_before: 0,
             selection: None,
         }
+    }
+
+    /// Hide every retained line from the tail view, as Ctrl-L clears a
+    /// terminal screen. Scrolling up still reveals them.
+    pub(super) fn clear_view(&mut self) {
+        self.cleared_before = self.lines.len();
+        self.scroll_top = None;
+        self.selection = None;
+    }
+
+    /// Discard every retained line, as the `clear` command empties a
+    /// terminal's screen and scrollback.
+    pub(super) fn clear(&mut self) {
+        self.lines.clear();
+        self.retained_bytes = 0;
+        self.scroll_top = None;
+        self.cleared_before = 0;
+        self.selection = None;
     }
 
     /// Return the number of retained logical lines.
@@ -143,7 +165,11 @@ impl Transcript {
             return 0..0;
         }
         let maximum_start = self.lines.len().saturating_sub(visible_line_count);
-        let start = self.scroll_top.unwrap_or(maximum_start).min(maximum_start);
+        let start = match self.scroll_top {
+            Some(scroll_top) => scroll_top.min(maximum_start),
+            // Following the tail never shows lines hidden by Ctrl-L.
+            None => maximum_start.max(self.cleared_before.min(self.lines.len())),
+        };
         start
             ..start
                 .saturating_add(visible_line_count)
@@ -391,6 +417,7 @@ impl Transcript {
         if let Some(scroll_top) = self.scroll_top.as_mut() {
             *scroll_top = scroll_top.saturating_sub(evicted_line_count);
         }
+        self.cleared_before = self.cleared_before.saturating_sub(evicted_line_count);
         let Some(selection) = self.selection.as_mut() else {
             return;
         };
@@ -463,6 +490,37 @@ mod tests {
 
     fn selected_text(transcript: &Transcript) -> Option<String> {
         transcript.selected_text_bounded(1_024).unwrap()
+    }
+
+    #[test]
+    fn ctrl_l_hides_lines_from_the_tail_view_but_keeps_them_scrollable() {
+        let mut transcript = Transcript::new(TranscriptLimits {
+            line_count_max: 100,
+            retained_bytes_max: 4_096,
+        });
+        for line in ["one", "two", "three"] {
+            transcript.append_line(line);
+        }
+        transcript.clear_view();
+        assert_eq!(transcript.visible_range(10), 3..3);
+        transcript.append_line("after");
+        assert_eq!(transcript.visible_range(10), 3..4);
+        // Scrolling up reveals the hidden lines again; all four fit.
+        assert!(transcript.scroll_up(2, 10));
+        assert_eq!(transcript.visible_range(10), 0..4);
+    }
+
+    #[test]
+    fn clear_discards_every_line() {
+        let mut transcript = Transcript::new(TranscriptLimits {
+            line_count_max: 100,
+            retained_bytes_max: 4_096,
+        });
+        transcript.append_line("secret");
+        transcript.clear();
+        assert_eq!(transcript.line_count(), 0);
+        assert_eq!(transcript.visible_range(10), 0..0);
+        assert!(!transcript.scroll_up(1, 10));
     }
 
     #[test]

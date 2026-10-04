@@ -1331,6 +1331,8 @@ pub enum InteractiveLine<'a> {
     Empty,
     /// The mode-independent `exit` or `quit` command.
     Exit,
+    /// The mode-independent `clear` command, which empties the screen.
+    Clear,
     /// A valid explicit `mode normal`, `mode data`, or `mode ai` request.
     ChangeMode(Mode),
     /// The explicit `mode toggle` request.
@@ -1362,6 +1364,9 @@ pub fn classify(mode: Mode, input: &str) -> InteractiveLine<'_> {
     }
     if matches!(input, "exit" | "quit") {
         return InteractiveLine::Exit;
+    }
+    if input == "clear" {
+        return InteractiveLine::Clear;
     }
     if input == "mode toggle" {
         return InteractiveLine::ToggleMode;
@@ -1835,6 +1840,17 @@ mod tests {
             assert!(error.help.contains("bash { ... }"));
             assert!(error.help.contains("zsh { ... }"));
         }
+    }
+
+    #[test]
+    fn clear_is_a_mode_independent_line_but_not_a_prefix() {
+        for mode in [Mode::Command, Mode::Data, Mode::Natural] {
+            assert_eq!(classify(mode, "  clear "), InteractiveLine::Clear);
+        }
+        assert_eq!(
+            classify(Mode::Command, "clear -x"),
+            InteractiveLine::Command("clear -x")
+        );
     }
 
     #[test]

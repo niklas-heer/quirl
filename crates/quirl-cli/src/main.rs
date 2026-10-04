@@ -2522,6 +2522,10 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                 match interactive_line {
                     InteractiveLine::Empty => {}
                     InteractiveLine::Exit => return Ok(last_status),
+                    InteractiveLine::Clear => {
+                        line_editor.clear_screen()?;
+                        last_status = 0;
+                    }
                     InteractiveLine::ChangeMode(next) => {
                         mode = next;
                         print_mode_feedback(mode, &active_config);
@@ -3718,6 +3722,25 @@ impl SessionEditor {
                         .with_context(error.to_string())
                         .with_help("Check that standard error is still available")
                 }),
+        }
+    }
+
+    /// Empty the screen for `clear`: the rich transcript is discarded, and
+    /// the simple surface writes the same sequence the `clear` program does.
+    fn clear_screen(&mut self) -> Result<(), ShellError> {
+        match self {
+            Self::Rich(editor) => editor.clear_transcript(),
+            Self::Simple(_) => {
+                let mut stdout = io::stdout().lock();
+                stdout
+                    .write_all(b"\x1b[H\x1b[2J\x1b[3J")
+                    .and_then(|()| stdout.flush())
+                    .map_err(|error| {
+                        ShellError::new(ErrorCode::Io, "could not clear the screen")
+                            .with_context(error.to_string())
+                            .with_help("Check that the terminal is still connected")
+                    })
+            }
         }
     }
 

@@ -837,6 +837,13 @@ impl RichSurface {
         })
     }
 
+    /// Discard the retained transcript, as `clear` empties a terminal's
+    /// screen and scrollback.
+    pub fn clear_transcript(&mut self) -> Result<(), ShellError> {
+        self.transcript.clear();
+        self.terminal.force_repaint()
+    }
+
     /// Append one completed command and its bounded captured output to the session viewport.
     ///
     /// Invalid UTF-8 is replaced, terminal controls are rendered visibly, and retention is
@@ -2037,6 +2044,9 @@ impl RichSurface {
                             self.open_picker(kind, editor.buffer(), editor.cursor(), "picker");
                         }
                         EditAction::ClearScreen => {
+                            // As in Zsh, Ctrl-L clears the screen while the
+                            // earlier output stays reachable by scrolling up.
+                            self.transcript.clear_view();
                             self.terminal.force_repaint()?;
                         }
                         EditAction::Suspend => {
