@@ -24,6 +24,10 @@ which versions are published.
   cleanup that ends a foreground command could kill the agent before it
   detached. `eval` and `source` now run outside that cleanup, so daemons
   they start keep running.
+- Typing a pasted loop or `{ ...; }` group no longer shows an "unsupported
+  dialect control form" error while it runs fine. The editor shows a quiet
+  hint that the line runs through `/bin/sh`; function definitions keep an
+  error that explains why they cannot persist.
 
 ## [0.5.0] - 2026-10-04
 

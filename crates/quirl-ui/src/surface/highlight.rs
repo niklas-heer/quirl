@@ -434,6 +434,25 @@ fn diagnostic_for(
             if super::input_is_incomplete(buffer, mode) {
                 return None;
             }
+            // Loops, groups, and other control forms run through /bin/sh;
+            // only a function definition cannot work, since it would not
+            // outlive the shell that runs it.
+            if let Some(form) = quirl_syntax::dialect_control_form(buffer) {
+                let range = Some(form.start..form.end.max(form.start.saturating_add(1)));
+                return Some(if form.defines_function {
+                    SurfaceDiagnostic {
+                        message: "shell functions do not persist in Quirl".to_owned(),
+                        severity: DiagnosticSeverity::Error,
+                        range,
+                    }
+                } else {
+                    SurfaceDiagnostic {
+                        message: format!("`{}` runs through /bin/sh", form.text),
+                        severity: DiagnosticSeverity::Hint,
+                        range,
+                    }
+                });
+            }
             return Some(SurfaceDiagnostic {
                 message: error.message,
                 severity: DiagnosticSeverity::Error,
@@ -1077,6 +1096,35 @@ mod tests {
             diagnostic_for(&catalog, &path_commands, input, Mode::Command, &spans).unwrap();
         assert_eq!(diagnostic.severity, DiagnosticSeverity::Error);
         assert!(diagnostic.message.contains("did you mean `git`"));
+    }
+
+    #[test]
+    fn pasted_control_forms_get_a_hint_and_functions_an_error() {
+        let catalog = Catalog::builtin();
+        let path_commands = PathCommandCache::new(None);
+        for (input, severity, message) in [
+            (
+                "for f in a b; do echo $f; done",
+                DiagnosticSeverity::Hint,
+                "`for` runs through /bin/sh",
+            ),
+            (
+                "{ echo a; } > out",
+                DiagnosticSeverity::Hint,
+                "`{` runs through /bin/sh",
+            ),
+            (
+                "greet() { echo hi; }",
+                DiagnosticSeverity::Error,
+                "shell functions do not persist in Quirl",
+            ),
+        ] {
+            let spans = highlight(input, Mode::Command);
+            let diagnostic =
+                diagnostic_for(&catalog, &path_commands, input, Mode::Command, &spans).unwrap();
+            assert_eq!(diagnostic.severity, severity, "{input}");
+            assert_eq!(diagnostic.message, message, "{input}");
+        }
     }
 
     #[test]
