@@ -4104,7 +4104,13 @@ fn assert_discovery_artifacts_bounded(index_dir: &Path) -> Result<(), TaskError>
             .into());
         }
         let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)?;
+        // The session is still running: SQLite may delete a journal between
+        // listing and inspection. A vanished entry retains nothing to bound.
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
         if !metadata.file_type().is_file() {
             return Err(io::Error::other(format!(
                 "discovery artifact {} was not a regular file",
@@ -4112,7 +4118,11 @@ fn assert_discovery_artifacts_bounded(index_dir: &Path) -> Result<(), TaskError>
             ))
             .into());
         }
-        let _ = read_bounded_fixture(&path, DISCOVERY_ARTIFACT_BYTES_MAX)?;
+        match read_bounded_fixture(&path, DISCOVERY_ARTIFACT_BYTES_MAX) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
     }
     Ok(())
 }
