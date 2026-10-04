@@ -928,10 +928,24 @@ fn wait_for_terminal_owner(session: &mut Session) -> Result<(), TaskError> {
     while session.pty.foreground_group()? != child && Instant::now() < deadline {
         session.pty.drain_for(Duration::from_millis(10))?;
     }
-    if session.pty.foreground_group()? != child {
+    let observed = session.pty.foreground_group()?;
+    if observed != child {
+        // Name what owned the terminal and what the screen showed, so an
+        // intermittent failure can be diagnosed from one report.
+        let screen = session.pty.screen().text();
+        let tail = screen
+            .lines()
+            .rev()
+            .filter(|line| !line.trim().is_empty())
+            .take(6)
+            .collect::<Vec<_>>();
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            "Quirl did not recover terminal ownership",
+            format!(
+                "Quirl did not recover terminal ownership: expected group {}, observed {}; screen tail (newest first): {tail:?}",
+                child.as_raw(),
+                observed.as_raw()
+            ),
         )
         .into());
     }
