@@ -17,7 +17,7 @@ Sends SIGCONT to the selected process group without transferring terminal owners
 
 Options:
 
-- `%job` — Positional `%job` declared by the builtin command signature.
+- `%job` — The `%job` argument
 
 ## `cd [path]`
 
@@ -31,7 +31,7 @@ Changes Quirl's process directory so later commands and prompt context follow it
 
 Options:
 
-- `path` — Positional `path` declared by the builtin command signature.
+- `path` — The `path` argument
 
 ## `export NAME=value...`
 
@@ -55,7 +55,7 @@ Transfers terminal ownership to the selected process group and waits until it ex
 
 Options:
 
-- `%job` — Positional `%job` declared by the builtin command signature.
+- `%job` — The `%job` argument
 
 ## `git commit [options]`
 
@@ -111,7 +111,7 @@ Use `help all` to browse commands; refine a search when results are shortened.
 
 Options:
 
-- `command` — Positional `command` declared by the builtin command signature.
+- `command` — The `command` argument
 
 ## `jobs`
 
@@ -135,7 +135,7 @@ Runs an expression in the persistent restricted Lua 5.5.1 VM.
 
 Options:
 
-- `expression` — Positional `expression` declared by the builtin command signature.
+- `expression` — The `expression` argument
 
 ## `mode <normal|data|ai|toggle>`
 
@@ -149,7 +149,7 @@ Normal mode carries bytes and process status. Unquoted newlines separate command
 
 Options:
 
-- `normal|data|ai|toggle` — Positional `normal|data|ai|toggle` declared by the builtin command signature.
+- `normal|data|ai|toggle` — One of `normal`, `data`, `ai`, or `toggle`
 
 ## `quirl agent catalog [--format text|json]`
 
@@ -177,7 +177,7 @@ Ranks only installed command and HOST_API facts, selects the smallest relevant s
 
 Options:
 
-- `query` — Positional `query` declared by the builtin command signature.
+- `query` — The `query` argument
 - `--format` — Choose agent Markdown or stable machine JSON
 - `--token-budget` — Bound the canonical context payload
 
@@ -207,7 +207,7 @@ Reads at most 4 MiB from an admitted regular file, then rejects unknown fields, 
 
 Options:
 
-- `file` — Positional `file` declared by the builtin command signature.
+- `file` — The `file` argument
 - `--format` — Choose accessible diagnostics or stable JSON
 - `--kind` — Select the deny-unknown document schema
 
@@ -237,7 +237,7 @@ Uses the same local semantic index as AI mode, excludes the requested command, a
 
 Options:
 
-- `command` — Positional `command` declared by the builtin command signature.
+- `command` — The `command` argument
 - `--format` — Choose accessible text or stable machine JSON
 - `--limit` — Bound returned suggestions to at most 100
 
@@ -253,7 +253,7 @@ Sends the bounded natural-language intent and a compact projection of the comple
 
 Options:
 
-- `query` — Positional `query` declared by the builtin command signature.
+- `query` — The `query` argument
 
 ## `quirl ai search <query...> [--limit count] [--kind all|command|option] [--format text|json]`
 
@@ -267,7 +267,7 @@ Always ranks the complete bounded lexical document set and fuses it with matchin
 
 Options:
 
-- `query` — Positional `query` declared by the builtin command signature.
+- `query` — The `query` argument
 - `--format` — Choose accessible text or stable machine JSON
 - `--kind` — Restrict results to commands, options, or both
 - `--limit` — Bound returned suggestions to at most 100
@@ -356,7 +356,7 @@ Deterministically discovers Lua and Quirl scripts through a bounded, non-recursi
 
 Options:
 
-- `file|directory` — Positional `file|directory` declared by the builtin command signature.
+- `file|directory` — One of `file` or `directory`
 - `--format` — Choose diagnostic output
 
 ## `quirl complete <input> [--format text|json]`
@@ -371,7 +371,7 @@ Returns the same attributed completion items used by the interactive editor.
 
 Options:
 
-- `input` — Positional `input` declared by the builtin command signature.
+- `input` — The `input` argument
 - `--format` — Choose stable text or JSON output
 
 ## `quirl config check <file> [--format text|json]`
@@ -386,7 +386,7 @@ Evaluates under config restrictions, validates the returned Lua graph before all
 
 Options:
 
-- `file` — Positional `file` declared by the builtin command signature.
+- `file` — The `file` argument
 - `--format` — Choose output format
 
 ## `quirl config diff <file> <other> [--format text|json]`
@@ -401,8 +401,8 @@ Loads both authoritative Lua files under the restricted schema policy and report
 
 Options:
 
-- `file` — Positional `file` declared by the builtin command signature.
-- `other` — Positional `other` declared by the builtin command signature.
+- `file` — The `file` argument
+- `other` — The `other` argument
 - `--format` — Choose output format
 
 ## `quirl config doctor <file> [--format text|json]`
@@ -417,7 +417,7 @@ Validates the authoritative configuration and reports which recognized settings 
 
 Options:
 
-- `file` — Positional `file` declared by the builtin command signature.
+- `file` — The `file` argument
 - `--format` — Choose output format
 
 ## `quirl config export <file> [--format text|json]`
@@ -432,7 +432,7 @@ Reads and validates config.lua, then emits a deterministic terminal-safe text vi
 
 Options:
 
-- `file` — Positional `file` declared by the builtin command signature.
+- `file` — The `file` argument
 - `--format` — Choose output format
 
 ## `quirl config fmt <file> [--check]`
@@ -447,7 +447,7 @@ Validates the authoritative configuration, then applies Quirl's deterministic Lu
 
 Options:
 
-- `file` — Positional `file` declared by the builtin command signature.
+- `file` — The `file` argument
 - `--check` — Report formatting drift without writing
 
 ## `quirl config get <file> <key>`
@@ -462,8 +462,8 @@ Evaluates the complete restricted Lua configuration, validates it through Rust s
 
 Options:
 
-- `file` — Positional `file` declared by the builtin command signature.
-- `key` — Positional `key` declared by the builtin command signature.
+- `file` — The `file` argument
+- `key` — The `key` argument
 
 ## `quirl config migrate <file> --dry-run [--format text|json]`
 
@@ -477,7 +477,7 @@ Previews migration of an unversioned or explicit v1/v2/v3 configuration to the c
 
 Options:
 
-- `file` — Positional `file` declared by the builtin command signature.
+- `file` — The `file` argument
 - `--format` — Choose output format
 - `--dry-run` — Require a non-mutating migration preview
 
@@ -493,9 +493,9 @@ Changes only a recognized literal field in `quirl.config`, including `prompt.sym
 
 Options:
 
-- `file` — Positional `file` declared by the builtin command signature.
-- `key` — Positional `key` declared by the builtin command signature.
-- `value` — Positional `value` declared by the builtin command signature.
+- `file` — The `file` argument
+- `key` — The `key` argument
+- `value` — The `value` argument
 
 ## `quirl config tui <file>`
 
@@ -509,7 +509,7 @@ Shows current editor, picker, and prompt symbol values, allowed values, and text
 
 Options:
 
-- `file` — Positional `file` declared by the builtin command signature.
+- `file` — The `file` argument
 
 ## `quirl config web [file] [--port <port>]`
 
@@ -523,8 +523,8 @@ Serves an accessible configuration form only on IPv4 loopback. The private sessi
 
 Options:
 
-- `file` — Positional `file` declared by the builtin command signature.
-- `port` — Positional `port` declared by the builtin command signature.
+- `file` — The `file` argument
+- `port` — The `port` argument
 - `--port` — Loopback port; 0 selects an available port
 
 ## `quirl data <source> [| transform ...] [--format table|plain|json]`
@@ -539,7 +539,7 @@ Sources are `pwd`, `files [path]` (or `ls`), `open <path>`, JSON, or explicit `^
 
 Options:
 
-- `source` — Positional `source` declared by the builtin command signature.
+- `source` — The `source` argument
 - `--format` — Choose a human table/plain renderer or the stable typed JSON envelope
 
 ## `quirl data ls [path]`
@@ -554,7 +554,7 @@ List a directory as typed entries in Data mode
 
 Options:
 
-- `path` — Positional `path` declared by the builtin command signature.
+- `path` — The `path` argument
 
 ## `quirl describe <command> [--format text|json|markdown|html]`
 
@@ -568,7 +568,7 @@ Renders one exact entry from the same semantic catalog used by completion, docum
 
 Options:
 
-- `command` — Positional `command` declared by the builtin command signature.
+- `command` — The `command` argument
 - `--format` — Choose a deterministic documentation view
 
 ## `quirl doc [--format text|json|markdown|html] [--output path] [--open]`
@@ -599,7 +599,7 @@ Runs one expression in the same restricted, budgeted Lua runtime used by scripts
 
 Options:
 
-- `lua-expression` — Positional `lua-expression` declared by the builtin command signature.
+- `lua-expression` — The `lua-expression` argument
 
 ## `quirl events schema [--format text|json]`
 
@@ -627,7 +627,7 @@ Reads at most 4 MiB from an admitted regular file, then checks the deny-unknown 
 
 Options:
 
-- `file` — Positional `file` declared by the builtin command signature.
+- `file` — The `file` argument
 - `--format` — Choose accessible text or stable validation JSON
 
 ## `quirl exec <source> [--format text|json]`
@@ -642,7 +642,7 @@ Accepts complete Quirl source as exactly one outer-shell argument and passes it 
 
 Options:
 
-- `source` — Positional `source` declared by the builtin command signature.
+- `source` — The `source` argument
 - `--format` — Choose human-readable or stable ShellError output for failures
 
 ## `quirl fmt <file|directory> [--check]`
@@ -657,7 +657,7 @@ Deterministically discovers Lua and native `.qrl` scripts (including `.quirl` an
 
 Options:
 
-- `file|directory` — Positional `file|directory` declared by the builtin command signature.
+- `file|directory` — One of `file` or `directory`
 - `--check` — Report drift without writing
 
 ## `quirl index build [--fish path]... [--bash path]... [--zsh path]... [--help path]... [--man path]... [--output path] [--format text|json]`
@@ -692,7 +692,7 @@ Reads an admitted regular catalog file up to 4 MiB, then shows source kind, conf
 
 Options:
 
-- `command` — Positional `command` declared by the builtin command signature.
+- `command` — The `command` argument
 - `--format` — Choose the explanation format
 - `--index` — Read a specific catalog index
 
@@ -708,7 +708,7 @@ Aggregates annotation and capability diagnostics for scripts found through the s
 
 Options:
 
-- `file|directory` — Positional `file|directory` declared by the builtin command signature.
+- `file|directory` — One of `file` or `directory`
 - `--format` — Choose diagnostic output
 
 ## `quirl lsp`
@@ -733,7 +733,7 @@ Writes a deterministic Lua or native Quirl script with create-new semantics, so 
 
 Options:
 
-- `name` — Positional `name` declared by the builtin command signature.
+- `name` — The `name` argument
 - `--directory` — Choose the destination directory
 - `--lang` — Choose Lua (the default) or native Quirl (`.qrl`)
 
@@ -815,7 +815,7 @@ Reads the manifest and entry only from admitted regular files under their 256 Ki
 
 Options:
 
-- `source` — Positional `source` declared by the builtin command signature.
+- `source` — The `source` argument
 - `--allow` — Approve one requested capability after review; repeat as needed
 - `--format` — Choose accessible text or stable machine JSON
 
@@ -831,7 +831,7 @@ Reads at most 4 MiB from an admitted regular file, then loads a trusted plugin w
 
 Options:
 
-- `file` — Positional `file` declared by the builtin command signature.
+- `file` — The `file` argument
 - `--format` — Choose output format
 
 ## `quirl plugin disable <name> [--format text|json]`
@@ -846,7 +846,7 @@ Atomically changes only enabled state; source, checksums, versions, and granted 
 
 Options:
 
-- `name` — Positional `name` declared by the builtin command signature.
+- `name` — The `name` argument
 - `--format` — Choose accessible text or stable machine JSON
 
 ## `quirl plugin doctor <name> [--format text|json]`
@@ -861,7 +861,7 @@ Verifies lock schema/API versions and SHA-256 checksums, then validates trusted 
 
 Options:
 
-- `name` — Positional `name` declared by the builtin command signature.
+- `name` — The `name` argument
 - `--format` — Choose accessible text or stable machine JSON
 
 ## `quirl plugin enable <name> [--format text|json]`
@@ -876,7 +876,7 @@ Runs doctor and the declared non-executing or budgeted trusted boundary before a
 
 Options:
 
-- `name` — Positional `name` declared by the builtin command signature.
+- `name` — The `name` argument
 - `--format` — Choose accessible text or stable machine JSON
 
 ## `quirl plugin permissions <name> [--format text|json]`
@@ -891,7 +891,7 @@ Reads the permission lock and emits requested, granted, added, removed, and unch
 
 Options:
 
-- `name` — Positional `name` declared by the builtin command signature.
+- `name` — The `name` argument
 - `--format` — Choose accessible text or stable machine JSON
 
 ## `quirl plugin remove <name> [--format text|json]`
@@ -906,7 +906,7 @@ Atomically removes the named permission record; external source directories are 
 
 Options:
 
-- `name` — Positional `name` declared by the builtin command signature.
+- `name` — The `name` argument
 - `--format` — Choose accessible text or stable machine JSON
 
 ## `quirl plugin update --locked [--format text|json]`
@@ -936,7 +936,7 @@ Clones an HTTP(S), SSH, or scp-style repository into &lt;root&gt;/&lt;host&gt;/&
 
 Options:
 
-- `repository` — Positional `repository` declared by the builtin command signature.
+- `repository` — The `repository` argument
 - `--root` — Override the parent directory for this managed clone
 
 ## `quirl projects policy [ask|managed|off]`
@@ -951,7 +951,7 @@ Without an argument, prints the saved policy; missing state defaults to ask. ask
 
 Options:
 
-- `ask|managed|off` — Positional `ask|managed|off` declared by the builtin command signature.
+- `ask|managed|off` — One of `ask`, `managed`, or `off`
 
 ## `quirl projects root [--root path]`
 
@@ -979,7 +979,7 @@ Lists or displays versioned atomic snapshots containing a redacted command, work
 
 Options:
 
-- `list|show` — Positional `list|show` declared by the builtin command signature.
+- `list|show` — One of `list` or `show`
 - `--format` — Choose stable text or JSON output
 
 ## `quirl recover list [--format text|json]`
@@ -1008,7 +1008,7 @@ Displays an explicit snapshot or the newest available snapshot, including redact
 
 Options:
 
-- `id` — Positional `id` declared by the builtin command signature.
+- `id` — The `id` argument
 - `--format` — Choose stable text or JSON output
 
 ## `quirl run <file|-> [--lang lua|quirl|bash|zsh] [arguments...]`
@@ -1023,8 +1023,8 @@ Reads at most 4 MiB from an admitted regular file, or bounded standard input. Se
 
 Options:
 
-- `arguments` — Positional `arguments` declared by the builtin command signature.
-- `file|-` — Positional `file|-` declared by the builtin command signature.
+- `arguments` — The `arguments` argument
+- `file|-` — One of `file` or `-`
 - `--lang` — Select the language explicitly, including for stdin
 
 ## `quirl sdk [--format text|json|markdown]`
@@ -1067,7 +1067,7 @@ Discovers conventional Lua test modules through the bounded non-recursive author
 
 Options:
 
-- `file|directory` — Positional `file|directory` declared by the builtin command signature.
+- `file|directory` — One of `file` or `directory`
 
 ## `quirl view directory [path] [--all] [--format text|json]`
 
@@ -1081,7 +1081,7 @@ Produces a line-oriented name, kind, byte-size, and modification view with a pla
 
 Options:
 
-- `path` — Positional `path` declared by the builtin command signature.
+- `path` — The `path` argument
 - `--format` — Choose the plain view or typed panel model
 - `--all` — Include hidden entries
 
@@ -1097,7 +1097,7 @@ Invokes one permission-locked, deadline-bounded panel provider, validates its es
 
 Options:
 
-- `name` — Positional `name` declared by the builtin command signature.
+- `name` — The `name` argument
 - `--format` — Choose the plain view or typed panel model
 
 ## `quirl view processes [--format text|json]`
@@ -1126,7 +1126,7 @@ Re-evaluates the native data expression until the declared sample bound or Ctrl-
 
 Options:
 
-- `expression` — Positional `expression` declared by the builtin command signature.
+- `expression` — The `expression` argument
 - `--capacity` — Bound retained samples to at most 256
 - `--format` — Choose live lines or a bounded JSON snapshot
 - `--interval-ms` — Set the cancellable refresh interval

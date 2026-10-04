@@ -31,6 +31,14 @@ which versions are published.
 - `ls` tables show the `kind` column with its real values, such as
   `directory`, so `where kind == "directory"` filters what the table shows.
   The column was labeled `type` and abbreviated values to `dir` and `link`.
+- `quirl complete` now runs the interactive completion engine, so it lists
+  what Tab offers, including directories for `cd` and `$VARIABLE` names.
+
+### Fixed
+
+- `mode d` and other commands whose argument has a fixed set of values no
+  longer offer file names next to those values. Their menu descriptions read
+  "One of `normal`, `data`, `ai`, or `toggle`" instead of internal wording.
 
 ## [0.4.0] - 2026-09-30
 

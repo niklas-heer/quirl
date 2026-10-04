@@ -13,6 +13,7 @@ mod screen_selection;
 mod statusbar;
 mod transcript;
 
+pub use completion::complete_listing;
 pub use degrade::{SurfaceKind, select_surface};
 pub use project_clone::ProjectCloneChoice;
 pub use runtime::{

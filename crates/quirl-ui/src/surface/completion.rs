@@ -378,6 +378,42 @@ pub struct CompletionState {
     dismissed: bool,
 }
 
+/// Answer one explicit completion request without a terminal, using the
+/// interactive engine: variable, filesystem, catalog, and extension sources
+/// merged and filtered exactly as the Tab menu lists them.
+///
+/// The catalog and extension workers run as they do interactively. Waiting
+/// stops at `deadline`; sources that have not answered by then contribute
+/// nothing, and the candidates collected so far are returned.
+pub fn complete_listing(
+    catalog: Arc<Catalog>,
+    extensions: Option<Box<dyn ExtensionCompleter + Send>>,
+    line: &str,
+    cursor: usize,
+    deadline: std::time::Duration,
+) -> Result<Vec<Completion>, ShellError> {
+    let started = std::time::Instant::now();
+    let mut state = CompletionState::new(catalog, extensions);
+    state.request_listing(line, cursor, Mode::Command)?;
+    while state.streaming && started.elapsed() < deadline {
+        state.poll(line, cursor);
+        thread::park_timeout(std::time::Duration::from_millis(1));
+    }
+    state.cancel_workers();
+    Ok(std::mem::take(&mut state.items)
+        .into_iter()
+        .map(|item| Completion {
+            value: item.value,
+            display: item.display,
+            summary: item.summary,
+            detail: item.detail,
+            replace_start: item.replace_start,
+            replace_end: item.replace_end,
+            match_indices: item.match_indices,
+        })
+        .collect())
+}
+
 impl CompletionState {
     pub fn new(
         catalog: impl Into<Arc<Catalog>>,
@@ -1245,6 +1281,10 @@ fn filesystem_completion_context(
         return None;
     }
     if !explicit_path && catalog_has_subcommand_prefix(catalog, segment, raw_token) {
+        return None;
+    }
+    if !explicit_path && catalog.is_some_and(|catalog| catalog.completes_finite_positional(segment))
+    {
         return None;
     }
 
@@ -2258,6 +2298,23 @@ mod tests {
                 .resource_notice()
                 .is_some_and(|notice| notice.contains("4096 query bytes"))
         );
+    }
+
+    #[test]
+    fn finite_positional_values_are_not_mixed_with_file_names() {
+        let catalog = Catalog::builtin();
+        for line in ["mode d", "mode "] {
+            assert!(
+                filesystem_completion_items(Some(&catalog), line, line.len(), Mode::Command, None)
+                    .is_empty(),
+                "{line}"
+            );
+        }
+        // An explicit path is still a path, and other commands still list files.
+        assert!(
+            filesystem_completion_context(Some(&catalog), "mode ./", 7, Mode::Command).is_some()
+        );
+        assert!(filesystem_completion_context(Some(&catalog), "cat d", 5, Mode::Command).is_some());
     }
 
     #[test]

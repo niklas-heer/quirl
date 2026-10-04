@@ -51,7 +51,7 @@ use package::PackageCommand;
 use pick::PickCommand;
 use platform::{EventsCommand, ViewCommand, WatchCommand};
 use plugin::PluginCommand;
-use quirl_catalog::{Catalog, Completion, Effect as CatalogEffect};
+use quirl_catalog::{Catalog, Effect as CatalogEffect};
 use quirl_contract::{CommandPlanner, CommandPlanningRequest, CommandProposal};
 use quirl_core::{
     CommandOutcome, ErrorCode, ExecutionCancellation, ExecutionCleanupState, ExecutionEffect,
@@ -491,18 +491,21 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
         }
         Some(Command::Index { command }) => index::execute(command),
         Some(Command::Complete { input, format }) => {
-            let catalog = load_composed_catalog()?;
-            let mut extensions = LuaExtensionHost::discover();
-            let mut completions = catalog.complete(&input, input.len());
-            completions.extend(
-                extensions
-                    .complete(&input, input.len())
-                    .into_iter()
-                    .chain(
-                        shell_completion::ZshArgumentCompleter::new().complete(&input, input.len()),
-                    )
-                    .map(extension_completion),
-            );
+            // Drive the interactive engine itself so this command lists what
+            // an explicit Tab would, including directories and variables.
+            let catalog = Arc::new(load_composed_catalog()?);
+            let extensions = Arc::new(Mutex::new(LuaExtensionHost::discover()));
+            let completer = ExplicitCompletionAdapter {
+                lua: LuaCompletionAdapter::new(extensions),
+                zsh: shell_completion::ZshArgumentCompleter::new(),
+            };
+            let completions = quirl_ui::complete_listing(
+                catalog,
+                Some(Box::new(completer)),
+                &input,
+                input.len(),
+                COMPLETE_COMMAND_DEADLINE,
+            )?;
             match format {
                 CompletionFormat::Json => {
                     let json = serde_json::to_string_pretty(&completions).map_err(json_error)?;
@@ -707,18 +710,6 @@ fn catalog_admission_test_hook() -> Result<(), ShellError> {
         );
     }
     Ok(())
-}
-
-fn extension_completion(suggestion: quirl_ui::ExtensionSuggestion) -> Completion {
-    Completion {
-        value: suggestion.value,
-        display: suggestion.display,
-        summary: suggestion.summary,
-        detail: suggestion.detail,
-        replace_start: suggestion.replace_start,
-        replace_end: suggestion.replace_end,
-        match_indices: Vec::new(),
-    }
 }
 
 impl Cli {
@@ -3858,6 +3849,29 @@ impl ExtensionCompleter for LocalAwareCompletionAdapter {
         suggestions
     }
 }
+
+/// Lua and live Zsh sources for `quirl complete`, which has no local
+/// command-intelligence session to feed.
+struct ExplicitCompletionAdapter {
+    lua: LuaCompletionAdapter,
+    zsh: shell_completion::ZshArgumentCompleter,
+}
+
+impl ExtensionCompleter for ExplicitCompletionAdapter {
+    fn complete(&mut self, line: &str, pos: usize) -> Vec<ExtensionSuggestion> {
+        self.lua.complete(line, pos)
+    }
+
+    fn complete_explicit(&mut self, line: &str, pos: usize) -> Vec<ExtensionSuggestion> {
+        let mut suggestions = self.complete(line, pos);
+        suggestions.extend(self.zsh.complete(line, pos));
+        suggestions
+    }
+}
+
+/// Longest `quirl complete` waits for every source, covering a cold live Zsh
+/// request (1.5 s) plus catalog and Lua work.
+const COMPLETE_COMMAND_DEADLINE: Duration = Duration::from_secs(3);
 
 const INTERACTIVE_PICKER_DEADLINE: Duration = Duration::from_millis(50);
 

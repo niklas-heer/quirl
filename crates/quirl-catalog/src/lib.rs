@@ -1844,6 +1844,15 @@ impl Catalog {
         self.complete_contextual(input, cursor, limit.min(MAX_COMPLETION_RESULTS))
     }
 
+    /// Whether the word ending `segment` is the first positional argument of
+    /// an exact command path whose catalog entry lists every accepted value,
+    /// such as `mode d`. Such a word never names a file, so filesystem
+    /// completion should leave it to the catalog's values.
+    pub fn completes_finite_positional(&self, segment: &str) -> bool {
+        self.first_positional_value_context(segment.trim_start(), 0)
+            .is_some()
+    }
+
     fn complete_contextual(
         &self,
         input: &str,
@@ -2810,6 +2819,23 @@ fn option(names: &[&str], value: Option<&str>, summary: &str) -> OptionSpec {
     }
 }
 
+/// Completion-menu prose for a signature positional: its accepted values when
+/// the signature lists them, otherwise the placeholder the signature names.
+fn positional_documentation(value: &str) -> String {
+    let Some(CompletionSource::Static { values }) = static_values(value) else {
+        return format!("The `{value}` argument");
+    };
+    let quoted = values
+        .iter()
+        .map(|value| format!("`{value}`"))
+        .collect::<Vec<_>>();
+    match quoted.split_last() {
+        Some((last, rest)) if rest.len() > 1 => format!("One of {}, or {last}", rest.join(", ")),
+        Some((last, rest)) => format!("One of {} or {last}", rest.join(", ")),
+        None => format!("The `{value}` argument"),
+    }
+}
+
 fn static_values(value: &str) -> Option<CompletionSource> {
     let values = value
         .split('|')
@@ -3026,9 +3052,9 @@ fn positional_argument(
         value_type: value.to_owned(),
         required,
         repeatable: token.contains("..."),
+        documentation: positional_documentation(value),
         values: static_values(value),
         conflicts: Vec::new(),
-        documentation: format!("Positional `{value}` declared by the builtin command signature."),
         examples: examples
             .iter()
             .map(|example| (*example).to_owned())
@@ -3098,6 +3124,20 @@ pub(crate) fn imported_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signature_positionals_describe_their_accepted_values() {
+        assert_eq!(
+            positional_documentation("normal|data|ai|toggle"),
+            "One of `normal`, `data`, `ai`, or `toggle`"
+        );
+        assert_eq!(positional_documentation("on|off"), "One of `on` or `off`");
+        assert_eq!(positional_documentation("path"), "The `path` argument");
+        let catalog = Catalog::builtin();
+        assert!(catalog.completes_finite_positional("mode d"));
+        assert!(catalog.completes_finite_positional("  mode "));
+        assert!(!catalog.completes_finite_positional("cat d"));
+    }
 
     #[test]
     fn fuzzy_command_completion_discovers_subcommands() {
