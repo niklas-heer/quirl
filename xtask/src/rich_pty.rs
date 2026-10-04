@@ -1070,11 +1070,14 @@ fn check_first_session_help_and_data(binary: &Path) -> Result<(), TaskError> {
     session
         .pty
         .wait_for_screen("first typed result", |screen| {
+            // The filtered row renders as a table, not as a JSON line.
             let text = screen.text();
             screen.bottom_line().contains("DATA")
-                && text
-                    .lines()
-                    .any(|line| line.trim().starts_with(r#"{"service":"api"}"#))
+                && text.lines().any(|line| {
+                    let cells: Vec<&str> = line.split('│').map(str::trim).collect();
+                    cells.get(1) == Some(&"0") && cells.get(2) == Some(&"api")
+                })
+                && !text.contains(r#"{"service":"api"}"#)
         })?;
     wait_for_rich_input_since(&mut session, result_start)?;
     session.pty.type_text("mode normal")?;

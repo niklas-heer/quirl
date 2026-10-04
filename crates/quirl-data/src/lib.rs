@@ -39,7 +39,7 @@ use syntax::{
     DataPredicate as SyntaxPredicate, DataSource, DataSyntaxDiagnostic, DataSyntaxDiagnosticKind,
     DataSyntaxLimits, DataTransform, SortDirection, Spanned,
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use value_boundary::{
     ValueUsage, data_value_from_json, data_value_from_syntax, data_value_from_toml,
     data_value_from_yaml, json_from_data_value, validate_data_value,
@@ -354,7 +354,15 @@ pub enum DataRenderFormat {
     /// Terminal-safe line-oriented text.
     Plain,
     /// A framed, Unicode-width-aligned table that collects streams within their configured row bound.
-    Table,
+    ///
+    /// A single record renders as a vertical key/value table, and nested lists
+    /// and records inside cells render as `[list 3 items]`-style summaries.
+    Table {
+        /// Terminal cells available per line. When set, wide columns shrink and
+        /// end in `…`, and trailing columns that still do not fit collapse into
+        /// one `…` column. `None` keeps every cell at its natural width.
+        width_cells_max: Option<usize>,
+    },
 }
 
 /// A pull-based stream. Calling `next` performs at most one row of work and
@@ -2058,7 +2066,9 @@ fn render_envelope_to(
             write_plain_envelope(writer, envelope, limits)?;
             write_output(writer, b"\n")
         }
-        DataRenderFormat::Table => render_table_to(writer, envelope, limits),
+        DataRenderFormat::Table { width_cells_max } => {
+            render_table_to(writer, envelope, limits, width_cells_max)
+        }
     }
 }
 
@@ -2074,11 +2084,11 @@ fn render_stream_to(
 ) -> Result<(), ShellError> {
     check_cancelled(cancelled)?;
     match format {
-        DataRenderFormat::Table => {
+        DataRenderFormat::Table { width_cells_max } => {
             let limits = stream.limits();
             let rows = stream.collect(cancelled)?;
             check_cancelled(cancelled)?;
-            render_table_rows_to(writer, &rows, limits, Some(cancelled))
+            render_table_rows_to(writer, &rows, limits, width_cells_max, Some(cancelled))
         }
         DataRenderFormat::Plain => {
             let limits = stream.limits();
@@ -2597,6 +2607,7 @@ fn render_table_to(
     writer: &mut impl Write,
     envelope: &DataEnvelope,
     limits: DataLimits,
+    width_cells_max: Option<usize>,
 ) -> Result<(), ShellError> {
     let original = envelope;
     let mut current = envelope;
@@ -2604,7 +2615,7 @@ fn render_table_to(
         match current {
             DataEnvelope::Value { value } => break value,
             DataEnvelope::Stream { items } => {
-                return render_table_rows_to(writer, items, limits, None);
+                return render_table_rows_to(writer, items, limits, width_cells_max, None);
             }
             DataEnvelope::Option { value }
             | DataEnvelope::Result { value, .. }
@@ -2618,9 +2629,9 @@ fn render_table_to(
         }
     };
     match value {
-        DataValue::List(rows) => render_table_rows_to(writer, rows, limits, None),
-        DataValue::Record(_) => {
-            render_table_rows_to(writer, std::slice::from_ref(value), limits, None)
+        DataValue::List(rows) => render_table_rows_to(writer, rows, limits, width_cells_max, None),
+        DataValue::Record(record) => {
+            render_record_table_to(writer, record, limits, width_cells_max)
         }
         _ => {
             write_plain_data_value(writer, value, limits)?;
@@ -2629,10 +2640,56 @@ fn render_table_to(
     }
 }
 
+/// Render one record vertically, one `key │ value` line per field, the way
+/// a record reads in a configuration file rather than as a one-row table.
+fn render_record_table_to(
+    writer: &mut impl Write,
+    record: &IndexMap<String, DataValue>,
+    limits: DataLimits,
+    width_cells_max: Option<usize>,
+) -> Result<(), ShellError> {
+    if record.is_empty() {
+        return write_output(writer, b"{record 0 fields}\n");
+    }
+    let now_unix_seconds = unix_seconds_now();
+    let mut lines = Vec::with_capacity(record.len());
+    let mut key_width = 0_usize;
+    let mut value_width = 0_usize;
+    for (key, value) in record {
+        let key = render_table_text(key, limits)?;
+        let rendered = render_table_value(value, limits, now_unix_seconds)?;
+        key_width = key_width.max(UnicodeWidthStr::width(key.as_str()));
+        value_width = value_width.max(UnicodeWidthStr::width(rendered.as_str()));
+        lines.push((key, rendered, table_alignment(value)));
+    }
+    let mut widths = [key_width, value_width];
+    if let Some(width_cells_max) = width_cells_max {
+        let floors = [
+            key_width.min(TABLE_KEY_WIDTH_MIN),
+            value_width.min(TABLE_COLUMN_WIDTH_MIN),
+        ];
+        shrink_table_widths(&mut widths, &floors, width_cells_max);
+    }
+    write_table_rule(writer, &widths, TableRule::Top)?;
+    for (key, rendered, alignment) in &lines {
+        write_table_row(
+            writer,
+            [
+                (key.as_str(), TableAlignment::Left),
+                (rendered.as_str(), *alignment),
+            ]
+            .into_iter(),
+            &widths,
+        )?;
+    }
+    write_table_rule(writer, &widths, TableRule::Bottom)
+}
+
 fn render_table_rows_to(
     writer: &mut impl Write,
     rows: &[DataValue],
     limits: DataLimits,
+    width_cells_max: Option<usize>,
     cancelled: Option<&AtomicBool>,
 ) -> Result<(), ShellError> {
     let mut columns = IndexSet::new();
@@ -2651,7 +2708,7 @@ fn render_table_rows_to(
         }
         return Ok(());
     }
-    let layout = table_layout(columns, rows, limits)?;
+    let layout = table_layout(columns, rows, limits, width_cells_max)?;
     write_table_rule(writer, &layout.widths, TableRule::Top)?;
     write_table_header(writer, &layout)?;
     write_table_rule(writer, &layout.widths, TableRule::Header)?;
@@ -2669,6 +2726,14 @@ fn render_table_rows_to(
 }
 
 const TABLE_PADDING_CHUNK_BYTES: usize = 64;
+/// Narrowest a shrinking data column becomes before trailing columns are
+/// elided; enough for a short word, a size, or a relative time.
+const TABLE_COLUMN_WIDTH_MIN: usize = 8;
+/// Narrowest a shrinking record key column becomes, and the longest heading
+/// kept whole while its column shrinks.
+const TABLE_KEY_WIDTH_MIN: usize = 12;
+/// Marks a truncated cell and the column standing in for elided columns.
+const TABLE_ELLIPSIS: &str = "…";
 const TABLE_REPEAT_HEADER_ROW_MIN: usize = 16;
 const TABLE_HORIZONTAL_RULE_CHUNK: &str = "────────────────";
 const TABLE_HORIZONTAL_RULE_CHUNK_CELLS: usize = 16;
@@ -2690,9 +2755,14 @@ enum TableRule {
 }
 
 struct TableLayout<'a> {
+    /// Displayed columns, after any trailing columns were elided.
     columns: Vec<TableColumn<'a>>,
     rendered_columns: Vec<String>,
+    /// Cell widths: the row index, each displayed column, then the `…`
+    /// column when `elided` is set.
     widths: Vec<usize>,
+    /// Whether trailing columns were replaced by one `…` column to fit.
+    elided: bool,
     now_unix_seconds: Option<u64>,
 }
 
@@ -2702,15 +2772,20 @@ struct TableColumn<'a> {
     heading: &'a str,
 }
 
+fn unix_seconds_now() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
 fn table_layout<'a>(
     columns: IndexSet<&'a str>,
     rows: &[DataValue],
     limits: DataLimits,
+    width_cells_max: Option<usize>,
 ) -> Result<TableLayout<'a>, ShellError> {
-    let now_unix_seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|duration| duration.as_secs());
+    let now_unix_seconds = unix_seconds_now();
     let columns = table_columns(columns, rows);
     let rendered_columns = columns
         .iter()
@@ -2728,8 +2803,7 @@ fn table_layout<'a>(
                         continue;
                     };
                     let width = UnicodeWidthStr::width(
-                        render_table_value(Some(column.key), value, limits, now_unix_seconds)?
-                            .as_str(),
+                        render_table_value(value, limits, now_unix_seconds)?.as_str(),
                     );
                     let Some(column_width) = widths.get_mut(index) else {
                         return Err(table_shape_error());
@@ -2738,7 +2812,7 @@ fn table_layout<'a>(
                 }
             }
             value => {
-                let rendered = render_table_value(None, value, limits, now_unix_seconds)?;
+                let rendered = render_table_value(value, limits, now_unix_seconds)?;
                 let Some(first_width) = widths.first_mut() else {
                     return Err(table_shape_error());
                 };
@@ -2749,12 +2823,121 @@ fn table_layout<'a>(
     let last_row_index = rows.len().saturating_sub(1);
     let row_index_width = last_row_index.to_string().len().max(1);
     widths.insert(0, row_index_width);
-    Ok(TableLayout {
+    let mut layout = TableLayout {
         columns,
         rendered_columns,
         widths,
+        elided: false,
         now_unix_seconds,
+    };
+    if let Some(width_cells_max) = width_cells_max {
+        fit_table_layout(&mut layout, width_cells_max);
+    }
+    Ok(layout)
+}
+
+/// Terminal cells one framed line occupies: a leading border, then one space,
+/// the cell, one space, and a border per column.
+fn table_line_width(widths: &[usize]) -> usize {
+    widths.iter().fold(1_usize, |total, width| {
+        total.saturating_add(width.saturating_add(3))
     })
+}
+
+/// Shrink and, if necessary, elide columns so every line fits.
+///
+/// The row index never shrinks. Data columns shrink toward
+/// [`TABLE_COLUMN_WIDTH_MIN`] or their heading width (or their natural width
+/// if smaller); when even
+/// those floors overflow, trailing columns are replaced by one `…` column. A
+/// terminal too narrow for the index and first column keeps that minimum
+/// and lets the terminal wrap rather than hiding every value.
+fn fit_table_layout(layout: &mut TableLayout<'_>, width_cells_max: usize) {
+    if table_line_width(&layout.widths) <= width_cells_max {
+        return;
+    }
+    // A heading up to the key width stays readable before its column shrinks.
+    let floors: Vec<usize> = layout
+        .widths
+        .iter()
+        .enumerate()
+        .map(|(index, width)| {
+            let Some(heading) = index
+                .checked_sub(1)
+                .and_then(|column| layout.rendered_columns.get(column))
+            else {
+                return *width;
+            };
+            let heading_width = UnicodeWidthStr::width(heading.as_str()).min(TABLE_KEY_WIDTH_MIN);
+            (*width).min(heading_width.max(TABLE_COLUMN_WIDTH_MIN))
+        })
+        .collect();
+    if table_line_width(&floors) > width_cells_max {
+        // Keep the index and as many leading columns as fit beside the
+        // one-cell `…` column, always keeping at least one data column.
+        // The `…` column is one cell wide plus its padding and border.
+        let marker_width = 4;
+        let mut kept = 1_usize;
+        let index_and_first = floors.get(..2).unwrap_or(&floors);
+        let mut used = table_line_width(index_and_first).saturating_add(marker_width);
+        while let Some(floor) = floors.get(kept.saturating_add(1)) {
+            let next = used.saturating_add(floor.saturating_add(3));
+            if next > width_cells_max {
+                break;
+            }
+            used = next;
+            kept = kept.saturating_add(1);
+        }
+        layout.columns.truncate(kept);
+        layout.rendered_columns.truncate(kept);
+        layout.widths.truncate(kept.saturating_add(1));
+        layout.elided = true;
+        let floors = floors.get(..layout.widths.len()).unwrap_or(&floors);
+        let available = width_cells_max.saturating_sub(marker_width);
+        shrink_table_widths(&mut layout.widths, floors, available);
+        layout.widths.push(1);
+        return;
+    }
+    shrink_table_widths(&mut layout.widths, &floors, width_cells_max);
+}
+
+/// Cap the widest columns at one shared width so the line fits in
+/// `width_cells_max`, never below each column's floor, then return any cells
+/// the integer cap left unused to capped columns from left to right.
+fn shrink_table_widths(widths: &mut [usize], floors: &[usize], width_cells_max: usize) {
+    let capped = |cap: usize| -> Vec<usize> {
+        widths
+            .iter()
+            .zip(floors)
+            .map(|(width, floor)| (*width).min(cap).max(*floor))
+            .collect()
+    };
+    if table_line_width(widths) <= width_cells_max {
+        return;
+    }
+    // Binary search for the largest shared cap that fits; the line width is
+    // monotonic in the cap, so this takes O(columns · log(widest)) work.
+    let mut low = 0_usize;
+    let mut high = widths.iter().copied().max().unwrap_or(0);
+    while low < high {
+        let middle = low.saturating_add(high.saturating_sub(low).div_ceil(2));
+        if table_line_width(&capped(middle)) <= width_cells_max {
+            low = middle;
+        } else {
+            high = middle.saturating_sub(1);
+        }
+    }
+    let mut fitted = capped(low);
+    let mut spare = width_cells_max.saturating_sub(table_line_width(&fitted));
+    for (fitted, natural) in fitted.iter_mut().zip(widths.iter()) {
+        if spare == 0 {
+            break;
+        }
+        let grow = natural.saturating_sub(*fitted).min(spare);
+        *fitted = fitted.saturating_add(grow);
+        spare = spare.saturating_sub(grow);
+    }
+    widths.copy_from_slice(&fitted);
 }
 
 fn table_columns<'a>(columns: IndexSet<&'a str>, rows: &[DataValue]) -> Vec<TableColumn<'a>> {
@@ -2780,7 +2963,7 @@ fn table_columns<'a>(columns: IndexSet<&'a str>, rows: &[DataValue]) -> Vec<Tabl
         },
         TableColumn {
             key: "kind",
-            heading: "type",
+            heading: "kind",
         },
         TableColumn {
             key: "size",
@@ -2818,14 +3001,26 @@ fn directory_field_is_not_default(row: &DataValue, field: &str) -> bool {
 fn write_table_header(writer: &mut impl Write, layout: &TableLayout<'_>) -> Result<(), ShellError> {
     write_table_row(
         writer,
-        std::iter::once(("#", TableAlignment::Center)).chain(
-            layout
-                .rendered_columns
-                .iter()
-                .map(|column| (column.as_str(), TableAlignment::Center)),
-        ),
+        std::iter::once(("#", TableAlignment::Center))
+            .chain(
+                layout
+                    .rendered_columns
+                    .iter()
+                    .map(|column| (column.as_str(), TableAlignment::Center)),
+            )
+            .chain(elision_cell(layout)),
         &layout.widths,
     )
+}
+
+/// The `…` cell standing in for elided columns, when the layout has one.
+fn elision_cell<'cell>(
+    layout: &TableLayout<'_>,
+) -> impl Iterator<Item = (&'cell str, TableAlignment)> + use<'cell> {
+    layout
+        .elided
+        .then_some((TABLE_ELLIPSIS, TableAlignment::Left))
+        .into_iter()
 }
 
 fn write_table_value_row(
@@ -2837,7 +3032,7 @@ fn write_table_value_row(
 ) -> Result<(), ShellError> {
     let rendered_row_index = row_index.to_string();
     let DataValue::Record(row) = value else {
-        let rendered = render_table_value(None, value, limits, layout.now_unix_seconds)?;
+        let rendered = render_table_value(value, limits, layout.now_unix_seconds)?;
         let trailing_cells = std::iter::repeat_n(
             ("", TableAlignment::Left),
             layout.widths.len().saturating_sub(2),
@@ -2866,7 +3061,7 @@ fn write_table_record(
         .map(|column| {
             row.get(column.key)
                 .map(|value| {
-                    render_table_value(Some(column.key), value, limits, layout.now_unix_seconds)
+                    render_table_value(value, limits, layout.now_unix_seconds)
                         .map(|rendered| (rendered, table_alignment(value)))
                 })
                 .transpose()
@@ -2875,11 +3070,13 @@ fn write_table_record(
         .collect::<Result<Vec<_>, ShellError>>()?;
     write_table_row(
         writer,
-        std::iter::once((rendered_row_index, TableAlignment::Right)).chain(
-            rendered
-                .iter()
-                .map(|(value, alignment)| (value.as_str(), *alignment)),
-        ),
+        std::iter::once((rendered_row_index, TableAlignment::Right))
+            .chain(
+                rendered
+                    .iter()
+                    .map(|(value, alignment)| (value.as_str(), *alignment)),
+            )
+            .chain(elision_cell(layout)),
         &layout.widths,
     )
 }
@@ -2901,23 +3098,34 @@ fn render_table_text(value: &str, limits: DataLimits) -> Result<String, ShellErr
     })
 }
 
+fn is_record(value: &DataValue) -> bool {
+    matches!(value, DataValue::Record(_))
+}
+
+/// Summarize a nested value inside a table cell, such as `[list 3 items]`,
+/// so one deep field cannot widen the whole table. `get` or `--format json`
+/// shows the full value.
+fn nested_summary(open: &str, count: usize, noun: &str, close: &str) -> String {
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{open} {count} {noun}{plural}{close}")
+}
+
 fn render_table_value(
-    column: Option<&str>,
     value: &DataValue,
     limits: DataLimits,
     now_unix_seconds: Option<u64>,
 ) -> Result<String, ShellError> {
-    if let (Some("kind"), DataValue::String(kind)) = (column, value) {
-        return Ok(match kind.as_str() {
-            "directory" => "dir".to_owned(),
-            "symlink" => "link".to_owned(),
-            _ => kind.clone(),
-        });
-    }
     match value {
         DataValue::Nothing => return Ok("—".to_owned()),
         DataValue::Bool(true) => return Ok("✓".to_owned()),
         DataValue::Bool(false) => return Ok("·".to_owned()),
+        DataValue::Record(fields) => {
+            return Ok(nested_summary("{record", fields.len(), "field", "}"));
+        }
+        DataValue::List(items) if !items.is_empty() && items.iter().all(is_record) => {
+            return Ok(nested_summary("[table", items.len(), "row", "]"));
+        }
+        DataValue::List(items) => return Ok(nested_summary("[list", items.len(), "item", "]")),
         _ => {}
     }
     if let DataValue::Size { bytes } = value {
@@ -3008,6 +3216,8 @@ fn write_table_row<'a>(
     write_output(writer, "│".as_bytes())?;
     for (index, (cell, alignment)) in cells.enumerate() {
         let width = widths.get(index).copied().ok_or_else(table_shape_error)?;
+        let truncated = truncate_table_cell(cell, width);
+        let cell = truncated.as_deref().unwrap_or(cell);
         let cell_width = UnicodeWidthStr::width(cell);
         let padding = width.saturating_sub(cell_width);
         let (left_padding, right_padding) = match alignment {
@@ -3023,6 +3233,29 @@ fn write_table_row<'a>(
         write_output(writer, "│".as_bytes())?;
     }
     write_output(writer, b"\n")
+}
+
+/// Shorten `cell` to `width` terminal cells ending in `…`, or return `None`
+/// when it already fits. Wide characters never straddle the boundary.
+fn truncate_table_cell(cell: &str, width: usize) -> Option<String> {
+    if UnicodeWidthStr::width(cell) <= width {
+        return None;
+    }
+    let budget = width.saturating_sub(1);
+    let mut used = 0_usize;
+    let mut truncated = String::with_capacity(budget.saturating_add(TABLE_ELLIPSIS.len()));
+    for character in cell.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used.saturating_add(character_width) > budget {
+            break;
+        }
+        used = used.saturating_add(character_width);
+        truncated.push(character);
+    }
+    if width > 0 {
+        truncated.push_str(TABLE_ELLIPSIS);
+    }
+    Some(truncated)
 }
 
 fn write_table_rule(
@@ -4839,7 +5072,9 @@ mod tests {
         for format in [
             DataRenderFormat::Json,
             DataRenderFormat::Plain,
-            DataRenderFormat::Table,
+            DataRenderFormat::Table {
+                width_cells_max: None,
+            },
         ] {
             let expected = render_stream_with_limit(
                 vec![expansion_row()],
@@ -4926,7 +5161,9 @@ mod tests {
         )]));
         let rendered = render_stream_with_limit(
             vec![row.clone(), row.clone()],
-            DataRenderFormat::Table,
+            DataRenderFormat::Table {
+                width_cells_max: None,
+            },
             DataLimits::DEFAULT.max_materialized_bytes,
         )
         .unwrap();
@@ -4941,13 +5178,20 @@ mod tests {
         );
         let single_row = render_stream_with_limit(
             vec![row.clone()],
-            DataRenderFormat::Table,
+            DataRenderFormat::Table {
+                width_cells_max: None,
+            },
             DataLimits::DEFAULT.max_materialized_bytes,
         )
         .unwrap();
-        let error =
-            render_stream_with_limit(vec![row], DataRenderFormat::Table, single_row.len() - 1)
-                .unwrap_err();
+        let error = render_stream_with_limit(
+            vec![row],
+            DataRenderFormat::Table {
+                width_cells_max: None,
+            },
+            single_row.len() - 1,
+        )
+        .unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
     }
 
@@ -5106,7 +5350,9 @@ mod tests {
                     DataValue::String("degraded".to_owned()),
                 )])),
             ],
-            DataRenderFormat::Table,
+            DataRenderFormat::Table {
+                width_cells_max: None,
+            },
             DataLimits::DEFAULT.max_materialized_bytes,
         )
         .unwrap();
@@ -5134,7 +5380,9 @@ mod tests {
                     ("size".to_owned(), DataValue::Size { bytes: 100 }),
                 ])),
             ],
-            DataRenderFormat::Table,
+            DataRenderFormat::Table {
+                width_cells_max: None,
+            },
             DataLimits::DEFAULT.max_materialized_bytes,
         )
         .unwrap();
@@ -5163,7 +5411,9 @@ mod tests {
                 ])),
                 DataValue::String("fallback".to_owned()),
             ],
-            DataRenderFormat::Table,
+            DataRenderFormat::Table {
+                width_cells_max: None,
+            },
             DataLimits::DEFAULT.max_materialized_bytes,
         )
         .unwrap();
@@ -5196,17 +5446,173 @@ mod tests {
         ]));
         let rendered = render_stream_with_limit(
             vec![row],
-            DataRenderFormat::Table,
+            DataRenderFormat::Table {
+                width_cells_max: None,
+            },
             DataLimits::DEFAULT.max_materialized_bytes,
         )
         .unwrap();
 
-        assert!(rendered.contains("│ # │  name  │ type │  size  │       modified       │"));
-        assert!(rendered.contains("│ 0 │ assets │ dir  │ 1.5 kB │ 2026-08-17T00:00:00Z │"));
+        // Headings and values match the fields, so `where kind == "directory"`
+        // filters exactly what the table shows.
+        assert!(rendered.contains("│ # │  name  │   kind    │  size  │       modified       │"));
+        assert!(rendered.contains("│ 0 │ assets │ directory │ 1.5 kB │ 2026-08-17T00:00:00Z │"));
         assert!(!rendered.contains("path"));
         assert!(!rendered.contains("readonly"));
         assert!(!rendered.contains("hidden"));
         assert!(!rendered.contains("target"));
+    }
+
+    fn service_row() -> DataValue {
+        DataValue::Record(IndexMap::from([
+            ("service".to_owned(), DataValue::String("api".to_owned())),
+            (
+                "region".to_owned(),
+                DataValue::String("eu-central-1".to_owned()),
+            ),
+            ("status".to_owned(), DataValue::String("failed".to_owned())),
+            ("latency_ms".to_owned(), DataValue::UInt(120)),
+            (
+                "owner".to_owned(),
+                DataValue::String("platform-team".to_owned()),
+            ),
+        ]))
+    }
+
+    fn render_table_fitted(rows: Vec<DataValue>, width_cells_max: usize) -> String {
+        render_stream_with_limit(
+            rows,
+            DataRenderFormat::Table {
+                width_cells_max: Some(width_cells_max),
+            },
+            DataLimits::DEFAULT.max_materialized_bytes,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn fitted_tables_keep_natural_widths_when_they_already_fit() {
+        let natural = render_stream_with_limit(
+            vec![service_row()],
+            DataRenderFormat::Table {
+                width_cells_max: None,
+            },
+            DataLimits::DEFAULT.max_materialized_bytes,
+        )
+        .unwrap();
+        let line_width = UnicodeWidthStr::width(natural.lines().next().unwrap());
+        assert_eq!(
+            render_table_fitted(vec![service_row()], line_width),
+            natural
+        );
+    }
+
+    #[test]
+    fn fitted_tables_shrink_wide_cells_with_an_ellipsis() {
+        let rendered = render_table_fitted(vec![service_row()], 60);
+        assert_eq!(
+            rendered,
+            "╭───┬─────────┬───────────┬────────┬────────────┬──────────╮\n\
+             │ # │ service │  region   │ status │ latency_ms │  owner   │\n\
+             ├───┼─────────┼───────────┼────────┼────────────┼──────────┤\n\
+             │ 0 │ api     │ eu-centr… │ failed │        120 │ platfor… │\n\
+             ╰───┴─────────┴───────────┴────────┴────────────┴──────────╯\n"
+        );
+        for line in rendered.lines() {
+            assert!(UnicodeWidthStr::width(line) <= 60, "{line}");
+        }
+    }
+
+    #[test]
+    fn fitted_tables_elide_trailing_columns_that_cannot_fit() {
+        let rendered = render_table_fitted(vec![service_row()], 40);
+        assert!(
+            rendered.contains("│ # │ service │  region   │ status │ … │"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("│ 0 │ api     │ eu-centr… │ failed │ … │"),
+            "{rendered}"
+        );
+        for line in rendered.lines() {
+            assert!(UnicodeWidthStr::width(line) <= 40, "{line}");
+        }
+    }
+
+    #[test]
+    fn fitted_tables_keep_one_column_on_a_terminal_narrower_than_its_floor() {
+        let rendered = render_table_fitted(vec![service_row()], 5);
+        assert!(rendered.contains("│ # │ service │ … │"), "{rendered}");
+    }
+
+    #[test]
+    fn truncated_cells_never_split_wide_characters() {
+        assert_eq!(truncate_table_cell("東京都", 4).as_deref(), Some("東…"));
+        assert_eq!(truncate_table_cell("東京都", 6), None);
+        assert_eq!(truncate_table_cell("abc", 0).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn single_records_render_as_vertical_tables_with_nested_summaries() {
+        let record = DataValue::Record(IndexMap::from([
+            ("service".to_owned(), DataValue::String("api".to_owned())),
+            (
+                "tags".to_owned(),
+                DataValue::List(vec![DataValue::String("a".to_owned())]),
+            ),
+            (
+                "owner".to_owned(),
+                DataValue::Record(IndexMap::from([
+                    ("team".to_owned(), DataValue::String("core".to_owned())),
+                    ("oncall".to_owned(), DataValue::String("ada".to_owned())),
+                ])),
+            ),
+            (
+                "replicas".to_owned(),
+                DataValue::List(vec![DataValue::Record(IndexMap::new()); 3]),
+            ),
+            ("empty".to_owned(), DataValue::List(Vec::new())),
+        ]));
+        let rendered = DataEnvelope::value(record)
+            .render(DataRenderFormat::Table {
+                width_cells_max: None,
+            })
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "╭──────────┬───────────────────╮\n\
+             │ service  │ api               │\n\
+             │ tags     │ [list 1 item]     │\n\
+             │ owner    │ {record 2 fields} │\n\
+             │ replicas │ [table 3 rows]    │\n\
+             │ empty    │ [list 0 items]    │\n\
+             ╰──────────┴───────────────────╯\n"
+        );
+        assert_eq!(
+            DataEnvelope::value(DataValue::Record(IndexMap::new()))
+                .render(DataRenderFormat::Table {
+                    width_cells_max: None,
+                })
+                .unwrap(),
+            "{record 0 fields}\n"
+        );
+    }
+
+    #[test]
+    fn fitted_record_tables_shrink_long_values() {
+        let record = DataValue::Record(IndexMap::from([(
+            "description".to_owned(),
+            DataValue::String("x".repeat(100)),
+        )]));
+        let rendered = DataEnvelope::value(record)
+            .render(DataRenderFormat::Table {
+                width_cells_max: Some(40),
+            })
+            .unwrap();
+        for line in rendered.lines() {
+            assert_eq!(UnicodeWidthStr::width(line), 40, "{line}");
+        }
+        assert!(rendered.contains("x…"));
     }
 
     #[test]
@@ -5238,7 +5644,9 @@ mod tests {
             .collect();
         let rendered = render_stream_with_limit(
             rows,
-            DataRenderFormat::Table,
+            DataRenderFormat::Table {
+                width_cells_max: None,
+            },
             DataLimits::DEFAULT.max_materialized_bytes,
         )
         .unwrap();
@@ -5510,7 +5918,11 @@ mod tests {
         assert!(json.contains("\"kind\": \"task\""));
         assert!(json.contains("\"state\": \"complete\""));
         assert!(json.contains("\"type\": \"string\""));
-        let table = envelope.render(DataRenderFormat::Table).unwrap();
+        let table = envelope
+            .render(DataRenderFormat::Table {
+                width_cells_max: None,
+            })
+            .unwrap();
         assert_eq!(
             table,
             "╭───┬──────┬──────╮\n\

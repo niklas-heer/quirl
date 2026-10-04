@@ -52,19 +52,31 @@ quirl data 'open users.json' --format json
 quirl data '^external printf "{\"ok\":true}" | from json'
 ```
 
-Interactive Data mode uses tables for already-materialized values such as
-single records. List sources, including inline JSON arrays, become streams
-and retain incremental plain-row output, preserving bounded memory and early
-failure behavior; `quirl data ... --format table` explicitly
-materializes a complete bounded table.
+Interactive Data mode renders records as tables. Record streams, including
+inline JSON arrays, render in batches of at most 256 rows; a batch older than
+100 ms renders with the next pulled record, so slow sources show rows early
+while memory stays bounded. Rows pulled before a failure remain visible.
+Scalar rows such as `lines` output stay line-oriented. `quirl data ...
+--format table` materializes one complete bounded table.
 
 Table output measures rendered Unicode cell widths and presents records in a
 compact rounded frame with padded cells and a header divider. Numeric, size,
 and duration values are right-aligned. It never relies on terminal tab stops,
-so alignment is stable in the rich viewport and redirected text.
+so alignment is stable in the rich viewport and redirected text. A single
+record renders vertically as one `key │ value` line per field. Nested values
+inside cells are summarized as `{record 2 fields}`, `[table 3 rows]`, or
+`[list 4 items]`; use `get` or `--format json` to see them in full.
 
-Filesystem tables use a focused display projection (`#`, `name`, `type`,
-`size`, and `modified`): sizes use decimal units and Unix modification times
+Tables fit the terminal. In the rich surface, and for `quirl data` when
+standard output is a terminal, the widest columns shrink and end in `…`, never
+below eight cells or their heading width (up to twelve). Trailing columns that
+still do not fit collapse into one `…` column. Redirected output keeps every
+cell at its natural width.
+
+Filesystem tables use a focused display projection (`#`, `name`, `kind`,
+`size`, and `modified`): headings and values are the record's own fields, so
+`where kind == "directory"` filters exactly what the table shows. Sizes use
+decimal units and Unix modification times
 are shown relative to one time captured for the complete render. The underlying
 records retain `path`, `hidden`, `readonly`, and `target` for transforms and
 machine formats; exceptional values are added to the table only when present.

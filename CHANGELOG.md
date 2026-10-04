@@ -12,6 +12,21 @@ which versions are published.
 
 ## [Unreleased]
 
+### Changed
+
+- Data mode in the interactive shell renders records as tables, as
+  `quirl data` already did, instead of one JSON line per row. Record streams
+  render in batches of up to 256 rows, so the first rows appear early.
+- Data tables fit the terminal. Wide columns shrink and end in `…`, and
+  columns that still do not fit collapse into one `…` column. Redirected
+  `quirl data` output keeps every cell intact.
+- A single record renders as a vertical key/value table, and nested values in
+  cells read `{record 2 fields}`, `[table 3 rows]`, or `[list 4 items]`
+  instead of raw JSON.
+- `ls` tables show the `kind` column with its real values, such as
+  `directory`, so `where kind == "directory"` filters what the table shows.
+  The column was labeled `type` and abbreviated values to `dir` and `link`.
+
 ## [0.4.0] - 2026-09-30
 
 ### Added

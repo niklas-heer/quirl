@@ -424,7 +424,9 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             let format = match format {
                 DataOutputFormat::Json => DataRenderFormat::Json,
                 DataOutputFormat::Plain => DataRenderFormat::Plain,
-                DataOutputFormat::Table => DataRenderFormat::Table,
+                DataOutputFormat::Table => DataRenderFormat::Table {
+                    width_cells_max: stdout_width_cells(),
+                },
             };
             let request = execution_request(
                 "<data>",
@@ -1631,6 +1633,13 @@ fn interactive_dialect_island(source: &str) -> Option<(ScriptLanguage, &str)> {
 }
 
 const INTERACTIVE_DATA_PULLS_PER_TURN_MAX: usize = 16;
+/// Records collected into one interactive table. A table needs its column set
+/// before its header, so record streams render in bounded batches: the first
+/// rows appear without waiting for the whole stream, and retention stays fixed.
+const INTERACTIVE_DATA_TABLE_ROWS_MAX: usize = 256;
+/// Age at which a pending batch renders with the next pulled record, so a slow
+/// record stream shows rows without waiting for a full batch.
+const INTERACTIVE_DATA_TABLE_FLUSH_AFTER: Duration = Duration::from_millis(100);
 const INTERACTIVE_DATA_OPTION_DEPTH_MAX: usize = 64;
 
 struct InteractiveSignalCancellation {
@@ -1912,20 +1921,42 @@ fn render_interactive_data_output(
     bytes = bytes.saturating_add(match output {
         // Finite values already own their bounded rows, so use the same table
         // presentation as `quirl data`. Streams keep incremental row rendering.
-        DataOutput::Value(value) => {
-            write_interactive_data_value(&value, DataRenderFormat::Table, cancelled, writer, stage)
-        }
+        DataOutput::Value(value) => write_interactive_data_value(
+            &value,
+            interactive_table_format(),
+            cancelled,
+            writer,
+            stage,
+        ),
         DataOutput::Stream(mut stream) => {
             let mut stream_bytes = 0_u64;
             let mut pulls = 0_usize;
-            while let Some(value) = stream.next(cancelled)? {
-                stream_bytes = stream_bytes.saturating_add(write_interactive_data_value(
-                    &value,
-                    DataRenderFormat::Plain,
-                    cancelled,
-                    writer,
-                    stage,
-                )?);
+            let mut batch = InteractiveTableBatch::default();
+            loop {
+                let value = match stream.next(cancelled) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => break,
+                    Err(error) => {
+                        // Rows pulled before a failure remain visible.
+                        batch.flush(cancelled, writer, stage)?;
+                        return Err(error);
+                    }
+                };
+                let written = if matches!(value, StructuredValue::Record(_)) {
+                    batch.push(value, cancelled, writer, stage)?
+                } else {
+                    // Scalars such as `lines` output stay line-oriented and
+                    // appear as soon as they are pulled.
+                    let flushed = batch.flush(cancelled, writer, stage)?;
+                    flushed.saturating_add(write_interactive_data_value(
+                        &value,
+                        DataRenderFormat::Plain,
+                        cancelled,
+                        writer,
+                        stage,
+                    )?)
+                };
+                stream_bytes = stream_bytes.saturating_add(written);
                 pulls = pulls.saturating_add(1);
                 if pulls == INTERACTIVE_DATA_PULLS_PER_TURN_MAX {
                     pulls = 0;
@@ -1939,7 +1970,7 @@ fn render_interactive_data_output(
                     std::thread::yield_now();
                 }
             }
-            Ok(stream_bytes)
+            Ok(stream_bytes.saturating_add(batch.flush(cancelled, writer, stage)?))
         }
         DataOutput::Option(None) => write_interactive_data_bytes(b"none\n", cancelled, writer),
         DataOutput::Option(Some(_)) => {
@@ -1965,6 +1996,74 @@ fn interactive_data_option_depth_error(observed: usize) -> ShellError {
         "limit: {INTERACTIVE_DATA_OPTION_DEPTH_MAX}; observed: {observed}"
     ))
     .with_help("Reduce nested optional transforms before rendering this expression")
+}
+
+/// Table rendering fitted to the current terminal for the rich transcript.
+fn interactive_table_format() -> DataRenderFormat {
+    DataRenderFormat::Table {
+        width_cells_max: quirl_ui::terminal_width().map(usize::from),
+    }
+}
+
+/// Terminal cells available to `quirl data`, or `None` when output is
+/// redirected so scripts and files keep every cell intact.
+fn stdout_width_cells() -> Option<usize> {
+    if !io::stdout().is_terminal() {
+        return None;
+    }
+    quirl_ui::terminal_width().map(usize::from)
+}
+
+/// Pending records of an interactive stream, rendered together as one table.
+#[derive(Default)]
+struct InteractiveTableBatch {
+    rows: Vec<StructuredValue>,
+    started: Option<Instant>,
+}
+
+impl InteractiveTableBatch {
+    /// Add one record, rendering the batch once it is full or older than
+    /// [`INTERACTIVE_DATA_TABLE_FLUSH_AFTER`]. Returns the bytes written.
+    fn push(
+        &mut self,
+        row: StructuredValue,
+        cancelled: &AtomicBool,
+        writer: &mut impl Write,
+        stage: &mut InteractiveDataStage,
+    ) -> Result<u64, ShellError> {
+        let started = *self.started.get_or_insert_with(Instant::now);
+        self.rows.push(row);
+        let full = self.rows.len() >= INTERACTIVE_DATA_TABLE_ROWS_MAX;
+        if full || started.elapsed() >= INTERACTIVE_DATA_TABLE_FLUSH_AFTER {
+            return self.flush(cancelled, writer, stage);
+        }
+        Ok(0)
+    }
+
+    /// Render pending records as one table and clear the batch. Rows enter
+    /// the picker cache only after they were written, as single values do.
+    fn flush(
+        &mut self,
+        cancelled: &AtomicBool,
+        writer: &mut impl Write,
+        stage: &mut InteractiveDataStage,
+    ) -> Result<u64, ShellError> {
+        self.started = None;
+        if self.rows.is_empty() {
+            return Ok(0);
+        }
+        let envelope = DataEnvelope::Stream {
+            items: std::mem::take(&mut self.rows),
+        };
+        let rendered = envelope.render(interactive_table_format())?;
+        let bytes = write_interactive_data_bytes(rendered.as_bytes(), cancelled, writer)?;
+        if let DataEnvelope::Stream { items } = &envelope {
+            for row in items {
+                stage.observe(row)?;
+            }
+        }
+        Ok(bytes)
+    }
 }
 
 fn write_interactive_data_value(
@@ -5958,6 +6057,31 @@ mod tests {
         assert!(text.contains('│'));
         assert!(!text.contains(r#"{"service""#));
         assert_eq!(stage.items.len(), 1);
+    }
+
+    #[test]
+    fn interactive_record_streams_render_as_tables_and_scalars_as_lines() {
+        let output = DataRuntime::new()
+            .eval_output(r#"[{"service":"api"},{"service":"web"}] | where service != "db""#)
+            .unwrap();
+        let mut rendered = Vec::new();
+        let mut stage = InteractiveDataCache::default().stage();
+        render_interactive_data_output(output, &AtomicBool::new(false), &mut rendered, &mut stage)
+            .unwrap();
+        let text = String::from_utf8(rendered).unwrap();
+        assert_eq!(text.matches('╭').count(), 1, "{text}");
+        assert!(text.contains("│ 1 │ web     │"), "{text}");
+        assert!(!text.contains(r#"{"service""#), "{text}");
+        assert_eq!(stage.items.len(), 2);
+
+        let output = DataRuntime::new()
+            .eval_output(r#""one\ntwo" | lines"#)
+            .unwrap();
+        let mut rendered = Vec::new();
+        let mut stage = InteractiveDataCache::default().stage();
+        render_interactive_data_output(output, &AtomicBool::new(false), &mut rendered, &mut stage)
+            .unwrap();
+        assert_eq!(String::from_utf8(rendered).unwrap(), "one\ntwo\n");
     }
 
     #[test]
