@@ -103,7 +103,12 @@ cargo xtask fmt
 cargo xtask lint
 cargo xtask test
 cargo xtask demo
+cargo xtask clean
 ```
+
+Debug builds with tests grow to tens of gigabytes. `cargo xtask clean` removes
+debug builds and test binaries but keeps release builds; `cargo xtask clean --all`
+also removes release builds, Rustdoc, and the website's Next.js build.
 
 The release recording is intentionally separate: `cargo xtask demo-record <sha256>`
 consumes the already-built candidate only after verifying its digest and local

@@ -263,6 +263,9 @@ All Lua embedding lives in `quirl-lua`. Rules that must hold:
   enforcement. Pull requests and pushes to `main` run this same gate in CI with
   bounded test parallelism; the larger replayable Bash/Zsh simulation swarm runs
   separately each day.
+- Debug builds with tests grow to tens of gigabytes. Run `cargo xtask clean`
+  when you are done building; it removes debug builds and test binaries and
+  keeps release builds. `cargo xtask clean --all` removes all build output.
 - Conventional commits (`feat`, `fix`, `docs`, `refactor`, `chore`, `bench`),
   present tense, optionally scoped, e.g. `feat(lua): add completion budgets`.
 - Significant design choices go through a decision record in `docs/decisions/`,

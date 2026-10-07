@@ -86,6 +86,12 @@ enum Task {
     },
     /// Build all public Rust API documentation with warnings denied.
     Docs,
+    /// Remove regenerable build output; debug builds and test binaries by default.
+    Clean {
+        /// Remove all of `target/` and the website's Next.js build as well.
+        #[arg(long)]
+        all: bool,
+    },
     /// Internal standalone test of xtask's linked terminal-input dependency.
     #[cfg(unix)]
     #[command(hide = true)]
@@ -196,6 +202,7 @@ fn execute(cli: Cli) -> Result<(), TaskError> {
         Task::Test { seed, cases } => task_test(&root, seed, cases),
         Task::Check { seed, cases } => task_check(&root, seed, cases),
         Task::Docs => task_docs(&root),
+        Task::Clean { all } => task_clean(&root, all),
         #[cfg(unix)]
         Task::ZeroPollCheck => rich_pty::zero_poll::check(),
         #[cfg(unix)]
@@ -361,6 +368,17 @@ fn task_docs(root: &Path) -> Result<(), TaskError> {
     cmd!(sh, "cargo doc --workspace --no-deps")
         .env("RUSTDOCFLAGS", "-D warnings")
         .run()?;
+    Ok(())
+}
+
+fn task_clean(root: &Path, all: bool) -> Result<(), TaskError> {
+    let sh = workspace_shell(root)?;
+    if all {
+        cmd!(sh, "cargo clean").run()?;
+        sh.remove_path("website/.next")?;
+    } else {
+        cmd!(sh, "cargo clean --profile dev").run()?;
+    }
     Ok(())
 }
 
@@ -609,6 +627,14 @@ mod tests {
             "7",
         ]);
         assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn clean_keeps_release_builds_unless_asked_for_all() {
+        let Cli { task } = Cli::try_parse_from(["cargo xtask", "clean"]).unwrap();
+        assert!(matches!(task, Task::Clean { all: false }));
+        let Cli { task } = Cli::try_parse_from(["cargo xtask", "clean", "--all"]).unwrap();
+        assert!(matches!(task, Task::Clean { all: true }));
     }
 
     #[test]
