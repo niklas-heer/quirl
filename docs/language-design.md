@@ -385,7 +385,7 @@ bash ./legacy-deploy.sh   # explicit always wins
   needs the island is rejected. A top-level program that is not a plain
   simple-command list and uses `read`, `set`, `trap`, `getopts`, `readonly`,
   `exec`, `wait`, `umask`, `ulimit`, `declare`, `typeset`, or `let` anywhere runs
-  in the island as a whole; this routing is being implemented now. See the
+  in the island as a whole. See the
   [POSIX invocation decision](decisions/2026-10-04_044214653_non-interactive-invocations-and-shell-setup-code-run-in-posi.md).
 - `source`, `.`, and `eval` run POSIX setup code in `/bin/sh` and import its
   exported variables and working directory.

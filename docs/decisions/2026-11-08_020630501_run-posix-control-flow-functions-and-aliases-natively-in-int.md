@@ -51,8 +51,7 @@ diagnostic, because the function could not outlive the island.
 A top-level program that is not a plain simple-command list, and that uses
 `read`, `set`, `trap`, `getopts`, `readonly`, `exec`, `wait`, `umask`,
 `ulimit`, `declare`, `typeset`, or `let` anywhere, runs in the island as a
-whole. This routing is being implemented now; until it lands, those programs
-still follow the path described above.
+whole, because those commands change how the rest of the program runs.
 
 `quirl -c`, scripts on standard input, `eval`, and `source` are unchanged: they
 remain exact `/bin/sh` invocations as recorded in the POSIX invocation
