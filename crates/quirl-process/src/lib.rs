@@ -16,10 +16,13 @@
     )
 )]
 
+#[cfg(unix)]
 mod arithmetic;
 mod builtin;
 mod developer_context;
+#[cfg(unix)]
 mod echo_builtin;
+#[cfg(unix)]
 mod field_split;
 pub mod local_completion;
 #[cfg(unix)]
@@ -27,6 +30,7 @@ mod posix_island;
 #[cfg(unix)]
 pub mod pty;
 mod spawn_lock;
+#[cfg(unix)]
 mod test_builtin;
 
 pub use developer_context::{DeveloperContextProbe, DeveloperContextSnapshot};
@@ -131,6 +135,13 @@ pub(crate) struct SessionEnvironment {
 }
 
 /// The binding one name holds after a single-name mutation.
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "only Unix shell assignments create unexported bindings"
+    )
+)]
 enum Binding {
     /// Exported with this value, and absent from the locals.
     Exported(OsString),
@@ -869,8 +880,10 @@ mod session_environment_tests {
 
 /// Shell variables as seen by `$(( ))`: reads use the session's value, and
 /// assignment operators set the variable as a bare `NAME=value` would.
+#[cfg(unix)]
 struct SessionArithmetic<'a>(&'a mut SessionEnvironment);
 
+#[cfg(unix)]
 impl arithmetic::ArithmeticVariables for SessionArithmetic<'_> {
     fn get(&self, name: &str) -> Option<String> {
         self.0
@@ -1098,6 +1111,17 @@ fn validate_native_plan(graph: &quirl_syntax::CommandList) -> Result<(), quirl_c
             .with_help("Split the pipeline or use intermediate files"));
         }
         for command in &pipeline.commands {
+            // The Windows backend only implements `2>&1`; refuse `>&2` rather
+            // than routing it the wrong way.
+            if command.redirects.iter().any(|redirect| {
+                redirect.kind == quirl_syntax::RedirectKind::DuplicateOutput && redirect.fd != 2
+            }) {
+                return Err(quirl_core::ShellError::new(
+                    quirl_core::ErrorCode::InvalidCommand,
+                    "`>&2` is not supported by the Windows executor",
+                )
+                .with_help("Write to standard error from the program itself, or use `2>&1`"));
+            }
             if command
                 .redirects
                 .iter()
@@ -1119,6 +1143,7 @@ pub const NATIVE_PROGRAM_PIPELINES_MAX: usize = 4096;
 
 /// Map a program parse failure to the executor's error contract, keeping the
 /// span so renderers can point at the offending text.
+#[cfg(unix)]
 fn program_error(error: quirl_syntax::ProgramError, input: &str) -> quirl_core::ShellError {
     use quirl_core::{ErrorCode, ShellError};
     let (message, start, end, help) = match error {
@@ -1140,6 +1165,7 @@ fn program_error(error: quirl_syntax::ProgramError, input: &str) -> quirl_core::
 
 /// Enforce pipeline-count, stage-count, and descriptor rules over every list
 /// of a program. Walks with an explicit stack; the parser already bounds depth.
+#[cfg(unix)]
 fn validate_native_program(program: &quirl_syntax::Program) -> Result<(), quirl_core::ShellError> {
     use quirl_syntax::{CommandNode, CompoundCommand};
     let mut pending = vec![&program.body];
@@ -1243,7 +1269,9 @@ fn validate_prepared_terminal_pipeline(
             let supported = match redirect.kind {
                 RedirectKind::Input | RedirectKind::HereString => redirect.fd == 0,
                 RedirectKind::Output | RedirectKind::Append => matches!(redirect.fd, 1 | 2),
-                RedirectKind::DuplicateOutput => redirect.fd == 2 && redirect.path == "1",
+                RedirectKind::DuplicateOutput => {
+                    matches!((redirect.fd, redirect.path.as_str()), (2, "1") | (1, "2"))
+                }
                 RedirectKind::DuplicateInput => false,
             };
             if !supported || !redirect.target.parts.is_empty() {
@@ -9359,8 +9387,12 @@ mod platform {
                     }))
                 }
                 "unset" => {
-                    let names = builtin::unset_operands(&command.words)?;
-                    self.environment.unset_names(&names)?;
+                    // Windows has no session functions, so `unset -f` has
+                    // nothing to remove and leaves variables alone.
+                    let operands = builtin::unset_operands(&command.words)?;
+                    if !operands.functions {
+                        self.environment.unset_names(&operands.names)?;
+                    }
                     Ok(Some(CommandOutcome {
                         status: 0,
                         stdout: None,

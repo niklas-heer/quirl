@@ -680,11 +680,13 @@ impl NativeExecutor {
                     &command.words,
                     retained_output_limit(request.map(|request| request.request)),
                 )?;
-                outcome(
-                    0,
-                    Some(String::from_utf8_lossy(&bytes).into_owned()),
-                    Some(String::new()),
-                )
+                match String::from_utf8(bytes) {
+                    Ok(text) => outcome(0, Some(text), Some(String::new())),
+                    Err(error) => {
+                        return write_raw_echo(command, error.into_bytes(), capture, request)
+                            .map(Some);
+                    }
+                }
             }
             "test" | "[" => match crate::test_builtin::evaluate_test(&command.words) {
                 Ok(crate::test_builtin::TestOutcome::True) => status_only(0),
@@ -992,6 +994,51 @@ impl NativeExecutor {
                 self.note_session_commands_changed();
             }
         }
+    }
+}
+
+/// Deliver `echo` output that is not UTF-8, such as `echo -e '\xff'`.
+///
+/// Outcomes carry text, so bytes reach a `>` file or the terminal directly
+/// and unchanged. Only captured output, which is displayed as text, falls
+/// back to a lossy conversion.
+fn write_raw_echo(
+    command: &SimpleCommand,
+    bytes: Vec<u8>,
+    capture: bool,
+    request: Option<RequestContext<'_>>,
+) -> Result<CommandOutcome, ShellError> {
+    let last_stdout = command.redirects.iter().rev().find(|redirect| {
+        redirect.fd == 1
+            && matches!(
+                redirect.kind,
+                RedirectKind::Output | RedirectKind::Append | RedirectKind::DuplicateOutput
+            )
+    });
+    match last_stdout {
+        Some(redirect) if redirect.kind != RedirectKind::DuplicateOutput => {
+            let file = super::open_redirected_output(redirect, request)?;
+            super::io_write_all(file, &bytes, &redirect.path)?;
+            Ok(outcome(
+                0,
+                capture.then(String::new),
+                capture.then(String::new),
+            ))
+        }
+        None if !capture => {
+            super::io_write_all(std::io::stdout(), &bytes, "standard output")?;
+            Ok(outcome(0, None, None))
+        }
+        _ => finish_control_builtin(
+            command,
+            outcome(
+                0,
+                Some(String::from_utf8_lossy(&bytes).into_owned()),
+                Some(String::new()),
+            ),
+            capture,
+            request,
+        ),
     }
 }
 
@@ -1531,6 +1578,17 @@ mod tests {
         );
         assert_eq!(err, "", "a later file redirection overrides `>&2`");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept\n");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn echo_with_non_utf8_output_keeps_its_raw_bytes() {
+        let path = std::env::temp_dir().join(format!("quirl-echo-bytes-{}", std::process::id()));
+        run(
+            &mut NativeExecutor::default(),
+            &format!("echo -ne 'A\\xffB' > '{}'", path.display()),
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"A\xffB");
         std::fs::remove_file(&path).unwrap();
     }
 

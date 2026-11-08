@@ -302,6 +302,7 @@ pub fn parse_program(input: &str, aliases: &dyn AliasLookup) -> Result<Program, 
         depth: 0,
         expansions: Vec::new(),
         aliases,
+        top_level_island_only: None,
     };
     let body = parser.compound_list(&[], false)?;
     if let Some(token) = parser.peek() {
@@ -312,7 +313,13 @@ pub fn parse_program(input: &str, aliases: &dyn AliasLookup) -> Result<Program, 
             "Remove it or add the construct it closes",
         )));
     }
-    Ok(Program { body })
+    let program = Program { body };
+    if !program.is_simple()
+        && let Some(form) = parser.top_level_island_only
+    {
+        return Err(ProgramError::Unsupported(form));
+    }
+    Ok(program)
 }
 
 /// Whether `input` ends inside an unfinished construct, so Enter should
@@ -383,6 +390,9 @@ struct Parser<'a> {
     depth: usize,
     expansions: Vec<AliasExpansion>,
     aliases: &'a dyn AliasLookup,
+    /// First top-level command that only a reference shell can run, such as
+    /// `set` or `read`.
+    top_level_island_only: Option<DialectControlForm>,
 }
 
 /// Which keywords end the compound list being parsed.
@@ -1160,14 +1170,16 @@ impl Parser<'_> {
         }
         if let Some(name) = words.first()
             && ISLAND_ONLY_COMMANDS.contains(&name.as_str())
-            && self.depth > 0
             && let Some(opener) = &opener
         {
-            return Err(ProgramError::Unsupported(unsupported(
-                opener,
-                name,
-                "this built-in is not native yet",
-            )));
+            let form = unsupported(opener, name, "this built-in is not native yet");
+            if self.depth > 0 {
+                return Err(ProgramError::Unsupported(form));
+            }
+            // At top level the command only matters when it changes how the
+            // rest of a compound program runs, as `set -e` does; a plain
+            // command list keeps running it as before.
+            self.top_level_island_only.get_or_insert(form);
         }
         Ok(SimpleCommand {
             words,
@@ -1735,6 +1747,21 @@ mod tests {
     #[test]
     fn read_outside_a_compound_command_stays_a_plain_command() {
         assert!(parse("read -r line").is_simple());
+        assert!(parse("set -x; echo hi").is_simple());
+    }
+
+    #[test]
+    fn top_level_shell_option_changes_send_compound_programs_to_the_island() {
+        for source in [
+            "set -e; for x in a; do false; done",
+            "f() { :; }; set -u",
+            "trap 'echo bye' EXIT; if true; then :; fi",
+        ] {
+            let Err(ProgramError::Unsupported(form)) = parse_program(source, &NoAliases) else {
+                panic!("{source} should be unsupported");
+            };
+            assert!(["set", "trap"].contains(&form.text.as_str()), "{source}");
+        }
     }
 
     #[test]

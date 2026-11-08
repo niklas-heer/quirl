@@ -798,13 +798,33 @@ struct ProgramValidator;
 impl reedline::Validator for ProgramValidator {
     fn validate(&self, line: &str) -> reedline::ValidationResult {
         if SIMPLE_EDITOR_MODE.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-            if quirl_syntax::is_incomplete(line) {
-                return reedline::ValidationResult::Incomplete;
+            if opens_dialect_island(line) {
+                return DefaultValidator.validate(line);
             }
-            return reedline::ValidationResult::Complete;
+            return match quirl_syntax::parse_program(line, &quirl_syntax::NoAliases) {
+                Err(quirl_syntax::ProgramError::Incomplete(_)) => {
+                    reedline::ValidationResult::Incomplete
+                }
+                // A valid native line is complete even with an unbalanced
+                // literal bracket, as in `echo {`.
+                Ok(_) => reedline::ValidationResult::Complete,
+                // Islands such as `bash {` and unsupported forms such as
+                // `(cd /tmp &&` keep reedline's bracket balancing.
+                Err(_) => DefaultValidator.validate(line),
+            };
         }
         DefaultValidator.validate(line)
     }
+}
+
+/// Whether `line` starts an explicit `bash { ... }` or `zsh { ... }` island,
+/// whose body is another shell's grammar and is balanced by braces.
+fn opens_dialect_island(line: &str) -> bool {
+    let line = line.trim_start();
+    ["bash", "zsh"].iter().any(|shell| {
+        line.strip_prefix(shell)
+            .is_some_and(|rest| rest.trim_start().starts_with('{'))
+    })
 }
 
 fn editor_cursor_config() -> CursorConfig {
@@ -3952,6 +3972,32 @@ mod tests {
                 .unwrap()
                 .contains("source: catalog")
         );
+    }
+
+    #[test]
+    fn simple_editor_continues_unfinished_native_constructs_islands_and_subshells() {
+        use reedline::{ValidationResult, Validator};
+        set_simple_editor_mode(Mode::Command);
+        for line in [
+            "for x in a; do",
+            "bash { echo hi",
+            "(cd /tmp &&",
+            "echo 'open",
+        ] {
+            assert!(
+                matches!(
+                    ProgramValidator.validate(line),
+                    ValidationResult::Incomplete
+                ),
+                "{line}"
+            );
+        }
+        for line in ["echo {", "for x in a; do echo; done", "bash { echo hi; }"] {
+            assert!(
+                matches!(ProgramValidator.validate(line), ValidationResult::Complete),
+                "{line}"
+            );
+        }
     }
 
     #[test]
