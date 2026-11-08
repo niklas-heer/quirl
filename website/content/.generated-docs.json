@@ -28,6 +28,7 @@
   "project/release-0.1/performance-record.mdx",
   "research/benchmarks/index.mdx",
   "research/benchmarks/release-v0.5.1.mdx",
+  "research/benchmarks/shell-workloads.mdx",
   "research/benchmarks/release-v0.5.0.mdx",
   "research/benchmarks/release-v0.4.0.mdx",
   "research/benchmarks/release-v0.3.0.mdx",
@@ -78,5 +79,6 @@
   "architecture/decisions/0040-zsh-reference-completion.mdx",
   "architecture/decisions/0041-posix-shell-invocation.mdx",
   "architecture/decisions/0042-rust-1.99-compatibility.mdx",
-  "architecture/decisions/0043-run-posix-control-flow-functions-and-aliases-natively.mdx"
+  "architecture/decisions/0043-run-posix-control-flow-functions-and-aliases-natively.mdx",
+  "architecture/decisions/0044-start-process-group-anchors-with-a-trusted-fast-shell.mdx"
 ]

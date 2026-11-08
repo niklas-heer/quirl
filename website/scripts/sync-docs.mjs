@@ -43,6 +43,7 @@ const documents = [
   ['docs/benchmarks/release-v1.0.md', 'project/release-0.1/performance-record.mdx'],
   ['docs/benchmarks/README.md', 'research/benchmarks/index.mdx'],
   ['docs/benchmarks/release-v0.5.1.md', 'research/benchmarks/release-v0.5.1.mdx'],
+  ['docs/benchmarks/shell-workloads.md', 'research/benchmarks/shell-workloads.mdx'],
   ['docs/benchmarks/release-v0.5.0.md', 'research/benchmarks/release-v0.5.0.mdx'],
   ['docs/benchmarks/release-v0.4.0.md', 'research/benchmarks/release-v0.4.0.mdx'],
   ['docs/benchmarks/release-v0.3.0.md', 'research/benchmarks/release-v0.3.0.mdx'],
@@ -94,6 +95,7 @@ const documents = [
   ['docs/decisions/2026-10-04_044214653_non-interactive-invocations-and-shell-setup-code-run-in-posi.md', 'architecture/decisions/0041-posix-shell-invocation.mdx'],
   ['docs/decisions/2026-10-04_162535286_rust-1-99-compatibility-and-selective-adoption.md', 'architecture/decisions/0042-rust-1.99-compatibility.mdx'],
   ['docs/decisions/2026-11-08_020630501_run-posix-control-flow-functions-and-aliases-natively-in-int.md', 'architecture/decisions/0043-run-posix-control-flow-functions-and-aliases-natively.mdx'],
+  ['docs/decisions/2026-11-08_041414983_start-process-group-anchors-with-a-trusted-fast-shell-in-par.md', 'architecture/decisions/0044-start-process-group-anchors-with-a-trusted-fast-shell.mdx'],
 ];
 
 const pageBySource = new Map(documents);
