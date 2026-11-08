@@ -1,7 +1,7 @@
 use crate::{Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, PromptViMode};
 
 use {
-    chrono::Local,
+    chrono::Utc,
     std::{borrow::Cow, env},
 };
 
@@ -143,7 +143,9 @@ fn format_working_dir(cwd: &std::path::Path, home: Option<&std::path::Path>) -> 
 }
 
 fn get_now() -> String {
-    let now = Local::now();
+    // Quirl patch: UTC avoids chrono's `clock` feature, whose time-zone
+    // lookup links CoreFoundation and slows every macOS process launch.
+    let now = Utc::now();
     format!("{:>}", now.format("%m/%d/%Y %I:%M:%S %p"))
 }
 
