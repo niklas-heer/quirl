@@ -618,6 +618,18 @@ fn options_are_authoritative(command: &CommandSpec) -> bool {
             command.provenance.source,
             Provenance::Builtin | Provenance::Lua | Provenance::Plugin
         )
+        && !operands_may_look_like_flags(command)
+}
+
+/// Built-ins whose operands are data that may start with `-`: `test -n x`
+/// is an expression, and `echo -x` prints `-x`. Their words are never flags
+/// to validate.
+fn operands_may_look_like_flags(command: &CommandSpec) -> bool {
+    command.provenance.source == Provenance::Builtin
+        && matches!(
+            command.path.as_str(),
+            "test" | "[" | "echo" | ":" | "true" | "false"
+        )
 }
 
 fn unknown_option<'a>(
@@ -913,6 +925,20 @@ fn timing_p95(samples: &VecDeque<Duration>) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_and_echo_operands_are_not_reported_as_unknown_flags() {
+        let catalog = Catalog::builtin();
+        for buffer in ["test -n x -a -d /", "[ -z \"$x\" ]", "echo -x -n"] {
+            let parsed = quirl_syntax::parse_command_list(buffer).unwrap();
+            let spans = quirl_syntax::highlight(buffer, quirl_syntax::Mode::Command);
+            assert!(
+                unknown_option(&catalog, &[], &parsed, &spans).is_none(),
+                "{buffer}"
+            );
+        }
+    }
+
     use super::*;
     use quirl_catalog::{import_bash, import_fish, import_help, import_zsh};
     use std::sync::atomic::AtomicU64;
