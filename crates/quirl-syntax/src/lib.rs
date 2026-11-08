@@ -905,9 +905,13 @@ pub fn data_statement_expression(line: &str) -> Option<&str> {
 }
 
 /// Largest statement, in bytes of source text, that [`split_script_statements`] accepts.
-pub const SCRIPT_STATEMENT_BYTES_MAX: usize = 256 * 1024;
+///
+/// Joining re-checks the growing statement after each added line, so the
+/// work for one statement grows with lines × bytes. These bounds keep the
+/// worst case near 64 MiB of lexing, about a tenth of a second.
+pub const SCRIPT_STATEMENT_BYTES_MAX: usize = 64 * 1024;
 /// Most physical lines one script statement may span.
-pub const SCRIPT_STATEMENT_LINES_MAX: usize = 10_000;
+pub const SCRIPT_STATEMENT_LINES_MAX: usize = 2_000;
 
 /// Bounds applied while splitting one script. Tests lower them so oversize cases stay cheap.
 #[derive(Debug, Clone, Copy)]
