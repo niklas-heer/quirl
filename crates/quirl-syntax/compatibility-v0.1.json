@@ -121,7 +121,7 @@
     {
       "id": "expansions", "level": "C1", "implementation": "native",
       "forms": ["$NAME", "${NAME}", "$?", "$1", "$#", "\"$@\"", "$((i + 1))", "$(printf value)", "*.qrl"],
-      "limitations": "Unix native executor: unquoted parameter and command expansions are field-split on IFS as in sh and Bash; command substitution has a 16 KiB source/output budget; glob no-match behavior is literal and process substitution is an explicit island."
+      "limitations": "Unix native executor: unquoted parameter and command expansions are field-split on IFS as in sh and Bash; command substitution has a 16 KiB `$(...)` source budget and a 1 MiB output budget; glob no-match behavior is literal and process substitution is an explicit island."
     },
     {
       "id": "conditionals_and_control", "level": "C1", "implementation": "native",

@@ -269,8 +269,12 @@ All Lua embedding lives in `quirl-lua`. Rules that must hold:
   bounded test parallelism; the larger replayable Bash/Zsh simulation swarm runs
   separately each day.
 - Debug builds with tests grow to tens of gigabytes. Run `cargo xtask clean`
-  when you are done building; it removes debug builds and test binaries and
-  keeps release builds. `cargo xtask clean --all` removes all build output.
+  when you are done building. It runs `cargo clean --profile dev`, which removes
+  `dev` and `test` output and keeps release builds and the custom `debugging`
+  profile; remove that with `cargo clean --profile debugging`. `cargo xtask
+  clean --all` runs `cargo clean` for the root Cargo target and removes
+  `website/.next`. It does not clean the separate `spikes/` workspaces, which
+  keep their own target directories.
 - Conventional commits (`feat`, `fix`, `docs`, `refactor`, `chore`, `bench`),
   present tense, optionally scoped, e.g. `feat(lua): add completion budgets`.
 - Significant design choices go through a decision record in `docs/decisions/`,

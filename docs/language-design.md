@@ -334,7 +334,7 @@ Quirl targets the copy-and-paste surface first. Full Bash and Zsh are separate e
 | Level | Promise | Examples | Implementation |
 | --- | --- | --- | --- |
 | C0 · Commands | Required for preview | `git status`, quoting, redirects, byte pipes, jobs | Native process engine and POSIX-like lexer |
-| C1 · Common interactive | Required for 1.0 | `&&`, `||`, globs, bounded substitutions, here-strings, `export NAME=value`, `for`/`case`/`if`, functions, aliases | Native compatibility AST and session executor on Linux/macOS; differential tests against reference `sh` and Bash |
+| C1 · Common interactive | Required for 1.0 | `&&`, `\|\|`, globs, bounded substitutions, here-strings, `export NAME=value`, `for`/`case`/`if`, functions, aliases | Native compatibility AST and session executor on Linux/macOS; differential tests against reference `sh` and Bash |
 | C2 · Dialect islands | Required for 1.0 | `bash { ... }`, `zsh { ... }`, shebangs | Reference-interpreter subprocess with structured capture |
 | C3 · Source state | Deliberately partial | Import cwd, exported env, aliases when representable | State-diff protocol; reject traps and opaque functions |
 | C4 · Exact emulation | No promise | Every option, trap, framework, obscure expansion | Run the requested `bash` or `zsh` |
@@ -376,11 +376,16 @@ bash ./legacy-deploy.sh   # explicit always wins
   Interactive Normal mode runs `if`, `for`, `while`, `until`, `case`, `{ ...; }`
   groups, persistent functions, and aliases natively, as the
   [native control-flow decision](decisions/2026-11-08_020630501_run-posix-control-flow-functions-and-aliases-natively-in-int.md)
-  records; that decision amends ADR 0010's boundary. Compound commands used as
-  pipeline stages or with redirections, and brace expansion, still run in an
-  implicit `/bin/sh` island that keeps exports and the working directory. Aliases
-  and functions are not visible inside that island, and a line that defines a
-  function and also needs the island is rejected. See the
+  records; that decision amends ADR 0010's boundary. Output redirections on
+  those compounds (`> file`, `>> file`, `2> file`, `2>&1`, `>&2`) run natively.
+  Compound commands used as pipeline stages or with input redirections
+  (`done < file`), and brace expansion, still run in an implicit `/bin/sh`
+  island that keeps exports and the working directory. Aliases and functions are
+  not visible inside that island, and a line that defines a function and also
+  needs the island is rejected. A top-level program that is not a plain
+  simple-command list and uses `read`, `set`, `trap`, `getopts`, `readonly`,
+  `exec`, `wait`, `umask`, `ulimit`, `declare`, `typeset`, or `let` anywhere runs
+  in the island as a whole; this routing is being implemented now. See the
   [POSIX invocation decision](decisions/2026-10-04_044214653_non-interactive-invocations-and-shell-setup-code-run-in-posi.md).
 - `source`, `.`, and `eval` run POSIX setup code in `/bin/sh` and import its
   exported variables and working directory.
