@@ -3027,11 +3027,30 @@ mod platform {
                 if prefixed {
                     words.push(crate::PREFIX_ASSIGNMENT_RUNNER.to_owned());
                 }
+                // Declaration utilities take `NAME=value` operands whose
+                // values are not field-split or globbed, as in POSIX and
+                // Bash, so `export PATH=/a:$PATH` keeps a PATH with spaces.
+                let declaration = forms
+                    .get(assignment_count)
+                    .and_then(|name| match name.parts.as_slice() {
+                        [part] if part.quoting == Quoting::Unquoted => Some(part.text.as_str()),
+                        _ => None,
+                    })
+                    .is_some_and(|name| {
+                        matches!(
+                            name,
+                            "export" | "local" | "readonly" | "alias" | "declare" | "typeset"
+                        )
+                    });
                 for (index, word) in forms.iter().enumerate() {
-                    if prefixed
-                        && index < assignment_count
-                        && let Some((name, value)) = crate::assignment_parts(word)
-                    {
+                    let declaration_operand = declaration && index > assignment_count;
+                    let unsplit_assignment =
+                        if (prefixed && index < assignment_count) || declaration_operand {
+                            crate::assignment_parts(word)
+                        } else {
+                            None
+                        };
+                    if let Some((name, value)) = unsplit_assignment {
                         let expanded = self.expand_word(
                             &value,
                             MAX_SUBSTITUTION_BYTES,
@@ -6967,6 +6986,17 @@ mod platform {
                 .execute_capture("x=$(head -c 1100000 /dev/zero | tr '\\0' a)")
                 .unwrap_err();
             assert_eq!(error.code, ErrorCode::ResourceLimit);
+        }
+
+        #[test]
+        fn declaration_operands_keep_spaces_from_expansions() {
+            let mut executor = NativeExecutor::default();
+            let result = executor
+                .execute_capture(
+                    "base='/a b/bin'; export QUIRL_SPACED=/x:$base; printf '%s|' \"$QUIRL_SPACED\" $base",
+                )
+                .unwrap();
+            assert_eq!(result.stdout.as_deref(), Some("/x:/a b/bin|/a|b/bin|"));
         }
 
         #[test]
