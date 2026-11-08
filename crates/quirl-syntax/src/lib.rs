@@ -904,51 +904,333 @@ pub fn data_statement_expression(line: &str) -> Option<&str> {
     (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim_start())
 }
 
+/// Largest statement, in bytes of source text, that [`split_script_statements`] accepts.
+pub const SCRIPT_STATEMENT_BYTES_MAX: usize = 256 * 1024;
+/// Most physical lines one script statement may span.
+pub const SCRIPT_STATEMENT_LINES_MAX: usize = 10_000;
+
+/// Bounds applied while splitting one script. Tests lower them so oversize cases stay cheap.
+#[derive(Debug, Clone, Copy)]
+struct ScriptStatementLimits {
+    bytes_max: usize,
+    lines_max: usize,
+}
+
+impl ScriptStatementLimits {
+    const DEFAULT: Self = Self {
+        bytes_max: SCRIPT_STATEMENT_BYTES_MAX,
+        lines_max: SCRIPT_STATEMENT_LINES_MAX,
+    };
+}
+
+/// One complete statement of a native `.qrl` script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptStatement<'a> {
+    /// Source text from the first non-blank byte through the last non-blank byte, including
+    /// interior line feeds and indentation.
+    pub text: &'a str,
+    /// Absolute half-open byte range of `text` within the script.
+    pub span: Range<usize>,
+}
+
+/// The complete statements of a script and the diagnostics found while splitting it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptSplit<'a> {
+    /// Complete statements in source order.
+    pub statements: Vec<ScriptStatement<'a>>,
+    /// Unterminated or oversized statements in source order. Their statements are omitted.
+    pub diagnostics: Vec<CommandSyntaxError>,
+    /// Whether splitting stopped at a statement bound. The last diagnostic then reports that bound
+    /// and no later statement is returned, because the oversized statement's extent, and so the
+    /// start of the next statement, is unknown.
+    pub limit_exceeded: bool,
+}
+
+/// Split a native `.qrl` script into complete statements without validating command syntax.
+///
+/// The shebang, blank lines, and `#` comment lines are skipped. A `data <expr>` line is one
+/// statement. Any other line starts a command statement, and following lines are joined while the
+/// text still ends inside a construct, so `for ...; do` through `done` is one statement. A `data`
+/// line never joins a pending command: the pending command is then reported as unterminated if it is
+/// still incomplete. An unterminated statement is a diagnostic derived from the parser's
+/// end-of-input error, pointing at that error's span or, when it has none, at the statement's last
+/// token.
+///
+/// A statement longer than [`SCRIPT_STATEMENT_BYTES_MAX`] bytes or
+/// [`SCRIPT_STATEMENT_LINES_MAX`] lines is a diagnostic, and splitting stops there. Joining reparses
+/// the growing statement, so one statement costs work quadratic in its line count; the bounds keep
+/// that finite. Every span is absolute within `source`, and nothing is executed.
+pub fn split_script_statements(source: &str) -> ScriptSplit<'_> {
+    split_script_statements_with_limits(source, ScriptStatementLimits::DEFAULT)
+}
+
+fn split_script_statements_with_limits(
+    source: &str,
+    limits: ScriptStatementLimits,
+) -> ScriptSplit<'_> {
+    let lines = script_lines(source);
+    let mut split = ScriptSplit {
+        statements: Vec::new(),
+        diagnostics: Vec::new(),
+        limit_exceeded: false,
+    };
+    let mut index = 0_usize;
+    while let Some(line) = lines.get(index) {
+        // The shebang is a `#` line, so it is skipped with the other comments.
+        let trimmed = line.text.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            index = index.saturating_add(1);
+            continue;
+        }
+        let Some(joined) = join_statement(source, &lines, index, limits) else {
+            break;
+        };
+        match joined {
+            Joined::Complete { span, next } => {
+                split.statements.push(ScriptStatement {
+                    text: source.get(span.clone()).unwrap_or_default(),
+                    span,
+                });
+                index = next;
+            }
+            Joined::Unterminated { diagnostic, next } => {
+                split.diagnostics.push(diagnostic);
+                index = next;
+            }
+            Joined::Oversized(diagnostic) => {
+                // Later lines cannot be attributed to statements once a boundary is unknown.
+                split.diagnostics.push(diagnostic);
+                split.limit_exceeded = true;
+                break;
+            }
+        }
+    }
+    split
+}
+
+/// One physical line of a script.
+struct ScriptLine<'a> {
+    /// Absolute byte offset of the line's first byte.
+    start: usize,
+    /// Line text without its line feed.
+    text: &'a str,
+}
+
+fn script_lines(source: &str) -> Vec<ScriptLine<'_>> {
+    let mut start = 0_usize;
+    source
+        .split_inclusive('\n')
+        .map(|raw| {
+            let line = ScriptLine {
+                start,
+                text: raw.strip_suffix('\n').unwrap_or(raw),
+            };
+            start = start.saturating_add(raw.len());
+            line
+        })
+        .collect()
+}
+
+/// The outcome of joining physical lines into one statement.
+enum Joined {
+    /// A complete statement spanning `span`; splitting resumes at line `next`.
+    Complete { span: Range<usize>, next: usize },
+    /// An incomplete statement. Its statement is omitted and splitting resumes at line `next`.
+    Unterminated {
+        diagnostic: CommandSyntaxError,
+        next: usize,
+    },
+    /// A statement over a bound. The diagnostic points at its first line.
+    Oversized(CommandSyntaxError),
+}
+
+/// Join the physical lines of the statement that begins at line `first`.
+///
+/// Returns `None` only when `first` is out of range. A `data` line is complete on its own and is
+/// never extended. A command line is extended one line at a time while it is incomplete, and
+/// extension stops before a `data` line.
+fn join_statement(
+    source: &str,
+    lines: &[ScriptLine<'_>],
+    first: usize,
+    limits: ScriptStatementLimits,
+) -> Option<Joined> {
+    let first_line = lines.get(first)?;
+    let head = statement_span(first_line, first_line);
+    let joinable = data_statement_expression(first_line.text.trim()).is_none();
+    let mut last = first;
+    loop {
+        let span = statement_span(first_line, lines.get(last)?);
+        if span.len() > limits.bytes_max {
+            return Some(Joined::Oversized(bytes_limit_diagnostic(
+                &head,
+                span.len(),
+                limits,
+            )));
+        }
+        let next = last.saturating_add(1);
+        if !joinable {
+            return Some(Joined::Complete { span, next });
+        }
+        let text = source.get(span.clone()).unwrap_or_default();
+        let Err(ProgramError::Incomplete(error)) = parse_program(text, &NoAliases) else {
+            return Some(Joined::Complete { span, next });
+        };
+        let Some(following) = lines.get(next) else {
+            return Some(Joined::Unterminated {
+                diagnostic: unterminated_diagnostic(error, &span, text),
+                next,
+            });
+        };
+        if data_statement_expression(following.text.trim()).is_some() {
+            return Some(Joined::Unterminated {
+                diagnostic: unterminated_diagnostic(error, &span, text),
+                next,
+            });
+        }
+        // Adding `following` would make the statement `next - first + 1` lines long.
+        if next.saturating_sub(first) >= limits.lines_max {
+            return Some(Joined::Oversized(lines_limit_diagnostic(&head, limits)));
+        }
+        last = next;
+    }
+}
+
+/// The span from the first non-blank byte of `first` through the last non-blank byte of `last`.
+fn statement_span(first: &ScriptLine<'_>, last: &ScriptLine<'_>) -> Range<usize> {
+    let indentation = first
+        .text
+        .len()
+        .saturating_sub(first.text.trim_start().len());
+    let start = first.start.saturating_add(indentation);
+    let end = last
+        .start
+        .saturating_add(last.text.trim_end().len())
+        .max(start);
+    start..end
+}
+
+fn bytes_limit_diagnostic(
+    head: &Range<usize>,
+    observed: usize,
+    limits: ScriptStatementLimits,
+) -> CommandSyntaxError {
+    CommandSyntaxError {
+        message: format!(
+            "script statement is {observed} bytes, over the {}-byte limit",
+            limits.bytes_max
+        ),
+        start: head.start,
+        end: head.end,
+        help: STATEMENT_SIZE_HELP.to_owned(),
+    }
+}
+
+fn lines_limit_diagnostic(
+    head: &Range<usize>,
+    limits: ScriptStatementLimits,
+) -> CommandSyntaxError {
+    CommandSyntaxError {
+        message: format!(
+            "script statement spans more than {} lines",
+            limits.lines_max
+        ),
+        start: head.start,
+        end: head.end,
+        help: STATEMENT_SIZE_HELP.to_owned(),
+    }
+}
+
+const STATEMENT_SIZE_HELP: &str =
+    "Split the statement, for example by moving a long loop body into a function";
+
+/// Derive the diagnostic for a statement that ends inside a construct.
+///
+/// `text` is the statement without trailing whitespace, and `span` is its absolute range. An
+/// end-of-input error has no width, so the diagnostic then points at the statement's last token.
+fn unterminated_diagnostic(
+    error: CommandSyntaxError,
+    span: &Range<usize>,
+    text: &str,
+) -> CommandSyntaxError {
+    let trimmed = text.trim_end();
+    let end = span.start.saturating_add(trimmed.len());
+    let (start, end) = if error.start < error.end {
+        (
+            span.start.saturating_add(error.start),
+            span.start.saturating_add(error.end),
+        )
+    } else {
+        let width = trimmed.chars().next_back().map_or(0, char::len_utf8);
+        (end.saturating_sub(width), end)
+    };
+    CommandSyntaxError {
+        message: error.message,
+        start,
+        end,
+        help: error.help,
+    }
+}
+
 /// Validate a line-oriented native Quirl script without executing it.
 ///
 /// `.qrl` is the canonical extension; `.quirl` and `.🌀` are accepted aliases
 /// at the CLI and language-service boundaries.
 ///
-/// Command statements use the same compatibility parser as interactive execution. `data`
-/// statements are recognized as a separate language island and require a non-empty expression.
-/// Every returned span is absolute within `source` and diagnostics retain source order. The
-/// checker scans linearly, does not execute source or recurse, and does not impose a byte limit;
-/// file-reading callers must reject oversized source before invoking it.
+/// Statements come from [`split_script_statements`]. Each command statement is checked with the
+/// native program grammar, and a `data` statement must have an expression. Every returned span is
+/// absolute within `source`, and diagnostics are in source order. The checker does not execute
+/// source or recurse. It does not bound the source size, so file-reading callers must reject
+/// oversized source before invoking it; each statement is bounded by the splitter.
 pub fn check_script(source: &str) -> Vec<CommandSyntaxError> {
-    let mut diagnostics = Vec::new();
-    let mut offset = 0_usize;
-    for (line_index, raw_line) in source.split_inclusive('\n').enumerate() {
-        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
-        let trimmed = line.trim();
-        let leading = line.len().saturating_sub(line.trim_start().len());
-        if (line_index == 0 && trimmed.starts_with("#!"))
-            || trimmed.is_empty()
-            || trimmed.starts_with('#')
-        {
-            offset = offset.saturating_add(raw_line.len());
-            continue;
+    let split = split_script_statements(source);
+    let mut diagnostics = split.diagnostics;
+    for statement in &split.statements {
+        match data_statement_expression(statement.text) {
+            Some("") => diagnostics.push(CommandSyntaxError {
+                message: "data statement requires an expression".to_owned(),
+                start: statement.span.start,
+                end: statement.span.end,
+                help: "Add a structured-data expression after `data`".to_owned(),
+            }),
+            Some(_) => {}
+            None => diagnostics.extend(
+                check_command_statement(statement.text)
+                    .map(|error| rebase_diagnostic(error, statement.span.start)),
+            ),
         }
-        if let Some(expression) = data_statement_expression(trimmed) {
-            if expression.is_empty() {
-                diagnostics.push(CommandSyntaxError {
-                    message: "data statement requires an expression".to_owned(),
-                    start: offset.saturating_add(leading),
-                    end: offset.saturating_add(leading).saturating_add(trimmed.len()),
-                    help: "Add a structured-data expression after `data`".to_owned(),
-                });
-            }
-            offset = offset.saturating_add(raw_line.len());
-            continue;
-        }
-        if let Err(mut error) = parse_command_list(trimmed) {
-            let line_start = offset.saturating_add(leading);
-            error.start = error.start.saturating_add(line_start);
-            error.end = error.end.saturating_add(line_start);
-            diagnostics.push(error);
-        }
-        offset = offset.saturating_add(raw_line.len());
     }
+    diagnostics.sort_by_key(|diagnostic| diagnostic.start);
     diagnostics
+}
+
+/// Validate one complete command statement with the native program grammar.
+///
+/// Returns the statement's diagnostic with offsets relative to `statement`; callers that know the
+/// statement's position in a larger script rebase them. An unsupported form is a diagnostic here,
+/// because `.qrl` scripts have no reference-shell fallback.
+pub fn check_command_statement(statement: &str) -> Option<CommandSyntaxError> {
+    match parse_program(statement, &NoAliases) {
+        Ok(_) => None,
+        // A complete statement cannot end inside a construct, so an incomplete error only occurs
+        // for partial text, and it is reported like any other syntax error.
+        Err(ProgramError::Incomplete(error) | ProgramError::Syntax(error)) => Some(error),
+        Err(ProgramError::Unsupported(form)) => Some(CommandSyntaxError {
+            message: format!(
+                "`{}` is not supported in .qrl scripts: {}",
+                form.text, form.reason
+            ),
+            start: form.start,
+            end: form.end,
+            help: "Run it with a reference shell: wrap it in `bash { ... }` or run the file with `quirl run --lang bash`".to_owned(),
+        }),
+    }
+}
+
+fn rebase_diagnostic(mut diagnostic: CommandSyntaxError, base: usize) -> CommandSyntaxError {
+    diagnostic.start = diagnostic.start.saturating_add(base);
+    diagnostic.end = diagnostic.end.saturating_add(base);
+    diagnostic
 }
 
 fn finish_command(
@@ -1945,6 +2227,225 @@ mod tests {
     fn script_checker_reuses_command_syntax_with_absolute_spans() {
         let source =
             "#!/usr/bin/env -S quirl run\ndata {\"ok\":true}\n  echo $HOME\nprintf ok |\ndata\n";
+        let diagnostics = check_script(source);
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(
+            source.get(diagnostics[0].start..diagnostics[0].end),
+            Some("|")
+        );
+        assert_eq!(
+            source.get(diagnostics[1].start..diagnostics[1].end),
+            Some("data")
+        );
+    }
+
+    #[test]
+    fn script_splitter_joins_a_multi_line_loop_into_one_statement() {
+        let source = "echo before\nfor name in a b; do\n  echo \"$name\"\ndone\necho after\n";
+        let split = split_script_statements(source);
+        assert!(split.diagnostics.is_empty());
+        assert!(!split.limit_exceeded);
+        let texts = split
+            .statements
+            .iter()
+            .map(|statement| statement.text)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            [
+                "echo before",
+                "for name in a b; do\n  echo \"$name\"\ndone",
+                "echo after"
+            ]
+        );
+        for statement in &split.statements {
+            assert_eq!(source.get(statement.span.clone()), Some(statement.text));
+        }
+    }
+
+    #[test]
+    fn script_splitter_joins_a_function_definition_across_lines() {
+        let source = "greet() {\n  printf '%s\\n' \"$1\"\n}\ngreet hi\n";
+        let split = split_script_statements(source);
+        assert!(split.diagnostics.is_empty());
+        let texts = split
+            .statements
+            .iter()
+            .map(|statement| statement.text)
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["greet() {\n  printf '%s\\n' \"$1\"\n}", "greet hi"]);
+    }
+
+    #[test]
+    fn script_splitter_keeps_nested_constructs_in_one_statement() {
+        let source = "for x in 1 2; do\n  if test \"$x\" = 1; then\n    echo one\n  else\n    echo other\n  fi\ndone\necho end\n";
+        let split = split_script_statements(source);
+        assert!(split.diagnostics.is_empty());
+        assert_eq!(split.statements.len(), 2);
+        assert!(split.statements[0].text.ends_with("\ndone"));
+        assert_eq!(split.statements[1].text, "echo end");
+    }
+
+    #[test]
+    fn script_splitter_keeps_comment_lines_inside_a_loop_body_in_the_statement() {
+        let source = "while true; do\n  # wait for the next turn\n  break\ndone\n# trailing comment\necho after\n";
+        let split = split_script_statements(source);
+        assert!(split.diagnostics.is_empty());
+        let texts = split
+            .statements
+            .iter()
+            .map(|statement| statement.text)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            [
+                "while true; do\n  # wait for the next turn\n  break\ndone",
+                "echo after"
+            ]
+        );
+    }
+
+    #[test]
+    fn script_splitter_ends_pending_commands_before_a_data_line() {
+        let source = "echo a\ndata [1, 2]\necho b\n";
+        let split = split_script_statements(source);
+        assert!(split.diagnostics.is_empty());
+        let texts = split
+            .statements
+            .iter()
+            .map(|statement| statement.text)
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["echo a", "data [1, 2]", "echo b"]);
+    }
+
+    #[test]
+    fn script_splitter_reports_a_construct_interrupted_by_a_data_line_as_unterminated() {
+        let source = "for x in a; do\ndata [1]\ndone\n";
+        let split = split_script_statements(source);
+        assert_eq!(split.diagnostics.len(), 1);
+        assert!(split.diagnostics[0].message.contains("`done`"));
+        let texts = split
+            .statements
+            .iter()
+            .map(|statement| statement.text)
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["data [1]", "done"]);
+    }
+
+    #[test]
+    fn script_splitter_reports_an_unterminated_loop_at_end_of_input_on_its_last_token() {
+        let source = "echo ok\nfor x in a; do\n  echo $x\n";
+        let split = split_script_statements(source);
+        assert_eq!(
+            split
+                .statements
+                .iter()
+                .map(|statement| statement.text)
+                .collect::<Vec<_>>(),
+            ["echo ok"]
+        );
+        let [diagnostic] = split.diagnostics.as_slice() else {
+            panic!("expected one unterminated diagnostic");
+        };
+        assert_eq!(
+            diagnostic.message,
+            "expected `done` before the end of input"
+        );
+        let last_token_end = source.trim_end().len();
+        assert_eq!(diagnostic.end, last_token_end);
+        assert_eq!(diagnostic.start, last_token_end - 1);
+    }
+
+    #[test]
+    fn script_splitter_stops_at_a_statement_over_the_line_limit() {
+        let source = "echo a\nfor x in a; do\n:\n:\ndone\necho z\n";
+        let split = split_script_statements_with_limits(
+            source,
+            ScriptStatementLimits {
+                bytes_max: 1024,
+                lines_max: 3,
+            },
+        );
+        assert!(split.limit_exceeded);
+        assert_eq!(
+            split
+                .statements
+                .iter()
+                .map(|statement| statement.text)
+                .collect::<Vec<_>>(),
+            ["echo a"]
+        );
+        let [diagnostic] = split.diagnostics.as_slice() else {
+            panic!("expected one limit diagnostic");
+        };
+        assert!(diagnostic.message.contains("more than 3 lines"));
+        assert_eq!(diagnostic.start, source.find("for").unwrap());
+    }
+
+    #[test]
+    fn script_splitter_rejects_a_statement_over_the_byte_limit() {
+        let source = "echo short\necho this statement is far too long\n";
+        let split = split_script_statements_with_limits(
+            source,
+            ScriptStatementLimits {
+                bytes_max: 16,
+                lines_max: 10,
+            },
+        );
+        assert!(split.limit_exceeded);
+        assert_eq!(split.statements.len(), 1);
+        let [diagnostic] = split.diagnostics.as_slice() else {
+            panic!("expected one limit diagnostic");
+        };
+        assert!(diagnostic.message.contains("16-byte limit"));
+        assert_eq!(diagnostic.start, source.find("echo this").unwrap());
+    }
+
+    #[test]
+    fn script_checker_accepts_multi_line_loops_and_functions() {
+        let source = "for x in a; do\n  echo $x\ndone\nf() {\n  return 0\n}\n";
+        assert!(check_script(source).is_empty());
+    }
+
+    #[test]
+    fn script_checker_reports_unsupported_forms_with_a_reference_shell_suggestion() {
+        let source = "echo ok\n[[ -f x ]]\n";
+        let diagnostics = check_script(source);
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one unsupported diagnostic");
+        };
+        assert_eq!(source.get(diagnostic.start..diagnostic.end), Some("[["));
+        assert!(diagnostic.message.contains("not supported in .qrl scripts"));
+        assert!(diagnostic.message.contains("[["));
+        assert!(diagnostic.help.contains("bash { ... }"));
+        assert!(diagnostic.help.contains("--lang bash"));
+    }
+
+    #[test]
+    fn script_checker_reports_a_syntax_error_inside_a_loop_with_an_absolute_span() {
+        let source = "echo ok\nfor x in a; do\n  echo ok |\ndone\n";
+        let diagnostics = check_script(source);
+        assert!(!diagnostics.is_empty());
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.start >= source.find("for").unwrap()
+                && source.get(diagnostic.start..diagnostic.end).is_some()
+        }));
+    }
+
+    #[test]
+    fn script_checker_reports_an_unterminated_construct_at_end_of_input() {
+        let source = "echo ok\nf() {\n  echo body\n";
+        let diagnostics = check_script(source);
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one unterminated diagnostic");
+        };
+        assert!(diagnostic.message.contains("before the end of input"));
+        assert_eq!(diagnostic.end, source.trim_end().len());
+    }
+
+    #[test]
+    fn script_checker_validates_a_statement_after_a_data_line_with_absolute_spans() {
+        let source = "data [1]\nprintf ok |\ndata\necho last\n";
         let diagnostics = check_script(source);
         assert_eq!(diagnostics.len(), 2);
         assert_eq!(
