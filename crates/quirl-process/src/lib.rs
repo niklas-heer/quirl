@@ -1778,6 +1778,9 @@ mod platform {
         pending_flow: Option<interpreter::Flow>,
         /// Host flag set by `SIGINT`; loops and lists stop when it is set.
         interrupt: Option<Arc<std::sync::atomic::AtomicBool>>,
+        /// Output of an in-process first pipeline stage, fed to the next
+        /// spawned pipeline's first stage as standard input.
+        pending_stdin: Option<Vec<u8>>,
         #[cfg(test)]
         fail_stopped_terminal_mode_read: bool,
     }
@@ -2266,6 +2269,7 @@ mod platform {
                 local_frames: Vec::new(),
                 pending_flow: None,
                 interrupt: None,
+                pending_stdin: None,
                 #[cfg(test)]
                 fail_stopped_terminal_mode_read: false,
             }
@@ -2743,6 +2747,22 @@ mod platform {
                     "background execution is unavailable to isolated Lua",
                 ));
             }
+            // Background pipelines keep every stage a process so job control
+            // can observe, suspend, and resume each one.
+            if pipeline.commands.len() > 1
+                && !pipeline.background
+                && !self.noninteractive_host
+                && let Some(result) = self.execute_in_process_first_stage(
+                    pipeline,
+                    source,
+                    capture,
+                    request,
+                    observer,
+                    previous_status,
+                )?
+            {
+                return Ok(result);
+            }
             if pipeline.commands.len() == 1 {
                 let Some(command) = pipeline.commands.first() else {
                     return Err(ShellError::new(
@@ -2796,6 +2816,7 @@ mod platform {
         ) -> Result<CommandOutcome, ShellError> {
             if capture
                 && !pipeline.background
+                && self.pending_stdin.is_none()
                 && let Some(observer) = observer
             {
                 let environment = self.environment_snapshot()?;
@@ -3682,6 +3703,7 @@ mod platform {
             // Extension callbacks and other user code must stay outside this
             // window so an early child notification cannot observe half a job.
             let mut spawned = PipelineConstructionGuard::new();
+            let mut initial_input = self.pending_stdin.take();
             let mut previous_reader: Option<PipeReader> = None;
             let mut capture_reader = None;
             let mut stderr_readers = Vec::new();
@@ -3711,8 +3733,15 @@ mod platform {
                 let input = input_stdio(
                     command,
                     previous_reader.take(),
-                    index > 0,
-                    self.noninteractive_host,
+                    InputContext {
+                        has_upstream: index > 0,
+                        stdin_is_null: self.noninteractive_host,
+                        initial: if index == 0 {
+                            initial_input.take()
+                        } else {
+                            None
+                        },
+                    },
                     request,
                 )?;
                 let (stdout, next_reader, writer, redirected_stdout) =
@@ -4609,13 +4638,29 @@ mod platform {
         previous[candidate.len()]
     }
 
+    /// Where a pipeline stage's standard input comes from when it has no
+    /// input redirection.
+    struct InputContext {
+        /// Whether an earlier stage feeds this one through a pipe.
+        has_upstream: bool,
+        /// Whether a stage without other input reads `/dev/null` instead of
+        /// inheriting the terminal.
+        stdin_is_null: bool,
+        /// Bytes an in-process first stage produced for this stage.
+        initial: Option<Vec<u8>>,
+    }
+
     fn input_stdio(
         command: &SimpleCommand,
         previous: Option<PipeReader>,
-        has_upstream: bool,
-        stdin_is_null: bool,
+        context: InputContext,
         request: Option<RequestContext<'_>>,
     ) -> Result<PreparedInput, ShellError> {
+        let InputContext {
+            has_upstream,
+            stdin_is_null,
+            initial,
+        } = context;
         enum InputSource {
             File(File),
             HereString(String),
@@ -4634,6 +4679,19 @@ mod platform {
                 let file = open_redirected_input(&redirect.path, request)?;
                 selected = Some(InputSource::File(file));
             }
+        }
+        if selected.is_none()
+            && let Some(bytes) = initial
+        {
+            let (reader, writer) = crate::spawn_guard_scope(pipe).map_err(|error| {
+                ShellError::new(ErrorCode::Io, "could not create pipeline input")
+                    .with_context(error.to_string())
+                    .with_help("Retry the command")
+            })?;
+            return Ok(PreparedInput {
+                stdio: Stdio::from(reader),
+                writer: Some((writer, bytes)),
+            });
         }
         match selected {
             Some(InputSource::HereString(value)) => {

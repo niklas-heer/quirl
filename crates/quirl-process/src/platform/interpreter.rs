@@ -811,6 +811,88 @@ impl NativeExecutor {
         status_only(0)
     }
 
+    /// Run an expanded pipeline whose first stage is a function or an
+    /// in-process built-in: that stage runs here with captured output, and
+    /// its bytes become the next stage's standard input, so
+    /// `myfunction | grep x` and `alias | sort` work without a subshell.
+    ///
+    /// Returns `None` when the first stage is an external program. The first
+    /// stage's output is bounded by the request's capture limit, and it
+    /// finishes before the rest of the pipeline starts, so this is not a
+    /// streaming pipe. Later stages must be external programs.
+    pub(super) fn execute_in_process_first_stage(
+        &mut self,
+        pipeline: &Pipeline,
+        source: &str,
+        capture: bool,
+        request: Option<RequestContext<'_>>,
+        observer: Option<&OutputObserverHandle<'_>>,
+        previous_status: i32,
+    ) -> Result<Option<CommandOutcome>, ShellError> {
+        let Some((first, rest)) = pipeline.commands.split_first() else {
+            return Ok(None);
+        };
+        let Some(name) = first.words.first() else {
+            return Ok(None);
+        };
+        let function = self.functions.get(name).cloned();
+        if function.is_none() && !NATIVE_BUILTINS.contains(&name.as_str()) {
+            return Ok(None);
+        }
+        if let Some(later) = rest.iter().find_map(|command| {
+            command
+                .words
+                .first()
+                .filter(|name| self.functions.contains_key(*name))
+        }) {
+            return Err(ShellError::new(
+                ErrorCode::InvalidCommand,
+                format!("function `{later}` can only be the first stage of a native pipeline"),
+            )
+            .with_command(source)
+            .with_help(
+                "Move the function to the start of the pipeline, or run it in `bash { ... }`",
+            ));
+        }
+        let produced = match function {
+            Some(definition) => self.call_function(
+                &definition,
+                first,
+                source,
+                true,
+                request,
+                None,
+                previous_status,
+            )?,
+            None => match self.execute_native_builtin(first, true, request, previous_status)? {
+                Some(result) => result,
+                None => return Ok(None),
+            },
+        };
+        // A `return` or `break` inside the first stage ends only that stage,
+        // as it would in the subshell other shells use for it.
+        if self.pending_flow != Some(Flow::Abort) {
+            self.pending_flow = None;
+        }
+        let stage_stderr = produced.stderr.unwrap_or_default();
+        if !capture && !stage_stderr.is_empty() {
+            super::io_write_all(std::io::stderr(), stage_stderr.as_bytes(), "standard error")?;
+        }
+        let remaining = Pipeline {
+            commands: rest.to_vec(),
+            background: pipeline.background,
+        };
+        self.pending_stdin = Some(produced.stdout.unwrap_or_default().into_bytes());
+        let result = self.run_external_pipeline(&remaining, source, capture, request, observer);
+        self.pending_stdin = None;
+        let mut result = result?;
+        if capture && !stage_stderr.is_empty() {
+            let own = result.stderr.take().unwrap_or_default();
+            result.stderr = Some(stage_stderr + &own);
+        }
+        Ok(Some(result))
+    }
+
     /// Remove functions named by `unset -f`.
     pub(super) fn unset_functions(&mut self, names: &[String]) {
         for name in names {
@@ -1271,6 +1353,15 @@ mod tests {
                 .iter()
                 .any(|help| help.contains("bash { ... }"))
         );
+    }
+
+    #[test]
+    fn functions_and_builtins_can_feed_a_pipeline() {
+        let mut executor = NativeExecutor::default();
+        let program = "lines() { printf 'b\\na\\n'; }; lines | sort; echo hi | tr a-z A-Z; alias z=1 y=2; alias | wc -l | tr -d ' '";
+        assert_eq!(run(&mut executor, program).1, "a\nb\nHI\n2\n");
+        let error = executor.execute_capture("echo x | lines").unwrap_err();
+        assert!(error.message.contains("first stage"));
     }
 
     #[test]
