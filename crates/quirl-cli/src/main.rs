@@ -79,11 +79,12 @@ use quirl_ui::{
     InteractiveHistoryEntry, InteractiveHomeDirectory, InteractiveJobAction,
     InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch, InteractivePanelProvider,
     InteractiveProjectEntry, InteractiveProjectProvider, InteractiveProjectSnapshot,
-    InteractiveRuntimeSnapshot, InteractiveSignal, MODE_TOGGLE_HOST_COMMAND, NativeProjectContext,
-    PROJECT_ITEMS_MAX, PROMPT_FIRST_PAINT_BUDGET, PickerItem, PickerItemKind, PickerMatch,
-    PickerRanker, PromptContextScheduler, QuirlPrompt, RichSurface, SurfaceKind,
-    editor_with_session_home, history_path, render_error, select_surface, set_product_identity,
-    terminal_supports_nerd_font, terminal_supports_unicode, terminal_width,
+    InteractiveRuntimeSnapshot, InteractiveSessionCommand, InteractiveSessionCommandKind,
+    InteractiveSignal, MODE_TOGGLE_HOST_COMMAND, NativeProjectContext, PROJECT_ITEMS_MAX,
+    PROMPT_FIRST_PAINT_BUDGET, PickerItem, PickerItemKind, PickerMatch, PickerRanker,
+    PromptContextScheduler, QuirlPrompt, RichSurface, SurfaceKind, editor_with_session_home,
+    history_path, render_error, select_surface, set_product_identity, terminal_supports_nerd_font,
+    terminal_supports_unicode, terminal_width,
 };
 use recovery::RecoveryCommand;
 use script::ScriptLanguage;
@@ -2346,6 +2347,31 @@ fn interactive_environment_snapshot(
         .collect())
 }
 
+/// Session functions, then aliases, as the interactive editors see them.
+///
+/// Both lists come from the executor in sorted name order. The editor enforces
+/// its own name and entry bounds when it installs the list.
+fn interactive_session_command_snapshots(
+    executor: &NativeExecutor,
+) -> Vec<InteractiveSessionCommand> {
+    let functions = executor
+        .function_names()
+        .into_iter()
+        .map(|name| InteractiveSessionCommand {
+            name,
+            kind: InteractiveSessionCommandKind::Function,
+        });
+    let aliases =
+        executor
+            .aliases()
+            .into_iter()
+            .map(|(name, expansion)| InteractiveSessionCommand {
+                name,
+                kind: InteractiveSessionCommandKind::Alias { expansion },
+            });
+    functions.chain(aliases).collect()
+}
+
 /// Largest `init.qrl` the interactive shell runs at startup, in bytes.
 const INIT_SCRIPT_BYTES_MAX: usize = 256 * 1024;
 
@@ -2490,6 +2516,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
     let mut data_cache = InteractiveDataCache::default();
     let mut runtime_snapshot_generation = 0_u64;
     let mut installed_environment_generation = None;
+    let mut installed_session_commands_generation = None;
     // Script evaluation remains lazy. Extension VMs load before the first editor
     // view, but first paint reads only their bounded prompt cache; Lua refreshes
     // on the fixed worker pool after the snapshot is returned.
@@ -2670,13 +2697,24 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                 &home_directory,
             )?)
         };
+        // Session functions and aliases change only when a line defines or
+        // removes one, so the list is rebuilt on a generation change alone.
+        let session_commands_generation = executor.session_commands_generation();
+        let session_commands =
+            if installed_session_commands_generation == Some(session_commands_generation) {
+                None
+            } else {
+                Some(interactive_session_command_snapshots(&executor))
+            };
         line_editor.install_runtime_snapshot(InteractiveRuntimeSnapshot {
             generation: runtime_snapshot_generation,
             jobs: interactive_job_snapshots(&job_states),
             data: data_cache.snapshot(),
             environment,
+            session_commands,
         });
         installed_environment_generation = Some(environment_generation);
+        installed_session_commands_generation = Some(session_commands_generation);
         let history_directory = std::env::current_dir().unwrap_or_default();
         line_editor.install_history_snapshot(history_database.snapshot(&history_directory, mode)?);
         let signal = line_editor.read_line(&mut prompt);
@@ -6362,6 +6400,38 @@ mod tests {
         );
         let error = posix_control_island("greet() { echo hi; }; [[ -n x ]]").unwrap_err();
         assert!(error.message.contains("cannot persist"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_snapshot_lists_session_functions_before_aliases_in_sorted_order() {
+        let mut executor = NativeExecutor::default();
+        executor
+            .execute_capture("zeta() { echo z; }; greet() { echo hi; }; alias ll='ls -la'")
+            .unwrap();
+        assert_eq!(
+            interactive_session_command_snapshots(&executor),
+            [
+                InteractiveSessionCommand {
+                    name: "greet".to_owned(),
+                    kind: InteractiveSessionCommandKind::Function,
+                },
+                InteractiveSessionCommand {
+                    name: "zeta".to_owned(),
+                    kind: InteractiveSessionCommandKind::Function,
+                },
+                InteractiveSessionCommand {
+                    name: "ll".to_owned(),
+                    kind: InteractiveSessionCommandKind::Alias {
+                        expansion: "ls -la".to_owned(),
+                    },
+                },
+            ]
+        );
+        let generation = executor.session_commands_generation();
+        executor.execute_capture("unalias ll").unwrap();
+        assert!(executor.session_commands_generation() > generation);
+        assert_eq!(interactive_session_command_snapshots(&executor).len(), 2);
     }
 
     #[cfg(unix)]

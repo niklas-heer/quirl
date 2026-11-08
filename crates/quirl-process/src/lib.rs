@@ -1765,6 +1765,8 @@ mod platform {
         functions: std::collections::BTreeMap<String, Arc<quirl_syntax::FunctionDefinition>>,
         /// Session aliases, applied to command names when source is parsed.
         aliases: std::collections::BTreeMap<String, String>,
+        /// Changes whenever a session function or alias is defined, replaced, or removed.
+        session_commands_generation: u64,
         /// `$1`, `$2`, ... of the innermost running function.
         positional: Vec<String>,
         /// Number of function calls currently running.
@@ -2263,6 +2265,7 @@ mod platform {
                 environment: SessionEnvironment::default(),
                 functions: std::collections::BTreeMap::new(),
                 aliases: std::collections::BTreeMap::new(),
+                session_commands_generation: 0,
                 positional: Vec::new(),
                 call_depth: 0,
                 loop_depth: 0,
@@ -2334,6 +2337,16 @@ mod platform {
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect()
+        }
+
+        /// Generation of the session's function and alias definitions.
+        ///
+        /// The value changes whenever [`Self::function_names`] or
+        /// [`Self::aliases`] may have changed, so a host can rebuild a derived
+        /// list only when this number moves. The counter saturates at
+        /// `u64::MAX` instead of wrapping to a previously observed value.
+        pub const fn session_commands_generation(&self) -> u64 {
+            self.session_commands_generation
         }
 
         /// Replace one variable in this executor's private environment snapshot.
@@ -8837,6 +8850,22 @@ mod platform {
         /// Generation of the private environment observed by future children.
         pub const fn environment_generation(&self) -> u64 {
             self.environment.generation
+        }
+
+        /// Windows has no native session functions or aliases, so there are no
+        /// names to publish and the generation never moves.
+        pub const fn session_commands_generation(&self) -> u64 {
+            0
+        }
+
+        /// Windows has no native session functions; the list is always empty.
+        pub fn function_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        /// Windows has no native session aliases; the list is always empty.
+        pub fn aliases(&self) -> Vec<(String, String)> {
+            Vec::new()
         }
 
         /// Clone the complete private environment inherited by future children.

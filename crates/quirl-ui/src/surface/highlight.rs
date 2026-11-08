@@ -20,6 +20,7 @@ use std::{
 };
 
 use super::editor::MAX_EDITOR_BUFFER_BYTES;
+use super::runtime::InteractiveSessionCommand;
 
 const TIMING_WINDOW: usize = 128;
 const MAX_PATH_DIRECTORIES: usize = 256;
@@ -71,6 +72,8 @@ pub struct InputAnalysis {
 pub struct InputAnalyzer {
     catalog: Option<Arc<Catalog>>,
     path_commands: PathCommandCache,
+    /// Session functions and aliases published with the current prompt generation.
+    session_commands: Arc<[InteractiveSessionCommand]>,
     cached_revision: Option<u64>,
     cached_mode: Mode,
     current: InputAnalysis,
@@ -82,6 +85,7 @@ impl InputAnalyzer {
         Self {
             catalog: Some(catalog.into()),
             path_commands: PathCommandCache::dormant(),
+            session_commands: Arc::from(Vec::new()),
             cached_revision: None,
             cached_mode: Mode::Command,
             current: InputAnalysis::default(),
@@ -93,6 +97,7 @@ impl InputAnalyzer {
         Self {
             catalog: None,
             path_commands: PathCommandCache::dormant(),
+            session_commands: Arc::from(Vec::new()),
             cached_revision: None,
             cached_mode: Mode::Command,
             current: InputAnalysis::default(),
@@ -113,6 +118,13 @@ impl InputAnalyzer {
         self.catalog = Some(catalog);
         self.cached_revision = None;
         self.current = InputAnalysis::default();
+    }
+
+    /// Publish the session functions and aliases that count as known commands.
+    /// Cached diagnostics are invalidated so the next edit re-evaluates names.
+    pub fn set_session_commands(&mut self, commands: Arc<[InteractiveSessionCommand]>) {
+        self.session_commands = commands;
+        self.cached_revision = None;
     }
 
     #[cfg(test)]
@@ -151,7 +163,14 @@ impl InputAnalyzer {
         };
         let diagnostic = if within_input_bound {
             self.catalog.as_deref().and_then(|catalog| {
-                diagnostic_for(catalog, &self.path_commands, buffer, mode, &spans)
+                diagnostic_for(
+                    catalog,
+                    &self.path_commands,
+                    &self.session_commands,
+                    buffer,
+                    mode,
+                    &spans,
+                )
             })
         } else {
             None
@@ -446,6 +465,7 @@ fn unsupported_form_diagnostic(form: &DialectControlForm) -> SurfaceDiagnostic {
 fn diagnostic_for(
     catalog: &Catalog,
     path_commands: &PathCommandCache,
+    session_commands: &[InteractiveSessionCommand],
     buffer: &str,
     mode: Mode,
     spans: &[HighlightSpan],
@@ -482,8 +502,13 @@ fn diagnostic_for(
     let command = buffer.get(command_span.range.clone())?.trim();
     let first_command = parsed.pipelines.first()?.commands.first()?;
     let catalog_command =
-        resolve_catalog_command(catalog, first_command).map(|(command, _)| command);
-    if catalog_command.is_none() && !command.contains('/') {
+        resolve_shell_command(catalog, session_commands, first_command).map(|(command, _)| command);
+    // A session function or alias is resolved by the executor before PATH, so
+    // it is known even though no file of that name exists.
+    if catalog_command.is_none()
+        && !command.contains('/')
+        && !session_command_named(session_commands, command)
+    {
         let path_status = path_commands.command_status(command);
         if path_status == Some(false)
             && buffer[command_span.range.end..].contains(char::is_whitespace)
@@ -522,13 +547,36 @@ fn diagnostic_for(
         }
     }
 
-    let (command, unknown) = unknown_option(catalog, &parsed, spans)?;
+    let (command, unknown) = unknown_option(catalog, session_commands, &parsed, spans)?;
     let flag = buffer.get(unknown.clone())?;
     Some(SurfaceDiagnostic {
         message: format!("unknown flag `{flag}` for `{}`", command.path),
         severity: DiagnosticSeverity::Warning,
         range: Some(unknown),
     })
+}
+
+fn session_command_named(session_commands: &[InteractiveSessionCommand], command: &str) -> bool {
+    session_commands
+        .iter()
+        .any(|candidate| candidate.name == command)
+}
+
+/// Catalog resolution for one simple command as the executor will run it.
+///
+/// A session function or alias that shares a catalog command's name runs
+/// instead of that command, so the catalog's spec and flag rules must not
+/// describe it.
+fn resolve_shell_command<'a>(
+    catalog: &'a Catalog,
+    session_commands: &[InteractiveSessionCommand],
+    command: &SimpleCommand,
+) -> Option<(&'a CommandSpec, usize)> {
+    let name = command.words.first()?;
+    if session_command_named(session_commands, name) {
+        return None;
+    }
+    resolve_catalog_command(catalog, command)
 }
 
 fn resolve_catalog_command<'a>(
@@ -574,6 +622,7 @@ fn options_are_authoritative(command: &CommandSpec) -> bool {
 
 fn unknown_option<'a>(
     catalog: &'a Catalog,
+    session_commands: &[InteractiveSessionCommand],
     parsed: &CommandList,
     spans: &[HighlightSpan],
 ) -> Option<(&'a CommandSpec, Range<usize>)> {
@@ -583,7 +632,7 @@ fn unknown_option<'a>(
         .map(|span| span.range.clone());
     for pipeline in &parsed.pipelines {
         for parsed_command in &pipeline.commands {
-            let resolved = resolve_catalog_command(catalog, parsed_command);
+            let resolved = resolve_shell_command(catalog, session_commands, parsed_command);
             let short_options = resolved.and_then(|(command, _)| {
                 options_are_authoritative(command).then(|| ShortOptionLookup::new(command))
             });
@@ -1108,9 +1157,129 @@ mod tests {
         let input = "gti status";
         let spans = highlight(input, Mode::Command);
         let diagnostic =
-            diagnostic_for(&catalog, &path_commands, input, Mode::Command, &spans).unwrap();
+            diagnostic_for(&catalog, &path_commands, &[], input, Mode::Command, &spans).unwrap();
         assert_eq!(diagnostic.severity, DiagnosticSeverity::Error);
         assert!(diagnostic.message.contains("did you mean `git`"));
+    }
+
+    #[test]
+    fn session_functions_and_aliases_are_never_reported_as_unknown_commands() {
+        use super::super::runtime::InteractiveSessionCommandKind;
+        let catalog = Catalog::builtin();
+        // A complete PATH snapshot that contains neither session name, so any
+        // silence below comes from the session list and not from missing data.
+        let mut path_commands = PathCommandCache::new(None);
+        path_commands.ready = true;
+        let session = [
+            InteractiveSessionCommand {
+                name: "greet".to_owned(),
+                kind: InteractiveSessionCommandKind::Function,
+            },
+            InteractiveSessionCommand {
+                name: "ll".to_owned(),
+                kind: InteractiveSessionCommandKind::Alias {
+                    expansion: "ls -la".to_owned(),
+                },
+            },
+        ];
+        for input in ["greet world", "ll /tmp"] {
+            let spans = highlight(input, Mode::Command);
+            assert!(
+                diagnostic_for(
+                    &catalog,
+                    &path_commands,
+                    &session,
+                    input,
+                    Mode::Command,
+                    &spans
+                )
+                .is_none(),
+                "{input}"
+            );
+        }
+        // Without the session list the same word is still reported, so the
+        // exemption is exactly the session names and nothing broader.
+        let spans = highlight("greet world", Mode::Command);
+        let diagnostic = diagnostic_for(
+            &catalog,
+            &path_commands,
+            &[],
+            "greet world",
+            Mode::Command,
+            &spans,
+        )
+        .unwrap();
+        assert!(diagnostic.message.contains("unknown command `greet`"));
+    }
+
+    #[test]
+    fn session_function_shadowing_a_catalog_command_is_not_checked_against_its_spec() {
+        use super::super::runtime::InteractiveSessionCommandKind;
+        let catalog = Catalog::builtin();
+        let mut path_commands = PathCommandCache::new(None);
+        path_commands.ready = true;
+        let input = "quirl describe --definitely-invalid";
+        let spans = highlight(input, Mode::Command);
+        let catalog_only =
+            diagnostic_for(&catalog, &path_commands, &[], input, Mode::Command, &spans);
+        assert!(
+            catalog_only.is_some_and(|diagnostic| diagnostic.message.contains("unknown flag")),
+            "the catalog spec for quirl describe rejects the flag"
+        );
+        let shadowing = [InteractiveSessionCommand {
+            name: "quirl".to_owned(),
+            kind: InteractiveSessionCommandKind::Function,
+        }];
+        assert!(
+            diagnostic_for(
+                &catalog,
+                &path_commands,
+                &shadowing,
+                input,
+                Mode::Command,
+                &spans
+            )
+            .is_none(),
+            "a session function named like a catalog command takes its own arguments"
+        );
+    }
+
+    #[test]
+    fn in_process_builtins_are_known_commands_without_a_path_entry() {
+        // Every builtin the executor runs in-process must resolve through the
+        // catalog, so none of them can be reported as an unknown command on a
+        // PATH that lacks it.
+        let catalog = Catalog::builtin();
+        let mut path_commands = PathCommandCache::new(None);
+        path_commands.ready = true;
+        for input in [
+            "true",
+            "false",
+            ": ignored",
+            "echo hello",
+            "test -n x",
+            "[ -n x ]",
+            "alias ll='ls -la'",
+            "unalias ll",
+            "type ls",
+            "local count=0",
+            "shift 2",
+            "return 1",
+            "break 2",
+            "continue 2",
+        ] {
+            let spans = highlight(input, Mode::Command);
+            let found = diagnostic_for(&catalog, &path_commands, &[], input, Mode::Command, &spans);
+            // Flag coverage of a builtin's catalog spec is a separate concern;
+            // this test only pins that the command word itself is recognized.
+            assert!(
+                found
+                    .as_ref()
+                    .is_none_or(|diagnostic| !diagnostic.message.starts_with("unknown command")),
+                "{input}: {:?}",
+                found.map(|diagnostic| diagnostic.message)
+            );
+        }
     }
 
     #[test]
@@ -1127,7 +1296,8 @@ mod tests {
         ] {
             let spans = highlight(input, Mode::Command);
             assert!(
-                diagnostic_for(&catalog, &path_commands, input, Mode::Command, &spans).is_none(),
+                diagnostic_for(&catalog, &path_commands, &[], input, Mode::Command, &spans)
+                    .is_none(),
                 "{input}"
             );
         }
@@ -1152,7 +1322,8 @@ mod tests {
         ] {
             let spans = highlight(input, Mode::Command);
             let diagnostic =
-                diagnostic_for(&catalog, &path_commands, input, Mode::Command, &spans).unwrap();
+                diagnostic_for(&catalog, &path_commands, &[], input, Mode::Command, &spans)
+                    .unwrap();
             assert_eq!(diagnostic.severity, severity, "{input}");
             assert!(
                 diagnostic.message.starts_with(prefix),
@@ -1183,7 +1354,7 @@ mod tests {
         let input = format!("{token} argument");
         let spans = highlight(&input, Mode::Command);
         let diagnostic =
-            diagnostic_for(&catalog, &path_commands, &input, Mode::Command, &spans).unwrap();
+            diagnostic_for(&catalog, &path_commands, &[], &input, Mode::Command, &spans).unwrap();
         assert_eq!(
             diagnostic.message,
             format!(

@@ -2,6 +2,7 @@ use super::super::{
     CompletionWorker, ExtensionCompleter, ExtensionSuggestion, SuggestionOrigin, SurfaceSymbols,
     extension_replacement_is_valid,
 };
+use super::runtime::{InteractiveSessionCommand, InteractiveSessionCommandKind};
 use quirl_catalog::{
     COMPLETION_PROTOCOL_VERSION, Catalog, CommandSpec, Completion, CompletionCancellation,
     CompletionOutcome, CompletionRequest, Effect, MAX_COMPLETION_DEADLINE_MS,
@@ -10,6 +11,7 @@ use quirl_catalog::{
 use quirl_core::ShellError;
 use quirl_syntax::Mode;
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -355,6 +357,10 @@ pub struct CompletionState {
     extension_worker: Option<ExtensionWorker>,
     extension_pending: Option<Vec<ExtensionSuggestion>>,
     filesystem_pending: Vec<CompletionItem>,
+    /// Session functions and aliases matching command-position input. Offered
+    /// before catalog commands, which they shadow when names collide.
+    session_pending: Vec<CompletionItem>,
+    session_commands: Arc<[InteractiveSessionCommand]>,
     catalog_ready: bool,
     extension_ready: bool,
     request_id: u64,
@@ -427,6 +433,8 @@ impl CompletionState {
             extension_worker: None,
             extension_pending: None,
             filesystem_pending: Vec::new(),
+            session_pending: Vec::new(),
+            session_commands: Arc::from(Vec::new()),
             catalog_ready: false,
             extension_ready: false,
             request_id: 0,
@@ -457,6 +465,8 @@ impl CompletionState {
             extension_worker: None,
             extension_pending: None,
             filesystem_pending: Vec::new(),
+            session_pending: Vec::new(),
+            session_commands: Arc::from(Vec::new()),
             catalog_ready: false,
             extension_ready: false,
             request_id: 0,
@@ -488,6 +498,12 @@ impl CompletionState {
             "completion cannot start before catalog publication"
         );
         self.catalog = Some(catalog);
+    }
+
+    /// Publish the session functions and aliases offered at command position.
+    /// Takes effect on the next request; an open menu keeps its current items.
+    pub fn set_session_commands(&mut self, commands: Arc<[InteractiveSessionCommand]>) {
+        self.session_commands = commands;
     }
 
     pub fn replace_catalog(&mut self, catalog: Arc<Catalog>) {
@@ -596,6 +612,8 @@ impl CompletionState {
         self.request_id = self.request_id.saturating_add(1);
         self.items.clear();
         self.extension_pending = None;
+        self.session_pending =
+            session_command_completion_items(&self.session_commands, line, cursor, mode);
         let variables = variable_completion_items(line, cursor, mode);
         self.filesystem_pending = if variables.is_empty() {
             filesystem_completion_items(
@@ -621,7 +639,12 @@ impl CompletionState {
             // share its prefix. Explicit Tab still offers those alternatives.
             self.filesystem_pending.clear();
         }
-        self.items.clone_from(&self.filesystem_pending);
+        self.items = self
+            .session_pending
+            .iter()
+            .chain(&self.filesystem_pending)
+            .cloned()
+            .collect();
         self.catalog_ready = false;
         self.extension_ready = self.extension_worker.is_none();
         self.selected = 0;
@@ -734,8 +757,20 @@ impl CompletionState {
                     .collect(),
                 CompletionOutcome::Cancelled | CompletionOutcome::DeadlineExceeded => Vec::new(),
             };
+            // Session names come first and win over a catalog command with the
+            // same value, because the executor resolves the session name first.
+            let session_items = std::mem::take(&mut self.session_pending);
+            let session_values = session_items
+                .iter()
+                .map(|item| item.value.clone())
+                .collect::<HashSet<_>>();
             let mut items = std::mem::take(&mut self.filesystem_pending);
-            items.extend(catalog_items);
+            items.extend(session_items);
+            items.extend(
+                catalog_items
+                    .into_iter()
+                    .filter(|item| !session_values.contains(&item.value)),
+            );
             self.items = bounded_items(items);
             self.catalog_ready = true;
             if let Some(extension_items) = self.extension_pending.take()
@@ -1158,6 +1193,68 @@ pub(crate) fn filesystem_completion_items(
 /// whose value names a directory completes with a trailing `/` so a path can
 /// continue, and any other variable completes as a finished word. Single
 /// quotes and escaped dollars are literal text and are never completed.
+/// Session function and alias names that complete the word at command position.
+///
+/// Only a single word at the start of a command segment qualifies: an argument
+/// or a word after a trailing space is never a command name. The candidate list
+/// is bounded by the snapshot (at most `SESSION_COMMANDS_MAX` names).
+pub(crate) fn session_command_completion_items(
+    commands: &[InteractiveSessionCommand],
+    line: &str,
+    cursor: usize,
+    mode: Mode,
+) -> Vec<CompletionItem> {
+    if mode != Mode::Command || commands.is_empty() {
+        return Vec::new();
+    }
+    let cursor = clamped_utf8_cursor(line, cursor);
+    let Some(before) = line.get(..cursor) else {
+        return Vec::new();
+    };
+    let segment_start = shell_segment_start(before);
+    let Some(segment) = before.get(segment_start..) else {
+        return Vec::new();
+    };
+    let words = shell_words(segment, segment_start);
+    let (replace_start, typed) = match words.as_slice() {
+        [] => (cursor, String::new()),
+        [word] if !segment.ends_with(char::is_whitespace) => {
+            (word.start, decode_shell_word(word.raw))
+        }
+        _ => return Vec::new(),
+    };
+    let mut items = Vec::new();
+    for command in commands {
+        if !command.name.starts_with(&typed) {
+            continue;
+        }
+        let (summary, detail) = match &command.kind {
+            InteractiveSessionCommandKind::Function => (
+                "function".to_owned(),
+                format!("Session function\n\n{}", command.name),
+            ),
+            InteractiveSessionCommandKind::Alias { expansion } => (
+                format!("alias for `{expansion}`"),
+                format!("Session alias\n\n{} = {expansion}", command.name),
+            ),
+        };
+        items.push(CompletionItem {
+            display: command.name.clone(),
+            value: escape_unquoted_shell_word(&command.name),
+            summary,
+            detail,
+            replace_start,
+            replace_end: cursor,
+            match_indices: (0..typed.chars().count()).collect(),
+            kind: CompletionKind::Command,
+            source: "session",
+            trust: "local",
+        });
+    }
+    items.sort_by(|left, right| left.display.cmp(&right.display));
+    bounded_items(items)
+}
+
 pub(crate) fn variable_completion_items(
     line: &str,
     cursor: usize,
@@ -2444,6 +2541,74 @@ mod tests {
         poll_completion_until(&mut state, "é", |state| !state.streaming);
         assert!(state.extension_ready);
         assert!(state.items.iter().all(|item| item.source != "plugin"));
+    }
+
+    fn session_fixture() -> Vec<InteractiveSessionCommand> {
+        vec![
+            InteractiveSessionCommand {
+                name: "greet".to_owned(),
+                kind: InteractiveSessionCommandKind::Function,
+            },
+            InteractiveSessionCommand {
+                name: "ll".to_owned(),
+                kind: InteractiveSessionCommandKind::Alias {
+                    expansion: "ls -la".to_owned(),
+                },
+            },
+            InteractiveSessionCommand {
+                name: "git".to_owned(),
+                kind: InteractiveSessionCommandKind::Alias {
+                    expansion: "git --no-pager".to_owned(),
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn session_names_complete_only_where_a_command_word_starts() {
+        let commands = session_fixture();
+        let values = |line: &str| {
+            session_command_completion_items(&commands, line, line.len(), Mode::Command)
+                .into_iter()
+                .map(|item| (item.value, item.summary))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values("gr"), [("greet".to_owned(), "function".to_owned())]);
+        assert_eq!(
+            values("ll"),
+            [("ll".to_owned(), "alias for `ls -la`".to_owned())]
+        );
+        // A word after a separator starts a new command segment.
+        assert_eq!(values("true; gr").len(), 1);
+        assert_eq!(values("true && gr").len(), 1);
+        // Argument positions, a finished command word, and other modes get none.
+        assert!(values("git gr").is_empty());
+        assert!(values("greet ").is_empty());
+        assert!(values("echo gr | cat x").is_empty());
+        assert!(session_command_completion_items(&commands, "gr", 2, Mode::Natural).is_empty());
+        // The replacement range covers the typed word only.
+        let item = &session_command_completion_items(&commands, "x; gr", 5, Mode::Command)[0];
+        assert_eq!((item.replace_start, item.replace_end), (3, 5));
+    }
+
+    #[test]
+    fn session_names_are_offered_with_catalog_commands_and_shadow_duplicates() {
+        let mut state = CompletionState::new(Catalog::builtin(), None);
+        state.set_session_commands(Arc::from(session_fixture()));
+        state.request("git", 3, Mode::Command).unwrap();
+        poll_completion_until(&mut state, "git", |state| !state.streaming);
+        let git = state
+            .items
+            .iter()
+            .filter(|item| item.value == "git")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            git.len(),
+            1,
+            "a session alias replaces the catalog duplicate"
+        );
+        assert_eq!(git[0].source, "session");
+        assert_eq!(state.items[0].source, "session");
     }
 
     #[test]

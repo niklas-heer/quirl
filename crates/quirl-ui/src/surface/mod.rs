@@ -22,8 +22,10 @@ pub use runtime::{
     InteractiveActivitySnapshot, InteractiveDataSnapshot, InteractiveEnvironmentSnapshot,
     InteractiveHomeDirectory, InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus,
     InteractivePanelBatch, InteractivePanelProvider, InteractivePanelSnapshot,
-    InteractiveRuntimeSnapshot, JOB_ACTION_ITEMS_MAX, JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX,
-    PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX, PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
+    InteractiveRuntimeSnapshot, InteractiveSessionCommand, InteractiveSessionCommandKind,
+    JOB_ACTION_ITEMS_MAX, JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX,
+    PANEL_FIELD_BYTES_MAX, PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
+    SESSION_COMMAND_NAME_BYTES_MAX, SESSION_COMMAND_TEXT_BYTES_MAX, SESSION_COMMANDS_MAX,
 };
 
 /// One-shot rich-session loader that returns the complete immutable catalog.
@@ -1285,7 +1287,14 @@ impl RichSurface {
 
     /// Replace the bounded immutable job and typed-result sources for the next frame.
     pub fn install_runtime_snapshot(&mut self, snapshot: InteractiveRuntimeSnapshot) {
-        self.runtime.install_snapshot(snapshot);
+        if self.runtime.install_snapshot(snapshot) {
+            // Both consumers share one immutable list, so a session change is
+            // one Arc publication rather than a copy per consumer.
+            let commands = self.runtime.session_commands();
+            self.input_analysis
+                .set_session_commands(Arc::clone(&commands));
+            self.completion.set_session_commands(commands);
+        }
     }
 
     /// Share the composition root's bounded raw HOME with filesystem completion.

@@ -27,11 +27,12 @@ pub use surface::{
     InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch,
     InteractivePanelProvider, InteractivePanelSnapshot, InteractiveProjectEntry,
     InteractiveProjectProvider, InteractiveProjectSnapshot, InteractiveRuntimeSnapshot,
-    InteractiveSignal, JOB_ACTION_ITEMS_MAX, JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX,
-    PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX, PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
-    PROJECT_FIELD_BYTES_MAX, PROJECT_ITEMS_MAX, PROJECT_RETAINED_BYTES_MAX,
-    PROJECT_STATUS_BYTES_MAX, ProjectCloneChoice, RichSurface, SurfaceKind, complete_listing,
-    select_surface, set_product_identity,
+    InteractiveSessionCommand, InteractiveSessionCommandKind, InteractiveSignal,
+    JOB_ACTION_ITEMS_MAX, JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX,
+    PANEL_FIELD_BYTES_MAX, PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX, PROJECT_FIELD_BYTES_MAX,
+    PROJECT_ITEMS_MAX, PROJECT_RETAINED_BYTES_MAX, PROJECT_STATUS_BYTES_MAX, ProjectCloneChoice,
+    RichSurface, SESSION_COMMAND_NAME_BYTES_MAX, SESSION_COMMAND_TEXT_BYTES_MAX,
+    SESSION_COMMANDS_MAX, SurfaceKind, complete_listing, select_surface, set_product_identity,
 };
 
 /// Escape `text` as one unquoted shell word, the way interactive completion

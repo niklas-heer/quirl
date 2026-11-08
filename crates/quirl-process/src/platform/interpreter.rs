@@ -457,7 +457,13 @@ impl NativeExecutor {
         }
         self.functions
             .insert(definition.name.clone(), Arc::new(definition.clone()));
+        self.note_session_commands_changed();
         Ok(())
+    }
+
+    /// Advance the generation that tells hosts the function or alias set changed.
+    fn note_session_commands_changed(&mut self) {
+        self.session_commands_generation = self.session_commands_generation.saturating_add(1);
     }
 
     /// Run a function for an expanded single-command pipeline.
@@ -653,6 +659,7 @@ impl NativeExecutor {
                         .with_help("Remove unused aliases with `unalias name`"));
                     }
                     self.aliases.insert(name.to_owned(), value.to_owned());
+                    self.note_session_commands_changed();
                 }
                 None => match self.aliases.get(operand) {
                     Some(value) => {
@@ -673,13 +680,17 @@ impl NativeExecutor {
             return failure(2, "unalias", "usage: unalias [-a] name...");
         }
         if operands.iter().any(|operand| operand == "-a") {
-            self.aliases.clear();
+            if !self.aliases.is_empty() {
+                self.aliases.clear();
+                self.note_session_commands_changed();
+            }
             return status_only(0);
         }
         let mut stderr = String::new();
         for operand in operands {
-            if self.aliases.remove(operand).is_none() {
-                stderr.push_str(&format!("unalias: {operand}: not found\n"));
+            match self.aliases.remove(operand) {
+                Some(_) => self.note_session_commands_changed(),
+                None => stderr.push_str(&format!("unalias: {operand}: not found\n")),
             }
         }
         outcome(
@@ -896,7 +907,9 @@ impl NativeExecutor {
     /// Remove functions named by `unset -f`.
     pub(super) fn unset_functions(&mut self, names: &[String]) {
         for name in names {
-            self.functions.remove(name);
+            if self.functions.remove(name).is_some() {
+                self.note_session_commands_changed();
+            }
         }
     }
 }
@@ -1248,6 +1261,30 @@ mod tests {
             outer() { inner x; printf \"($1,$#)\"; shift; printf \"($1,$#)\"; }; \
             outer a b; printf \"{$#}\"";
         assert_eq!(stdout(program), "[x](a,2)(b,1){0}");
+    }
+
+    #[test]
+    fn session_commands_generation_moves_only_when_function_or_alias_names_change() {
+        let mut executor = NativeExecutor::default();
+        let start = executor.session_commands_generation();
+        run(&mut executor, "echo nothing-to-define");
+        assert_eq!(executor.session_commands_generation(), start);
+        run(&mut executor, "greet() { echo hi; }");
+        let defined = executor.session_commands_generation();
+        assert!(defined > start);
+        run(&mut executor, "alias ll='ls -la'");
+        let aliased = executor.session_commands_generation();
+        assert!(aliased > defined);
+        run(&mut executor, "unalias nope");
+        assert_eq!(executor.session_commands_generation(), aliased);
+        run(&mut executor, "unalias ll");
+        let unaliased = executor.session_commands_generation();
+        assert!(unaliased > aliased);
+        run(&mut executor, "unset -f nope");
+        assert_eq!(executor.session_commands_generation(), unaliased);
+        run(&mut executor, "unset -f greet");
+        assert!(executor.session_commands_generation() > unaliased);
+        assert!(executor.function_names().is_empty());
     }
 
     #[test]

@@ -87,6 +87,22 @@ pub const JOB_ACTION_ITEMS_MAX: usize = 256;
 pub const JOB_RETAINED_BYTES_MAX: usize = 512 * 1024;
 /// Maximum UTF-8 bytes retained for one bottom-bar activity message.
 pub const ACTIVITY_MESSAGE_BYTES_MAX: usize = 512;
+/// Most session functions plus aliases retained for one prompt generation.
+///
+/// Matches the executor's own limits of 1,024 functions and 1,024 aliases per
+/// session. Entries beyond this bound are dropped with a notice, so
+/// diagnostics and completion never scan an unbounded list.
+pub const SESSION_COMMANDS_MAX: usize = 2_048;
+/// Largest session function or alias name retained, in bytes.
+///
+/// Longer or control-character names are dropped rather than truncated,
+/// because a truncated name would name a different command.
+pub const SESSION_COMMAND_NAME_BYTES_MAX: usize = 256;
+/// Largest alias expansion retained for display, in bytes.
+///
+/// Longer expansions are cut at a character boundary and shown with the
+/// truncated text; the executor still runs the full expansion.
+pub const SESSION_COMMAND_TEXT_BYTES_MAX: usize = 256;
 const LIVE_GENERATIONS_MAX: usize = 4;
 const PANEL_BATCHES_MAX: usize = PANEL_QUEUE_UPDATES_MAX / PANEL_COUNT_MAX;
 const ENVIRONMENT_FIELD_BYTES_MAX: usize = 6 * 1024;
@@ -176,6 +192,33 @@ pub struct InteractiveRuntimeSnapshot {
     /// New session-private variables inherited by future child processes.
     /// `None` retains the environment from the preceding generation.
     pub environment: Option<Vec<InteractiveEnvironmentSnapshot>>,
+    /// Session functions and aliases, at most [`SESSION_COMMANDS_MAX`] entries.
+    /// `None` retains the list from the preceding generation, so a prompt that
+    /// did not define or remove a command does not rebuild or reinstall it.
+    pub session_commands: Option<Vec<InteractiveSessionCommand>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Whether a session command is a shell function or an alias.
+pub enum InteractiveSessionCommandKind {
+    /// A function defined with `name() { ...; }` or `function name { ...; }`.
+    Function,
+    /// An alias whose expansion is shown as completion documentation.
+    Alias {
+        /// Expansion text, escaped for terminal display and cut to
+        /// [`SESSION_COMMAND_TEXT_BYTES_MAX`] bytes.
+        expansion: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// One session function or alias that command-position input may name.
+pub struct InteractiveSessionCommand {
+    /// Exact command name as the executor resolves it. Never empty and never
+    /// longer than [`SESSION_COMMAND_NAME_BYTES_MAX`] bytes.
+    pub name: String,
+    /// Whether the name is a function or an alias.
+    pub kind: InteractiveSessionCommandKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +278,7 @@ pub(crate) struct RuntimeSurfaceState {
     jobs: Vec<InteractiveJobSnapshot>,
     data: Vec<InteractiveDataSnapshot>,
     environment: Vec<InteractiveEnvironmentSnapshot>,
+    session_commands: std::sync::Arc<[InteractiveSessionCommand]>,
     panel_generation: u64,
     panels: Vec<PanelSlot>,
     panel_focus: usize,
@@ -259,6 +303,7 @@ impl RuntimeSurfaceState {
             jobs: Vec::new(),
             data: Vec::new(),
             environment: Vec::new(),
+            session_commands: std::sync::Arc::from(Vec::new()),
             panel_generation: 0,
             panels: Vec::new(),
             panel_focus: 0,
@@ -290,9 +335,12 @@ impl RuntimeSurfaceState {
         }
     }
 
-    pub(crate) fn install_snapshot(&mut self, mut snapshot: InteractiveRuntimeSnapshot) {
+    /// Install one prompt generation. Returns `true` when the session command
+    /// list was replaced, so dependents can drop derived state. A stale
+    /// generation changes nothing and returns `false`.
+    pub(crate) fn install_snapshot(&mut self, mut snapshot: InteractiveRuntimeSnapshot) -> bool {
         if snapshot.generation < self.snapshot_generation {
-            return;
+            return false;
         }
         self.snapshot_generation = snapshot.generation;
         self.notice = None;
@@ -301,6 +349,19 @@ impl RuntimeSurfaceState {
         if let Some(mut environment) = snapshot.environment {
             self.environment = bounded_environment(&mut environment, &mut self.notice);
         }
+        match snapshot.session_commands {
+            Some(commands) => {
+                self.session_commands = bounded_session_commands(commands, &mut self.notice);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Shared, immutable session command list for the current generation.
+    /// Cloning clones the `Arc`, not the entries.
+    pub(crate) fn session_commands(&self) -> std::sync::Arc<[InteractiveSessionCommand]> {
+        std::sync::Arc::clone(&self.session_commands)
     }
 
     pub(crate) fn poll_panels(&mut self) -> bool {
@@ -626,6 +687,60 @@ fn bounded_environment(
     retained
 }
 
+/// Admit session commands in input order, dropping names the executor could not
+/// have produced and recording one notice when anything was dropped or the
+/// entry bound was reached. Expansions are terminal-escaped and truncated.
+fn bounded_session_commands(
+    commands: Vec<InteractiveSessionCommand>,
+    notice: &mut Option<String>,
+) -> std::sync::Arc<[InteractiveSessionCommand]> {
+    let mut retained = Vec::with_capacity(commands.len().min(SESSION_COMMANDS_MAX));
+    let mut dropped = false;
+    for command in commands {
+        if retained.len() == SESSION_COMMANDS_MAX {
+            dropped = true;
+            break;
+        }
+        match bounded_session_command(command) {
+            Some(admitted) => retained.push(admitted),
+            None => dropped = true,
+        }
+    }
+    if dropped {
+        *notice = Some(format!(
+            "session command completion keeps at most {SESSION_COMMANDS_MAX} names of {SESSION_COMMAND_NAME_BYTES_MAX} bytes; some were not offered"
+        ));
+    }
+    std::sync::Arc::from(retained)
+}
+
+fn bounded_session_command(
+    command: InteractiveSessionCommand,
+) -> Option<InteractiveSessionCommand> {
+    let name_is_admissible = !command.name.is_empty()
+        && command.name.len() <= SESSION_COMMAND_NAME_BYTES_MAX
+        && !command
+            .name
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace());
+    if !name_is_admissible {
+        return None;
+    }
+    let kind = match command.kind {
+        InteractiveSessionCommandKind::Function => InteractiveSessionCommandKind::Function,
+        InteractiveSessionCommandKind::Alias { expansion } => {
+            let escaped = escape_terminal_line(&expansion);
+            InteractiveSessionCommandKind::Alias {
+                expansion: truncate_bytes(&escaped, SESSION_COMMAND_TEXT_BYTES_MAX),
+            }
+        }
+    };
+    Some(InteractiveSessionCommand {
+        name: command.name,
+        kind,
+    })
+}
+
 fn validate_panel_batch(batch: &InteractivePanelBatch) -> Result<(), ShellError> {
     if batch.panels.len() > PANEL_COUNT_MAX {
         return Err(panel_limit_error(
@@ -935,6 +1050,7 @@ mod tests {
                     value: path.clone(),
                 },
             ]),
+            session_commands: None,
         });
 
         let jobs = state.job_items(0);
@@ -958,6 +1074,102 @@ mod tests {
         assert_eq!(environment[0].value, path);
         assert_eq!(environment[1].name, "TOKEN");
         assert!(!environment[1].value.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn absent_session_commands_retain_the_previous_generation_list() {
+        let mut state = RuntimeSurfaceState::new();
+        assert!(state.install_snapshot(InteractiveRuntimeSnapshot {
+            generation: 1,
+            session_commands: Some(vec![InteractiveSessionCommand {
+                name: "greet".to_owned(),
+                kind: InteractiveSessionCommandKind::Function,
+            }]),
+            ..InteractiveRuntimeSnapshot::default()
+        }));
+        assert!(!state.install_snapshot(InteractiveRuntimeSnapshot {
+            generation: 2,
+            ..InteractiveRuntimeSnapshot::default()
+        }));
+        assert_eq!(state.session_commands().len(), 1);
+        assert_eq!(state.session_commands()[0].name, "greet");
+
+        // A stale generation is rejected entirely, including its command list.
+        assert!(!state.install_snapshot(InteractiveRuntimeSnapshot {
+            generation: 1,
+            session_commands: Some(Vec::new()),
+            ..InteractiveRuntimeSnapshot::default()
+        }));
+        assert_eq!(state.session_commands().len(), 1);
+
+        assert!(state.install_snapshot(InteractiveRuntimeSnapshot {
+            generation: 3,
+            session_commands: Some(Vec::new()),
+            ..InteractiveRuntimeSnapshot::default()
+        }));
+        assert!(state.session_commands().is_empty());
+    }
+
+    #[test]
+    fn session_commands_drop_inadmissible_names_and_escape_alias_text() {
+        let mut state = RuntimeSurfaceState::new();
+        let long_expansion = format!("\u{1b}[31m{}", "e".repeat(SESSION_COMMAND_TEXT_BYTES_MAX));
+        state.install_snapshot(InteractiveRuntimeSnapshot {
+            generation: 1,
+            session_commands: Some(vec![
+                InteractiveSessionCommand {
+                    name: "ll".to_owned(),
+                    kind: InteractiveSessionCommandKind::Alias {
+                        expansion: long_expansion,
+                    },
+                },
+                InteractiveSessionCommand {
+                    name: "x".repeat(SESSION_COMMAND_NAME_BYTES_MAX + 1),
+                    kind: InteractiveSessionCommandKind::Function,
+                },
+                InteractiveSessionCommand {
+                    name: "has space".to_owned(),
+                    kind: InteractiveSessionCommandKind::Function,
+                },
+                InteractiveSessionCommand {
+                    name: String::new(),
+                    kind: InteractiveSessionCommandKind::Function,
+                },
+            ]),
+            ..InteractiveRuntimeSnapshot::default()
+        });
+
+        let commands = state.session_commands();
+        assert_eq!(commands.len(), 1, "only the admissible name remains");
+        assert_eq!(commands[0].name, "ll");
+        let InteractiveSessionCommandKind::Alias { expansion } = &commands[0].kind else {
+            panic!("alias kind must be preserved");
+        };
+        assert!(expansion.len() <= SESSION_COMMAND_TEXT_BYTES_MAX);
+        assert!(!expansion.contains('\u{1b}'));
+        assert!(
+            state
+                .notice()
+                .is_some_and(|notice| notice.contains("some were not offered"))
+        );
+    }
+
+    #[test]
+    fn session_commands_stop_at_the_entry_bound_with_a_notice() {
+        let mut state = RuntimeSurfaceState::new();
+        let commands = (0..=SESSION_COMMANDS_MAX)
+            .map(|index| InteractiveSessionCommand {
+                name: format!("f{index}"),
+                kind: InteractiveSessionCommandKind::Function,
+            })
+            .collect();
+        state.install_snapshot(InteractiveRuntimeSnapshot {
+            generation: 1,
+            session_commands: Some(commands),
+            ..InteractiveRuntimeSnapshot::default()
+        });
+        assert_eq!(state.session_commands().len(), SESSION_COMMANDS_MAX);
+        assert!(state.notice().is_some());
     }
 
     #[test]
