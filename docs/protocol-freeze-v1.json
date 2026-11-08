@@ -7,7 +7,7 @@
     {"name":"agent.context","owner":"quirl-contract","current_version":"2","oldest_readable":"2","compatibility":"frozen_major","schema_hash":"fnv1a64:df94421d02bc70bb","status":"frozen"},
     {"name":"agent.manifest","owner":"quirl-contract","current_version":"2","oldest_readable":"2","compatibility":"frozen_major","schema_hash":"fnv1a64:913848cdbe3dcd66","status":"frozen"},
     {"name":"catalog","owner":"quirl-catalog","current_version":"4","oldest_readable":"2","compatibility":"migrated_range","schema_hash":"fnv1a64:d4bd0c9abee15fb1","status":"frozen"},
-    {"name":"command_grammar","owner":"quirl-syntax","current_version":"4","oldest_readable":"4","compatibility":"frozen_major","schema_hash":"fnv1a64:77cfd156278de374","status":"posix_native_unix_c2_runner"},
+    {"name":"command_grammar","owner":"quirl-syntax","current_version":"4","oldest_readable":"4","compatibility":"frozen_major","schema_hash":"fnv1a64:e374031d2745570a","status":"posix_native_unix_c2_runner"},
     {"name":"common_abi","owner":"quirl-core","current_version":"2","oldest_readable":"2","compatibility":"frozen_major","schema_hash":"fnv1a64:254f7565de75d691","status":"frozen"},
     {"name":"compatibility_matrix","owner":"quirl-syntax","current_version":"3","oldest_readable":"3","compatibility":"frozen_major","schema_hash":"fnv1a64:10bf6b947ec63476","status":"frozen_disposition"},
     {"name":"completion","owner":"quirl-catalog","current_version":"1","oldest_readable":"1","compatibility":"frozen_major","schema_hash":"fnv1a64:8293d43f3a269ccf","status":"versioned_async_frozen"},
