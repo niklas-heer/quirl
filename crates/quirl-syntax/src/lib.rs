@@ -11,6 +11,16 @@
 use serde::{Deserialize, Serialize};
 use std::{fmt, ops::Range, str::FromStr};
 
+mod program;
+
+pub use program::{
+    ALIAS_EXPANSIONS_MAX, ALIAS_VALUE_BYTES_MAX, AliasLookup, AndOrList, CaseArm, CaseClause,
+    CommandNode, CompoundCommand, CompoundList, ConditionalBranch, ConnectedPipeline, ForClause,
+    FunctionDefinition, IfClause, ListItem, LoopClause, NoAliases, PROGRAM_NESTING_MAX,
+    PipelineNode, Program, ProgramError, is_function_name, is_incomplete, is_reserved_word,
+    is_shell_name, parse_program,
+};
+
 /// Versioned, machine-readable evidence for Quirl's current native compatibility subset and
 /// the frozen 1.0 C1/C2 disposition.
 pub const COMPATIBILITY_MATRIX_JSON: &str = include_str!("../compatibility-v0.1.json");
@@ -195,8 +205,13 @@ enum TokenKind {
     Pipe,
     And,
     Or,
-    Redirect { fd: u8, kind: RedirectKind },
+    Redirect {
+        fd: u8,
+        kind: RedirectKind,
+    },
     Semicolon,
+    /// `;;`, which ends a `case` arm in a compound program.
+    DoubleSemicolon,
     Newline,
     Background,
 }
@@ -310,6 +325,7 @@ fn highlight_tokens(line: &str, tokens: &[Token]) -> Vec<HighlightSpan> {
             | TokenKind::And
             | TokenKind::Or
             | TokenKind::Semicolon
+            | TokenKind::DoubleSemicolon
             | TokenKind::Newline
             | TokenKind::Background => {
                 command_position = true;
@@ -512,6 +528,13 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
                     }
                 });
             }
+            TokenKind::DoubleSemicolon => {
+                return Err(syntax_error(
+                    token,
+                    "`;;` only ends a `case` arm",
+                    "Use a single `;` to separate commands",
+                ));
+            }
             TokenKind::Background => {
                 commands.push(finish_command(
                     &mut words,
@@ -592,13 +615,67 @@ pub struct DialectControlForm {
     /// Whether the form defines a shell function (`name()` or `function`),
     /// which cannot outlive the shell that runs it.
     pub defines_function: bool,
+    /// Why the native grammar leaves this form to a reference shell.
+    pub reason: &'static str,
 }
 
-/// Return the first compound or expansion form that Quirl's native grammar
-/// leaves to a reference shell, such as `for`, `{ ...; }`, `[[`, or `{a,b}`.
-/// Returns `None` for native input and for input that does not tokenize.
+/// Return the first form in `input` that Quirl's native program grammar
+/// leaves to a reference shell, such as `[[`, a subshell, brace expansion, or a
+/// loop used as a pipeline stage. Natively executable control flow such as
+/// `for`, `if`, `case`, and function definitions returns `None`, as does input
+/// that is incomplete or invalid. Aliases are not applied.
+///
+/// [`DialectControlForm::defines_function`] is set when the input also
+/// defines a function anywhere, since that function could not outlive the
+/// reference shell.
 pub fn dialect_control_form(input: &str) -> Option<DialectControlForm> {
-    first_dialect_form(&lex_command(input).ok()?)
+    let Err(ProgramError::Unsupported(mut form)) = parse_program(input, &NoAliases) else {
+        return None;
+    };
+    form.defines_function |= lex_command(input)
+        .ok()
+        .and_then(|tokens| first_dialect_form(&tokens))
+        .is_some_and(|first| first.defines_function)
+        || defines_function_anywhere(input);
+    Some(form)
+}
+
+/// Whether any command-position word in `input` starts a function definition.
+fn defines_function_anywhere(input: &str) -> bool {
+    let Ok(tokens) = lex_command(input) else {
+        return false;
+    };
+    let mut command_position = true;
+    let mut previous_function_name = false;
+    for token in &tokens {
+        match &token.kind {
+            TokenKind::Word(word) => {
+                let text = word.text();
+                if previous_function_name && text == "()" {
+                    return true;
+                }
+                if command_position
+                    && (text == "function"
+                        || text
+                            .strip_suffix("()")
+                            .is_some_and(program::is_function_name))
+                {
+                    return true;
+                }
+                previous_function_name = command_position && program::is_function_name(&text);
+                command_position = is_reserved_word(&text) && text != "in";
+            }
+            TokenKind::Redirect { .. } => {
+                previous_function_name = false;
+                command_position = false;
+            }
+            _ => {
+                previous_function_name = false;
+                command_position = true;
+            }
+        }
+    }
+    false
 }
 
 /// Keep the native grammar deliberately unambiguous: compound dialect syntax cannot silently
@@ -627,6 +704,7 @@ fn first_dialect_form(tokens: &[Token]) -> Option<DialectControlForm> {
                 start: token.start,
                 end: token.end,
                 defines_function: false,
+                reason: "brace expansion is Bash and Zsh syntax",
             });
         }
         if redirect_target {
@@ -639,6 +717,7 @@ fn first_dialect_form(tokens: &[Token]) -> Option<DialectControlForm> {
             | TokenKind::And
             | TokenKind::Or
             | TokenKind::Semicolon
+            | TokenKind::DoubleSemicolon
             | TokenKind::Newline
             | TokenKind::Background => command_position = true,
             TokenKind::Word(word) => {
@@ -665,6 +744,7 @@ fn first_dialect_form(tokens: &[Token]) -> Option<DialectControlForm> {
                         start: token.start,
                         end: token.end,
                         defines_function,
+                        reason: "compound commands need the compound program grammar",
                     });
                 }
                 command_position = false;
@@ -980,6 +1060,15 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
             quote_open = Some(index);
             continue;
         }
+        // A `#` that begins a word starts a comment that runs to the end of
+        // the physical line, as in POSIX `sh` and interactive Bash. The line
+        // feed itself still separates commands.
+        if character == '#' && word_start.is_none() && fragment.is_empty() && parts.is_empty() {
+            while characters.peek().is_some_and(|(_, next)| *next != '\n') {
+                characters.next();
+            }
+            continue;
+        }
         if character.is_whitespace() {
             push_word(
                 &mut tokens,
@@ -1025,6 +1114,10 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
                 Some((TokenKind::And, 2))
             }
             '&' => Some((TokenKind::Background, 1)),
+            ';' if characters.peek().is_some_and(|(_, next)| *next == ';') => {
+                characters.next();
+                Some((TokenKind::DoubleSemicolon, 2))
+            }
             ';' => Some((TokenKind::Semicolon, 1)),
             '<' if characters.peek().is_some_and(|(_, next)| *next == '(') => {
                 return Err(CommandSyntaxError {
@@ -1599,14 +1692,14 @@ mod tests {
     }
 
     #[test]
-    fn carriage_returns_and_hash_words_keep_their_existing_quote_semantics() {
+    fn carriage_returns_and_hash_words_keep_quote_semantics_and_comments_end_lines() {
         let graph =
-            parse_command_list("printf a\\\r\nprintf '#quoted' word#suffix #literal\n").unwrap();
+            parse_command_list("printf a\\\r\nprintf '#quoted' word#suffix #comment\n").unwrap();
         assert_eq!(graph.pipelines.len(), 2);
         assert_eq!(graph.pipelines[0].commands[0].words, ["printf", "a\r"]);
         assert_eq!(
             graph.pipelines[1].commands[0].words,
-            ["printf", "#quoted", "word#suffix", "#literal"]
+            ["printf", "#quoted", "word#suffix"]
         );
     }
 
@@ -1854,24 +1947,38 @@ mod tests {
     }
 
     #[test]
-    fn dialect_control_forms_are_reported_with_function_definitions_marked() {
-        let form = dialect_control_form("cd /tmp && for f in *; do echo $f; done").unwrap();
-        assert_eq!(form.text, "for");
+    fn only_forms_outside_the_native_program_grammar_are_dialect_forms() {
+        for native in [
+            "cd /tmp && for f in *; do echo $f; done",
+            "greet() { echo hi; }",
+            "function greet { echo hi; }",
+            "if true; then echo yes; fi",
+            "echo for '{a,b}' ${HOME}",
+            "echo 'unclosed",
+        ] {
+            assert_eq!(dialect_control_form(native), None, "{native}");
+        }
+        let form = dialect_control_form("{ echo a; } > out").unwrap();
+        assert_eq!(form.text, ">");
         assert!(!form.defines_function);
-        assert_eq!(dialect_control_form("{ echo a; } > out").unwrap().text, "{");
+        assert!(form.reason.contains("subshell"));
         assert_eq!(dialect_control_form("echo {a,b}").unwrap().text, "{a,b}");
+        assert_eq!(dialect_control_form("[[ -n x ]]").unwrap().text, "[[");
         assert!(
-            dialect_control_form("greet() { echo hi; }")
+            dialect_control_form("greet() { echo hi; }; [[ -n x ]]")
                 .unwrap()
                 .defines_function
         );
         assert!(
-            dialect_control_form("function greet { echo hi; }")
+            dialect_control_form("[[ -n x ]] && function greet { echo hi; }")
                 .unwrap()
                 .defines_function
         );
-        assert_eq!(dialect_control_form("echo for '{a,b}' ${HOME}"), None);
-        assert_eq!(dialect_control_form("echo 'unclosed"), None);
+        assert!(
+            !dialect_control_form("echo greet; [[ -n x ]]")
+                .unwrap()
+                .defines_function
+        );
     }
 
     #[test]

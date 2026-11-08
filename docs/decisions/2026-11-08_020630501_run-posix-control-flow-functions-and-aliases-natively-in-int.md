@@ -1,0 +1,108 @@
++++
+schema_version = 1
+id = "01M6WEGFK5C8F7D3B4KZ3FEMMH"
+title = "Run POSIX control flow, functions, and aliases natively in interactive sessions"
+date = "2026-11-08"
+status = "accepted"
+tags = ["compatibility", "grammar", "process", "interactive", "performance"]
+supersedes = []
+superseded_by = []
+depends_on = []
+related_to = ["01M2XHZ6Y69RDWA9BNV5SMG7Y8", "01M42KGFQXE3Q6FB1DY16BMBYW"]
++++
+
+## Decision
+
+Interactive Normal mode executes a bounded POSIX `sh` subset of compound
+syntax natively, in the session's own executor, instead of handing the line to
+an implicit `/bin/sh` island:
+
+- `if`/`elif`/`else`/`fi`, `for NAME [in WORD...]`, `while`, `until`,
+  `case WORD in PATTERN[|PATTERN]) LIST ;; esac`, `{ LIST; }` groups, and `#`
+  comments.
+- Function definitions, both `name() COMPOUND` and `function name COMPOUND`,
+  persist for the session. Calls set positional parameters (`$1`..`$9`,
+  `${N}`, `$#`, `$@`, `$*`); `local`, `return`, and `shift` work inside them.
+- `alias NAME=VALUE`, `alias`, `alias NAME`, and `unalias [-a] NAME` manage
+  session aliases, expanded at command position before parsing, as POSIX
+  specifies (a value ending in a blank also checks the next word; an alias is
+  never re-expanded inside its own expansion).
+- `break [N]`, `continue [N]`, `true`, `false`, `:`, `test`, `[`, and `echo`
+  run in-process. `echo` follows Bash (`-n`, `-e`, `-E`).
+- Unquoted parameter expansions and command substitutions undergo POSIX field
+  splitting on `IFS` (default space, tab, newline) in every native context, so
+  `for f in $(git ls-files)` and `ls $FLAGS` behave as in `sh` and Bash. This
+  replaces the earlier native behavior of never splitting fields.
+- `$XDG_CONFIG_HOME/quirl/init.qrl` (default `~/.config/quirl/init.qrl`), when
+  present, runs natively at interactive startup so aliases and functions can be
+  configured in shell syntax next to the Lua configuration.
+
+Forms outside the native subset keep today's behavior and run in the implicit
+`/bin/sh` island: here-documents, `[[`, `((`, `select`, subshells `( ... )`,
+brace expansion, process substitution, and compound commands used as pipeline
+stages or with redirections. A line that defines a function and also needs the
+island is still rejected with the existing diagnostic, because the function
+could not outlive the island.
+
+`quirl -c`, scripts on standard input, `eval`, and `source` are unchanged: they
+remain exact `/bin/sh` invocations as recorded in the POSIX invocation
+decision. Native semantics target POSIX `sh`, so a line that ran through the
+island before produces the same output natively, with two intended
+differences: unexported variables assigned in a loop now persist in the
+session, and functions persist.
+
+Bounds, enforced where work enters the executor and failing with
+`ResourceLimit`: compound nesting depth 64 at parse time; function call depth
+256; 1,024 functions and 1,024 aliases per session, each definition at most
+64 KiB; alias expansion of at most 64 substitutions per line and the existing
+source-byte limit after expansion. Loops have no iteration limit, but every
+iteration checks for an interrupt so Ctrl-C stops a loop that never spawns a
+process, and a child terminated by `SIGINT` ends the enclosing compound
+command as it does in Bash.
+
+## Context
+
+ADR 0010 froze loops, functions, and conditionals as reference-shell islands
+for 1.0 to avoid open-ended, partially faithful Bash/Zsh emulation. In daily
+use that boundary had real costs: functions and aliases, which nearly every
+user carries over, could not exist at all; every loop and conditional forked
+`/bin/sh` and lost unexported state; a loop body forked one process per
+`[`, `echo`, `true`, or `:` call, which made loops orders of magnitude slower
+than in any other shell; and the island's semantics depend on what `/bin/sh` is
+(Bash on macOS, Dash on Debian).
+
+The original concern still holds, so this decision narrows rather than drops
+it. The native subset is POSIX `sh`, a single, specified, stable dialect, not
+"Bash or Zsh". It is verified by differential tests against a reference `sh`
+and Bash. Anything outside it keeps falling back to the island instead of being
+approximated, so no input is silently reinterpreted.
+
+Alternatives considered:
+
+- Keep islands and add only aliases. Rejected: it leaves functions impossible
+  and loops slow, which were the most visible gaps.
+- Emulate Bash, including `[[`, arrays, and brace expansion. Rejected for now:
+  it reopens the unbounded-emulation problem ADR 0010 described. `[[` and brace
+  expansion can be added later as separately decided native forms.
+- Define a new Quirl-native control syntax. Rejected: users paste POSIX shell
+  code, and typed, structured scripting already belongs to data mode and Lua.
+
+This decision amends the compatibility boundary of ADR 0010 and the
+interactive-control-line clause of the POSIX invocation decision; their other
+clauses (Unix-first support, non-interactive `/bin/sh` invocation) still apply.
+
+## Consequences
+
+- The command grammar protocol advances to version 4, with a compound program
+  representation alongside the existing `CommandList`. Consumers that only
+  need simple commands keep using `parse_command_list`.
+- Loops and conditionals over builtins run without spawning processes, and
+  native control flow no longer forks `/bin/sh`.
+- Field splitting changes the arguments of existing simple commands that use
+  unquoted expansions containing whitespace. This matches `sh` and Bash, and
+  differs from Zsh's default; quoting restores a single field.
+- Functions and aliases become session state that completion, highlighting,
+  `type`-style inspection, and the catalog must account for.
+- The compatibility matrix and differential fixtures gain the native subset;
+  any divergence from the reference `sh` found later is a defect, not a
+  documented limitation.
