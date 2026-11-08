@@ -122,7 +122,9 @@ impl PipelineNode {
             .iter()
             .map(|command| match command {
                 CommandNode::Simple(simple) => Some(simple),
-                CommandNode::Compound(_) | CommandNode::FunctionDefinition(_) => None,
+                CommandNode::Compound(_)
+                | CommandNode::RedirectedCompound(_)
+                | CommandNode::FunctionDefinition(_) => None,
             })
             .collect()
     }
@@ -136,8 +138,21 @@ pub enum CommandNode {
     Simple(SimpleCommand),
     /// A control-flow construct or brace group.
     Compound(CompoundCommand),
+    /// A compound command whose output is redirected, as in `done > file`.
+    RedirectedCompound(RedirectedCompound),
     /// A function definition, which records the body without running it.
     FunctionDefinition(FunctionDefinition),
+}
+
+/// A compound command with output redirections that apply to its whole body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedirectedCompound {
+    /// The redirected command.
+    pub command: CompoundCommand,
+    /// Output redirections in source order: `>`, `>>`, on descriptors 1 and
+    /// 2, and `2>&1`. Never empty.
+    pub redirects: Vec<Redirect>,
 }
 
 /// Compound commands executed natively.
@@ -624,8 +639,15 @@ impl Parser<'_> {
             return match keyword {
                 "if" | "for" | "while" | "until" | "case" | "{" => {
                     let compound = self.compound_command()?;
-                    self.reject_compound_redirect()?;
-                    Ok(CommandNode::Compound(compound))
+                    let redirects = self.compound_output_redirects()?;
+                    if redirects.is_empty() {
+                        Ok(CommandNode::Compound(compound))
+                    } else {
+                        Ok(CommandNode::RedirectedCompound(RedirectedCompound {
+                            command: compound,
+                            redirects,
+                        }))
+                    }
                 }
                 "function" => self.function_keyword_definition(),
                 other => Err(ProgramError::Syntax(syntax_error(
@@ -653,6 +675,31 @@ impl Parser<'_> {
             }
         }
         self.simple_command().map(CommandNode::Simple)
+    }
+
+    /// Parse output redirections after a compound command: `>`, `>>`, `2>`,
+    /// `2>>`, and `2>&1`. Input redirections share one file offset across
+    /// the whole body, which needs a subshell, so they stay unsupported.
+    fn compound_output_redirects(&mut self) -> Result<Vec<Redirect>, ProgramError> {
+        let mut redirects = Vec::new();
+        while let Some(token) = self.peek().cloned() {
+            let TokenKind::Redirect { fd, kind } = token.kind else {
+                break;
+            };
+            if !matches!(
+                kind,
+                RedirectKind::Output | RedirectKind::Append | RedirectKind::DuplicateOutput
+            ) {
+                return Err(ProgramError::Unsupported(unsupported(
+                    &token,
+                    self.input.get(token.start..token.end).unwrap_or_default(),
+                    "input redirection of a compound command needs a subshell",
+                )));
+            }
+            self.position = self.position.saturating_add(1);
+            redirects.push(self.redirect_target(&token, fd, kind)?);
+        }
+        Ok(redirects)
     }
 
     fn reject_compound_redirect(&self) -> Result<(), ProgramError> {
@@ -1169,11 +1216,12 @@ impl Parser<'_> {
             )));
         };
         if kind == RedirectKind::DuplicateInput
-            || (kind == RedirectKind::DuplicateOutput && (fd != 2 || target.text() != "1"))
+            || (kind == RedirectKind::DuplicateOutput
+                && !crate::is_standard_duplication(fd, &target.text()))
         {
             return Err(ProgramError::Syntax(syntax_error(
                 token,
-                "native C1 supports only `2>&1` descriptor duplication",
+                "native C1 supports only `2>&1` and `>&2` descriptor duplication",
                 "Use `bash { ... }` or `zsh { ... }` for this descriptor graph",
             )));
         }
@@ -1666,7 +1714,7 @@ mod tests {
             ("echo {a,b}", "{a,b}"),
             ("for f in {1..3}; do echo $f; done", "{1..3}"),
             ("printf a | while true; do break; done", "|"),
-            ("for x in a; do echo $x; done > out", ">"),
+            ("for x in a; do echo $x; done < in", "<"),
             ("while read line; do echo $line; done", "read"),
             ("true && false &", "&"),
             ("select x in a; do break; done", "select"),
@@ -1793,6 +1841,25 @@ mod tests {
         let json = serde_json::to_string(&program).unwrap();
         let decoded: Program = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, program);
+    }
+
+    #[test]
+    fn compound_commands_accept_output_redirections() {
+        let program = parse("for x in a; do echo $x; done > out 2>&1; { echo a; } >> log");
+        let CommandNode::RedirectedCompound(redirected) =
+            &program.body.items[0].and_or.first.commands[0]
+        else {
+            panic!("not redirected");
+        };
+        assert!(matches!(redirected.command, CompoundCommand::For(_)));
+        assert_eq!(redirected.redirects.len(), 2);
+        assert_eq!(redirected.redirects[0].path, "out");
+        assert_eq!(redirected.redirects[1].kind, RedirectKind::DuplicateOutput);
+        assert!(matches!(
+            program.body.items[1].and_or.first.commands[0],
+            CommandNode::RedirectedCompound(_)
+        ));
+        assert!(!program.is_simple());
     }
 
     #[test]

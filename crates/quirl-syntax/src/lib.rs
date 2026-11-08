@@ -17,8 +17,8 @@ pub use program::{
     ALIAS_EXPANSIONS_MAX, ALIAS_VALUE_BYTES_MAX, AliasLookup, AndOrList, CaseArm, CaseClause,
     CommandNode, CompoundCommand, CompoundList, ConditionalBranch, ConnectedPipeline, ForClause,
     FunctionDefinition, IfClause, ListItem, LoopClause, NoAliases, PROGRAM_NESTING_MAX,
-    PipelineNode, Program, ProgramError, is_function_name, is_incomplete, is_reserved_word,
-    is_shell_name, parse_program,
+    PipelineNode, Program, ProgramError, RedirectedCompound, is_function_name, is_incomplete,
+    is_reserved_word, is_shell_name, parse_program,
 };
 
 /// Versioned, machine-readable evidence for Quirl's current native compatibility subset and
@@ -33,7 +33,7 @@ pub const COMPATIBILITY_MATRIX_SCHEMA_VERSION: u32 = 3;
 /// Any change to serialized shapes, token semantics, supported expansions, or
 /// the referenced compatibility matrix must update this descriptor and the
 /// corresponding protocol version.
-pub const GRAMMAR_SCHEMA_DESCRIPTOR: &str = "quirl.command-grammar@4{CommandList{deny_unknown;pipelines:array<Pipeline>;connectors:array<and|or|sequence>;invariant:connectors.len+1=pipelines.len};Pipeline{deny_unknown;commands:array<SimpleCommand>;background:bool};SimpleCommand{deny_unknown;words:nonempty-array<string>;word_ir:array<Word>;redirects:array<Redirect>};Word{deny_unknown;parts:nonempty-array<WordPart>};WordPart{deny_unknown;text:string;quoting:unquoted|single|double|escaped};Redirect{deny_unknown;fd:u8;kind:input|output|append|here_string|duplicate_input|duplicate_output;path:string;target:Word};Program{deny_unknown;body:CompoundList};CompoundList{deny_unknown;items:array<ListItem>};ListItem{deny_unknown;and_or:AndOrList;background:bool};AndOrList{deny_unknown;first:PipelineNode;rest:array<ConnectedPipeline>};ConnectedPipeline{deny_unknown;connector:and|or;pipeline:PipelineNode};PipelineNode{deny_unknown;negated:bool;commands:nonempty-array<CommandNode>};CommandNode:simple(SimpleCommand)|compound(CompoundCommand)|function_definition(FunctionDefinition);CompoundCommand:brace_group(CompoundList)|if(IfClause)|for(ForClause)|while(LoopClause)|until(LoopClause)|case(CaseClause);IfClause{deny_unknown;branches:array<ConditionalBranch>;else_body:null|CompoundList};ConditionalBranch{deny_unknown;condition:CompoundList;body:CompoundList};ForClause{deny_unknown;variable:string;words:null|array<Word>;body:CompoundList};LoopClause{deny_unknown;condition:CompoundList;body:CompoundList};CaseClause{deny_unknown;subject:Word;arms:array<CaseArm>};CaseArm{deny_unknown;patterns:nonempty-array<Word>;body:CompoundList};FunctionDefinition{deny_unknown;name:string;body:CompoundCommand;source:string};tokens:word|pipe|and|or|semicolon|double_semicolon|newline|input|output|append|here_string|fd_duplicate|background;comments:hash-at-word-start-to-LF;lines:unquoted-LF-sequences|leading-blank-trailing-LF-ignored|LF-after-pipe-and-or-continues|backslash-LF-removed|quoted-LF-literal|unquoted-CR-whitespace|backslash-CRLF-keeps-escaped-CR-then-separates;expansion:parameter|positional|special|arithmetic|command|pathname|field-splitting;aliases:posix-command-position;compatibility_matrix:quirl-syntax/compatibility-v0.1.json@schema3}";
+pub const GRAMMAR_SCHEMA_DESCRIPTOR: &str = "quirl.command-grammar@4{CommandList{deny_unknown;pipelines:array<Pipeline>;connectors:array<and|or|sequence>;invariant:connectors.len+1=pipelines.len};Pipeline{deny_unknown;commands:array<SimpleCommand>;background:bool};SimpleCommand{deny_unknown;words:nonempty-array<string>;word_ir:array<Word>;redirects:array<Redirect>};Word{deny_unknown;parts:nonempty-array<WordPart>};WordPart{deny_unknown;text:string;quoting:unquoted|single|double|escaped};Redirect{deny_unknown;fd:u8;kind:input|output|append|here_string|duplicate_input|duplicate_output;path:string;target:Word};Program{deny_unknown;body:CompoundList};CompoundList{deny_unknown;items:array<ListItem>};ListItem{deny_unknown;and_or:AndOrList;background:bool};AndOrList{deny_unknown;first:PipelineNode;rest:array<ConnectedPipeline>};ConnectedPipeline{deny_unknown;connector:and|or;pipeline:PipelineNode};PipelineNode{deny_unknown;negated:bool;commands:nonempty-array<CommandNode>};CommandNode:simple(SimpleCommand)|compound(CompoundCommand)|redirected_compound(RedirectedCompound)|function_definition(FunctionDefinition);RedirectedCompound{deny_unknown;command:CompoundCommand;redirects:nonempty-array<Redirect>};CompoundCommand:brace_group(CompoundList)|if(IfClause)|for(ForClause)|while(LoopClause)|until(LoopClause)|case(CaseClause);IfClause{deny_unknown;branches:array<ConditionalBranch>;else_body:null|CompoundList};ConditionalBranch{deny_unknown;condition:CompoundList;body:CompoundList};ForClause{deny_unknown;variable:string;words:null|array<Word>;body:CompoundList};LoopClause{deny_unknown;condition:CompoundList;body:CompoundList};CaseClause{deny_unknown;subject:Word;arms:array<CaseArm>};CaseArm{deny_unknown;patterns:nonempty-array<Word>;body:CompoundList};FunctionDefinition{deny_unknown;name:string;body:CompoundCommand;source:string};tokens:word|pipe|and|or|semicolon|double_semicolon|newline|input|output|append|here_string|fd_duplicate|background;comments:hash-at-word-start-to-LF;lines:unquoted-LF-sequences|leading-blank-trailing-LF-ignored|LF-after-pipe-and-or-continues|backslash-LF-removed|quoted-LF-literal|unquoted-CR-whitespace|backslash-CRLF-keeps-escaped-CR-then-separates;expansion:parameter|positional|special|arithmetic|command|pathname|field-splitting;aliases:posix-command-position;compatibility_matrix:quirl-syntax/compatibility-v0.1.json@schema3}";
 
 const MAX_COMMAND_SUBSTITUTION_DEPTH: usize = 64;
 
@@ -170,7 +170,7 @@ pub enum RedirectKind {
     HereString,
     /// Duplicate an input descriptor (`<&`); reserved by the IR but rejected in native C1.
     DuplicateInput,
-    /// Duplicate an output descriptor (`>&`); native C1 accepts only `2>&1`.
+    /// Duplicate an output descriptor (`>&`); native C1 accepts `2>&1` and `>&2`.
     DuplicateOutput,
 }
 
@@ -584,11 +584,11 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
                 };
                 if *kind == RedirectKind::DuplicateInput
                     || (*kind == RedirectKind::DuplicateOutput
-                        && (*fd != 2 || target.text() != "1"))
+                        && !is_standard_duplication(*fd, &target.text()))
                 {
                     return Err(syntax_error(
                         token,
-                        "native C1 supports only `2>&1` descriptor duplication",
+                        "native C1 supports only `2>&1` and `>&2` descriptor duplication",
                         "Use `bash { ... }` or `zsh { ... }` for this descriptor graph",
                     ));
                 }
@@ -1235,6 +1235,12 @@ fn rebase_diagnostic(mut diagnostic: CommandSyntaxError, base: usize) -> Command
     diagnostic.start = diagnostic.start.saturating_add(base);
     diagnostic.end = diagnostic.end.saturating_add(base);
     diagnostic
+}
+
+/// Whether `fd>&target` is one of the two native duplications: `2>&1`
+/// (standard error to standard output) or `1>&2` (the reverse).
+fn is_standard_duplication(fd: u8, target: &str) -> bool {
+    matches!((fd, target), (2, "1") | (1, "2"))
 }
 
 fn finish_command(
@@ -2665,8 +2671,9 @@ mod tests {
         ] {
             assert_eq!(dialect_control_form(native), None, "{native}");
         }
-        let form = dialect_control_form("{ echo a; } > out").unwrap();
-        assert_eq!(form.text, ">");
+        assert_eq!(dialect_control_form("{ echo a; } > out"), None);
+        let form = dialect_control_form("{ echo a; } < in").unwrap();
+        assert_eq!(form.text, "<");
         assert!(!form.defines_function);
         assert!(form.reason.contains("subshell"));
         assert_eq!(dialect_control_form("echo {a,b}").unwrap().text, "{a,b}");
@@ -2697,7 +2704,7 @@ mod tests {
                 .iter()
                 .all(|part| part.quoting == Quoting::Double)
         );
-        for source in ["echo nope 3> output", "echo nope 1>&2", "cat 0<&1"] {
+        for source in ["echo nope 3> output", "echo nope 1>&3", "cat 0<&1"] {
             let error = parse_command_list(source).unwrap_err();
             assert!(error.help.contains("bash { ... }"));
         }

@@ -27,8 +27,8 @@ use super::{
 use quirl_core::{CommandOutcome, ErrorCode, ShellError};
 use quirl_syntax::{
     CaseClause, CommandNode, CompoundCommand, CompoundList, ForClause, FunctionDefinition,
-    IfClause, ListConnector, LoopClause, Pipeline, PipelineNode, Program, Quoting, SimpleCommand,
-    Word,
+    IfClause, ListConnector, LoopClause, Pipeline, PipelineNode, Program, Quoting, Redirect,
+    RedirectKind, RedirectedCompound, SimpleCommand, Word, WordPart,
 };
 use std::{ffi::OsString, sync::Arc, sync::atomic::Ordering};
 
@@ -201,6 +201,9 @@ impl NativeExecutor {
     ) -> Result<Flow, ShellError> {
         let flow = match node.commands.as_slice() {
             [CommandNode::Compound(compound)] => self.run_compound(compound, context)?,
+            [CommandNode::RedirectedCompound(redirected)] => {
+                self.run_redirected_compound(redirected, context)?
+            }
             [CommandNode::FunctionDefinition(definition)] => {
                 self.define_function(definition)?;
                 context.status = 0;
@@ -216,7 +219,15 @@ impl NativeExecutor {
                         )
                         .with_help("Run the pipeline in `bash { ... }` or `zsh { ... }`"));
                     };
-                    simple.push(command.clone());
+                    let mut command = command.clone();
+                    if !self.inherited_redirects.is_empty() {
+                        // Outer redirections apply first, as the shell's own
+                        // descriptors would, so the command's own come after.
+                        command
+                            .redirects
+                            .splice(0..0, self.inherited_redirects.iter().cloned());
+                    }
+                    simple.push(command);
                 }
                 let pipeline = Pipeline {
                     commands: simple,
@@ -242,6 +253,76 @@ impl NativeExecutor {
             context.status = i32::from(context.status == 0);
         }
         Ok(flow)
+    }
+
+    /// Run a compound command whose output is redirected. Each target is
+    /// opened once, truncating for `>`, and every command in the body then
+    /// appends to it, so output streams exactly as through one descriptor.
+    /// Only regular files and character devices qualify: reopening a FIFO or
+    /// socket per command would not behave like one shared descriptor.
+    fn run_redirected_compound(
+        &mut self,
+        redirected: &RedirectedCompound,
+        context: &mut RunContext<'_, '_, '_, '_>,
+    ) -> Result<Flow, ShellError> {
+        let mut inherited = Vec::with_capacity(redirected.redirects.len());
+        for redirect in &redirected.redirects {
+            if redirect.kind == RedirectKind::DuplicateOutput {
+                inherited.push(redirect.clone());
+                continue;
+            }
+            let path = self.expand_single_word(&redirect.target, context)?;
+            let absolute = std::env::current_dir()
+                .map_err(|error| {
+                    ShellError::new(ErrorCode::Io, "could not resolve the redirection path")
+                        .with_context(error.to_string())
+                        .with_help("Enter an existing directory and retry")
+                })?
+                .join(&path);
+            let absolute = absolute.to_str().map(str::to_owned).ok_or_else(|| {
+                ShellError::new(
+                    ErrorCode::InvalidArgument,
+                    "the redirection path is not valid UTF-8",
+                )
+                .with_help("Redirect to a path with a UTF-8 name")
+            })?;
+            let opened = Redirect {
+                fd: redirect.fd,
+                kind: redirect.kind,
+                path: absolute.clone(),
+                target: literal_word(&absolute),
+            };
+            let file = super::open_redirected_output(&opened, context.request)?;
+            let file_type = file
+                .metadata()
+                .map_err(|error| {
+                    ShellError::new(ErrorCode::Io, "could not inspect the redirection target")
+                        .with_context(error.to_string())
+                        .with_help("Redirect to a regular file")
+                })?
+                .file_type();
+            let shareable =
+                file_type.is_file() || std::os::unix::fs::FileTypeExt::is_char_device(&file_type);
+            if !shareable {
+                return Err(ShellError::new(
+                    ErrorCode::InvalidCommand,
+                    "a compound command can only redirect to a file or device natively",
+                )
+                .with_context(format!("target {path}"))
+                .with_help(
+                    "Run the command in `bash { ... }` to redirect it to a pipe or socket",
+                ));
+            }
+            inherited.push(Redirect {
+                kind: RedirectKind::Append,
+                ..opened
+            });
+        }
+        let depth = self.inherited_redirects.len();
+        self.inherited_redirects.extend(inherited);
+        let result = self.run_compound(&redirected.command, context);
+        self.inherited_redirects.truncate(depth);
+        result
     }
 
     fn run_compound(
@@ -914,6 +995,16 @@ impl NativeExecutor {
     }
 }
 
+/// A word that expands to exactly `text`.
+fn literal_word(text: &str) -> Word {
+    Word {
+        parts: vec![WordPart {
+            text: text.to_owned(),
+            quoting: Quoting::Single,
+        }],
+    }
+}
+
 enum LoopStep {
     Continue,
     Exit(Flow),
@@ -1399,6 +1490,48 @@ mod tests {
         assert_eq!(run(&mut executor, program).1, "a\nb\nHI\n2\n");
         let error = executor.execute_capture("echo x | lines").unwrap_err();
         assert!(error.message.contains("first stage"));
+    }
+
+    #[test]
+    fn redirected_compound_commands_stream_every_command_to_one_file() {
+        let directory =
+            std::env::temp_dir().join(format!("quirl-compound-redirect-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("out.txt");
+        std::fs::write(&path, "stale\n").unwrap();
+        let program = format!(
+            "for i in 1 2; do echo line$i; printf 'err%s\\n' $i >&2; /bin/echo ext$i; done > '{0}' 2>&1; {{ echo more; }} >> '{0}'; printf done",
+            path.display()
+        );
+        assert_eq!(stdout(&program), "done");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "line1\nerr1\next1\nline2\nerr2\next2\nmore\n"
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn stdout_duplicated_to_stderr_reaches_stderr_for_builtins_and_programs() {
+        let (status, out, err) = run(
+            &mut NativeExecutor::default(),
+            "echo one >&2; /bin/echo two >&2; printf three 1>&2; die() { echo \"fatal: $1\" >&2; return 3; }; die four",
+        );
+        assert_eq!(status, 3);
+        assert_eq!(out, "");
+        assert_eq!(err, "one\ntwo\nthreefatal: four\n");
+        let error = NativeExecutor::default()
+            .execute_capture("/bin/echo x >&2 2>/dev/null")
+            .unwrap_err();
+        assert!(error.message.contains("`>&2`"));
+        let path = std::env::temp_dir().join(format!("quirl-dup-override-{}", std::process::id()));
+        let (_, _, err) = run(
+            &mut NativeExecutor::default(),
+            &format!("/bin/echo kept >&2 > '{}'", path.display()),
+        );
+        assert_eq!(err, "", "a later file redirection overrides `>&2`");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept\n");
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

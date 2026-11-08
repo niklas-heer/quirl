@@ -1183,6 +1183,7 @@ fn validate_native_program(program: &quirl_syntax::Program) -> Result<(), quirl_
                         continue;
                     }
                     CommandNode::Compound(compound) => compound,
+                    CommandNode::RedirectedCompound(redirected) => &redirected.command,
                     CommandNode::FunctionDefinition(definition) => &definition.body,
                 };
                 match compound {
@@ -1783,6 +1784,9 @@ mod platform {
         /// Output of an in-process first pipeline stage, fed to the next
         /// spawned pipeline's first stage as standard input.
         pending_stdin: Option<Vec<u8>>,
+        /// Output redirections of the enclosing redirected compound commands,
+        /// outermost first, applied before each command's own.
+        inherited_redirects: Vec<quirl_syntax::Redirect>,
         #[cfg(test)]
         fail_stopped_terminal_mode_read: bool,
     }
@@ -2273,6 +2277,7 @@ mod platform {
                 pending_flow: None,
                 interrupt: None,
                 pending_stdin: None,
+                inherited_redirects: Vec::new(),
                 #[cfg(test)]
                 fail_stopped_terminal_mode_read: false,
             }
@@ -3340,12 +3345,19 @@ mod platform {
                     }
                     self.substitution_stderr
                         .push_str(stderr.get(..end).unwrap_or_default());
+                    // The nested capture already stops at the default
+                    // retained-output limit; this keeps the bound explicit.
                     let stdout = nested.stdout.unwrap_or_default();
-                    if stdout.len() > limit {
-                        return Err(expansion_error(
+                    if stdout.len() > DEFAULT_CAPTURE_BYTES {
+                        return Err(ShellError::new(
+                            ErrorCode::ResourceLimit,
                             "command substitution exceeded its output budget",
-                            "Write large output to a file before substituting it",
-                        ));
+                        )
+                        .with_context(format!(
+                            "limit {DEFAULT_CAPTURE_BYTES} bytes; observed {} bytes",
+                            stdout.len()
+                        ))
+                        .with_help("Write large output to a file before substituting it"));
                     }
                     budget.append(output, stdout.trim_end_matches('\n'))?;
                     record_splittable(marks.as_deref_mut(), quoted, expansion_start, output.len());
@@ -3811,6 +3823,11 @@ mod platform {
                 } else {
                     stderr_stdio(command, capture_streams, request)?
                 };
+                let (stdout, stderr, own_stderr_reader) = if stdout_duplicates_stderr(command)? {
+                    stdout_into_stderr(command, capture_streams, request)?
+                } else {
+                    (stdout, stderr, None)
+                };
                 process.stdin(input.stdio).stdout(stdout).stderr(stderr);
                 process.process_group(spawned.process_group.unwrap_or(0));
                 let mut child = crate::spawn_serialized(&mut process).map_err(|error| {
@@ -3829,6 +3846,15 @@ mod platform {
                     spawned.push(child)?;
                 }
                 if let Some(stderr) = child_stderr {
+                    stderr_readers.push(spawn_reader_with_budget(
+                        stderr,
+                        Arc::clone(&stderr_budget),
+                        output_sender
+                            .clone()
+                            .map(|sender| (sender, OutputStream::Stderr)),
+                    )?);
+                }
+                if let Some(stderr) = own_stderr_reader {
                     stderr_readers.push(spawn_reader_with_budget(
                         stderr,
                         Arc::clone(&stderr_budget),
@@ -4821,6 +4847,101 @@ mod platform {
         })
     }
 
+    /// Whether standard output must follow standard error's target because
+    /// of a `>&2` redirection.
+    ///
+    /// Redirections apply left to right, and inherited ones from an
+    /// enclosing compound command come first. Simulating them gives the final
+    /// targets of descriptors 1 and 2. When both end at standard error's
+    /// target (the terminal's stderr or a `2>` file), the stage needs the
+    /// `>&2` wiring. When `>&2` is overridden by a later `>` file, or both end
+    /// at standard output's target through `2>&1`, the ordinary wiring already
+    /// produces the right result. Any other order is rejected, not
+    /// approximated.
+    fn stdout_duplicates_stderr(command: &SimpleCommand) -> Result<bool, ShellError> {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Target {
+            Stdout,
+            Stderr,
+            File { descriptor: u8, index: usize },
+        }
+        let mut stdout = Target::Stdout;
+        let mut stderr = Target::Stderr;
+        let mut duplicated = false;
+        for (index, redirect) in command.redirects.iter().enumerate() {
+            match (redirect.fd, redirect.kind) {
+                (descriptor @ 1, RedirectKind::Output | RedirectKind::Append) => {
+                    stdout = Target::File { descriptor, index };
+                }
+                (descriptor @ 2, RedirectKind::Output | RedirectKind::Append) => {
+                    stderr = Target::File { descriptor, index };
+                }
+                (2, RedirectKind::DuplicateOutput) => stderr = stdout,
+                (1, RedirectKind::DuplicateOutput) => {
+                    stdout = stderr;
+                    duplicated = true;
+                }
+                _ => {}
+            }
+        }
+        if !duplicated {
+            return Ok(false);
+        }
+        let follows_stderr = matches!(stderr, Target::Stderr | Target::File { descriptor: 2, .. });
+        if stdout == stderr {
+            return Ok(follows_stderr);
+        }
+        let overridden = command
+            .redirects
+            .iter()
+            .rev()
+            .find(|redirect| redirect.fd == 1)
+            .is_some_and(|redirect| redirect.kind != RedirectKind::DuplicateOutput);
+        if overridden {
+            return Ok(false);
+        }
+        Err(ShellError::new(
+            ErrorCode::InvalidCommand,
+            "native C1 cannot route `>&2` before a later standard-error redirection",
+        )
+        .with_help("Put `2>` redirections before `>&2`, or run the command in `bash { ... }`"))
+    }
+
+    /// Standard output and standard error for a stage whose output is `>&2`:
+    /// both go to the standard-error target, which is the redirected file,
+    /// one shared capture pipe, or the shell's own standard error.
+    fn stdout_into_stderr(
+        command: &SimpleCommand,
+        capture: bool,
+        request: Option<RequestContext<'_>>,
+    ) -> Result<(Stdio, Stdio, Option<PipeReader>), ShellError> {
+        let duplicate_error = |error: std::io::Error| {
+            ShellError::new(
+                ErrorCode::Io,
+                "could not duplicate the standard-error descriptor",
+            )
+            .with_context(error.to_string())
+            .with_help("Retry after closing unused processes or file descriptors")
+        };
+        if let Some(redirect) = command.redirects.iter().rev().find(|redirect| {
+            redirect.fd == 2 && matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append)
+        }) {
+            let file = open_redirected_output(redirect, request)?;
+            let duplicate = file.try_clone().map_err(duplicate_error)?;
+            return Ok((Stdio::from(duplicate), Stdio::from(file), None));
+        }
+        if capture {
+            let (reader, writer) = crate::spawn_guard_scope(pipe).map_err(duplicate_error)?;
+            let duplicate = writer.try_clone().map_err(duplicate_error)?;
+            return Ok((Stdio::from(duplicate), Stdio::from(writer), Some(reader)));
+        }
+        let duplicate = std::io::stderr()
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(duplicate_error)?;
+        Ok((Stdio::from(duplicate), Stdio::inherit(), None))
+    }
+
     fn duplicates_stderr_to_stdout(redirect: &quirl_syntax::Redirect) -> bool {
         redirect.fd == 2 && redirect.kind == RedirectKind::DuplicateOutput && redirect.path == "1"
     }
@@ -4846,21 +4967,48 @@ mod platform {
         capture: bool,
         request: Option<RequestContext<'_>>,
     ) -> Result<CommandOutcome, ShellError> {
-        if command
-            .redirects
-            .iter()
-            .any(|redirect| matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append))
-        {
-            write_redirected_output(
-                command,
+        // Route in-process output the way the descriptors would: `>&2` sends
+        // standard output to standard error, `2>&1` the reverse, and file
+        // redirections on either descriptor receive their stream.
+        let stdout_follows_stderr = stdout_duplicates_stderr(command)?;
+        if stdout_follows_stderr {
+            let moved = result.stdout.take().unwrap_or_default();
+            let stderr = result.stderr.get_or_insert_with(String::new);
+            stderr.insert_str(0, &moved);
+            result.stdout = Some(String::new());
+        } else if command.redirects.iter().any(duplicates_stderr_to_stdout) {
+            let moved = result.stderr.take().unwrap_or_default();
+            result
+                .stdout
+                .get_or_insert_with(String::new)
+                .push_str(&moved);
+            result.stderr = Some(String::new());
+        }
+        let stdout_file = command.redirects.iter().rev().find(|redirect| {
+            redirect.fd == 1 && matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append)
+        });
+        if let Some(redirect) = stdout_file.filter(|_| !stdout_follows_stderr) {
+            let file = open_redirected_output(redirect, request)?;
+            io_write_all(
+                file,
                 result.stdout.as_deref().unwrap_or_default().as_bytes(),
-                request,
+                &redirect.path,
             )?;
             result.stdout = capture.then(String::new);
         } else if !capture && let Some(stdout) = result.stdout.take() {
             io_write_all(std::io::stdout(), stdout.as_bytes(), "standard output")?;
         }
-        if !capture && let Some(stderr) = result.stderr.take() {
+        if let Some(redirect) = command.redirects.iter().rev().find(|redirect| {
+            redirect.fd == 2 && matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append)
+        }) {
+            let file = open_redirected_output(redirect, request)?;
+            io_write_all(
+                file,
+                result.stderr.as_deref().unwrap_or_default().as_bytes(),
+                &redirect.path,
+            )?;
+            result.stderr = capture.then(String::new);
+        } else if !capture && let Some(stderr) = result.stderr.take() {
             io_write_all(std::io::stderr(), stderr.as_bytes(), "standard error")?;
         }
         Ok(result)
@@ -4885,26 +5033,6 @@ mod platform {
             open_redirected_output(redirect, request)?;
         }
         Ok(())
-    }
-
-    fn write_redirected_output(
-        command: &SimpleCommand,
-        bytes: &[u8],
-        request: Option<RequestContext<'_>>,
-    ) -> Result<(), ShellError> {
-        let redirect = command
-            .redirects
-            .iter()
-            .rev()
-            .find(|redirect| matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append))
-            .ok_or_else(|| {
-                ShellError::new(ErrorCode::Io, "missing output redirection")
-                    .with_help(
-                        "Add a > or >> redirect to the command, or report this if one was already given",
-                    )
-            })?;
-        let file = open_redirected_output(redirect, request)?;
-        io_write_all(file, bytes, &redirect.path)
     }
 
     fn open_redirected_output(
@@ -6827,6 +6955,18 @@ mod platform {
                 .unwrap_err();
             assert_eq!(error.code, ErrorCode::ResourceLimit);
             assert!(started.elapsed() < Duration::from_secs(1));
+        }
+
+        #[test]
+        fn command_substitution_keeps_large_output_up_to_the_capture_limit() {
+            let result = NativeExecutor::default()
+                .execute_capture("n=0; for i in $(seq 1 20000); do n=$((n + 1)); done; printf $n")
+                .unwrap();
+            assert_eq!(result.stdout.as_deref(), Some("20000"));
+            let error = NativeExecutor::default()
+                .execute_capture("x=$(head -c 1100000 /dev/zero | tr '\\0' a)")
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
         }
 
         #[test]

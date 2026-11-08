@@ -1584,6 +1584,9 @@ fn program_has_background(source: &str) -> bool {
                     let compound = match command {
                         quirl_syntax::CommandNode::Simple(_) => continue,
                         quirl_syntax::CommandNode::Compound(compound) => compound,
+                        quirl_syntax::CommandNode::RedirectedCompound(redirected) => {
+                            &redirected.command
+                        }
                         quirl_syntax::CommandNode::FunctionDefinition(definition) => {
                             &definition.body
                         }
