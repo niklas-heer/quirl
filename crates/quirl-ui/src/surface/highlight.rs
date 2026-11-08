@@ -1331,9 +1331,9 @@ mod tests {
         // error when a function is defined beside it, since it would not persist.
         for (input, severity, prefix) in [
             (
-                "{ echo a; } > out",
+                "{ echo a; } < in",
                 DiagnosticSeverity::Hint,
-                "`>` runs through /bin/sh: ",
+                "`<` runs through /bin/sh: ",
             ),
             (
                 "[[ -f x ]] && echo yes",
