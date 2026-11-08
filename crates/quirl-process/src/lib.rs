@@ -3160,10 +3160,7 @@ mod platform {
                     budget.append(&mut value, text)?;
                     continue;
                 }
-                pathname |= part.quoting == Quoting::Unquoted
-                    && text
-                        .chars()
-                        .any(|character| matches!(character, '*' | '?' | '['));
+                pathname |= part.quoting == Quoting::Unquoted && has_glob_pattern(text);
                 self.expand_fragment(
                     text,
                     limit,
@@ -4159,6 +4156,22 @@ mod platform {
             self.jobs[index].state.status = JobStatus::Running;
             Ok(outcome(0, None, None))
         }
+    }
+
+    /// Whether unquoted `text` asks for pathname expansion: it contains `*`,
+    /// `?`, or a `[` with a later `]`. A lone `[`, as in `[ -n x ]`, is an
+    /// ordinary word, so the shell never scans a directory for it.
+    fn has_glob_pattern(text: &str) -> bool {
+        let mut open_bracket = false;
+        for character in text.chars() {
+            match character {
+                '*' | '?' => return true,
+                '[' => open_bracket = true,
+                ']' if open_bracket => return true,
+                _ => {}
+            }
+        }
+        false
     }
 
     fn word_fields_error() -> ShellError {
