@@ -6,11 +6,6 @@
 //! splitter makes one pass over the value, so its cost is linear in the value
 //! length times the length of IFS, which is expected to be small.
 
-#![allow(
-    dead_code,
-    reason = "wired into the native executor by the native-language integration"
-)]
-
 use quirl_core::{ErrorCode, ShellError};
 use std::ops::Range;
 

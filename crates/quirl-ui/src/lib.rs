@@ -752,7 +752,7 @@ fn configured_editor(
         .with_hinter(Box::new(
             DefaultHinter::default().with_style(theme.ansi_hint()),
         ))
-        .with_validator(Box::new(DefaultValidator))
+        .with_validator(Box::new(ProgramValidator))
         .with_edit_mode(configured_edit_mode_with_picker(
             &config.editor.keymap,
             picker_invocation,
@@ -770,6 +770,40 @@ fn configured_editor(
             line_editor.with_highlighter(Box::new(SemanticHighlighter::new(catalog, theme)));
     }
     line_editor
+}
+
+/// Grammar mode of the simple editor's current `read_line`, read by
+/// [`ProgramValidator`]. Reedline validators only receive the buffer, and a
+/// process runs one interactive editor, so a process-wide cell is the
+/// narrowest channel; [`set_simple_editor_mode`] updates it before each read.
+static SIMPLE_EDITOR_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tell the simple editor's validator which grammar the next line uses, so
+/// Enter continues an unfinished compound command only in Normal mode.
+pub fn set_simple_editor_mode(mode: Mode) {
+    let encoded = match mode {
+        Mode::Command => 0,
+        Mode::Data => 1,
+        Mode::Natural => 2,
+    };
+    SIMPLE_EDITOR_MODE.store(encoded, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Continue the line on Enter while Normal-mode input ends inside an
+/// unfinished construct (an open loop, quote, or trailing `|`), and keep
+/// reedline's bracket balancing for the other grammars.
+struct ProgramValidator;
+
+impl reedline::Validator for ProgramValidator {
+    fn validate(&self, line: &str) -> reedline::ValidationResult {
+        if SIMPLE_EDITOR_MODE.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            if quirl_syntax::is_incomplete(line) {
+                return reedline::ValidationResult::Incomplete;
+            }
+            return reedline::ValidationResult::Complete;
+        }
+        DefaultValidator.validate(line)
+    }
 }
 
 fn editor_cursor_config() -> CursorConfig {

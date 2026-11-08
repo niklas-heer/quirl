@@ -5,11 +5,6 @@
 //! output, so the executor can write them directly. Output is accumulated under
 //! an explicit byte limit, and escape decoding stops as soon as `\c` appears.
 
-#![allow(
-    dead_code,
-    reason = "wired into the native executor by the native-language integration"
-)]
-
 use quirl_core::{ErrorCode, ShellError};
 use std::{iter::Peekable, str::Chars};
 

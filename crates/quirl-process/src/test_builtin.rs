@@ -14,11 +14,6 @@
 //! only side effects are filesystem metadata reads, `access(2)` checks, and
 //! terminal queries on descriptors 0 to 2.
 
-#![allow(
-    dead_code,
-    reason = "wired into the native executor by the native-language integration"
-)]
-
 #[cfg(unix)]
 use nix::unistd::{AccessFlags, access};
 use quirl_core::{ErrorCode, ShellError};

@@ -1538,12 +1538,14 @@ fn execute_command_or_dialect_island(
     .map(|outcome| command_outcome_projection(&outcome))
 }
 
-/// Wrap a Normal-mode line that uses a shell control form the native grammar
-/// leaves to a reference shell, such as `for ...; do ...; done`, `{ ...; }`,
-/// `[[ ... ]]`, or `{a,b}`, in an `eval` island. The line then runs exactly
-/// as `/bin/sh` runs it, and the session keeps its exports and directory, as
-/// pasting it into Bash or Zsh would. Function definitions are rejected
-/// instead: a function cannot outlive the island that defines it.
+/// Wrap a Normal-mode line that uses a form the native program grammar
+/// leaves to a reference shell, such as `[[ ... ]]`, a subshell, `{a,b}`, or
+/// a loop used as a pipeline stage, in an `eval` island. The line then runs
+/// exactly as `/bin/sh` runs it, and the session keeps its exports and
+/// directory, as pasting it into Bash or Zsh would. Loops, conditionals,
+/// `case`, and functions are native and never wrapped. A line that would need
+/// the island and also defines a function is rejected: the function could
+/// not outlive the island.
 fn posix_control_island(source: &str) -> Result<Option<String>, ShellError> {
     let Some(form) = quirl_syntax::dialect_control_form(source) else {
         return Ok(None);
@@ -1551,14 +1553,99 @@ fn posix_control_island(source: &str) -> Result<Option<String>, ShellError> {
     if form.defines_function {
         return Err(ShellError::new(
             ErrorCode::InvalidCommand,
-            "shell functions do not persist in Quirl",
+            format!(
+                "a function defined next to `{}` cannot persist: {}",
+                form.text, form.reason
+            ),
         )
         .with_command(source)
         .with_help(
-            "Define and call the function together in one `bash { ... }` block, or put it in a script and run the script",
+            "Define the function on its own line, or run the whole block in `bash { ... }`",
         ));
     }
     Ok(Some(format!("eval '{}'", source.replace('\'', r"'\''"))))
+}
+
+/// Whether any list item in `source`, at any nesting depth, runs in the
+/// background. Uses no aliases, matching what the user typed.
+fn program_has_background(source: &str) -> bool {
+    let Ok(program) = quirl_syntax::parse_program(source, &quirl_syntax::NoAliases) else {
+        return false;
+    };
+    let mut pending = vec![&program.body];
+    while let Some(list) = pending.pop() {
+        for item in &list.items {
+            if item.background {
+                return true;
+            }
+            for pipeline in item.and_or.pipelines() {
+                for command in &pipeline.commands {
+                    let compound = match command {
+                        quirl_syntax::CommandNode::Simple(_) => continue,
+                        quirl_syntax::CommandNode::Compound(compound) => compound,
+                        quirl_syntax::CommandNode::FunctionDefinition(definition) => {
+                            &definition.body
+                        }
+                    };
+                    match compound {
+                        quirl_syntax::CompoundCommand::BraceGroup(list) => pending.push(list),
+                        quirl_syntax::CompoundCommand::If(clause) => {
+                            for branch in &clause.branches {
+                                pending.push(&branch.condition);
+                                pending.push(&branch.body);
+                            }
+                            pending.extend(clause.else_body.as_ref());
+                        }
+                        quirl_syntax::CompoundCommand::For(clause) => pending.push(&clause.body),
+                        quirl_syntax::CompoundCommand::While(clause)
+                        | quirl_syntax::CompoundCommand::Until(clause) => {
+                            pending.push(&clause.condition);
+                            pending.push(&clause.body);
+                        }
+                        quirl_syntax::CompoundCommand::Case(clause) => {
+                            pending.extend(clause.arms.iter().map(|arm| &arm.body));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Routes `SIGINT` to a flag the executor checks between commands while a
+/// native command runs, so Ctrl-C stops a loop that never starts a process
+/// instead of ending the shell. Dropping the guard detaches the flag and
+/// restores the previous signal disposition.
+struct NativeInterruptGuard<'a> {
+    executor: &'a mut NativeExecutor,
+    #[cfg(unix)]
+    signal_id: Option<signal_hook::SigId>,
+}
+
+impl<'a> NativeInterruptGuard<'a> {
+    fn install(executor: &'a mut NativeExecutor) -> Self {
+        let flag = Arc::new(AtomicBool::new(false));
+        #[cfg(unix)]
+        let signal_id =
+            signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&flag)).ok();
+        executor.set_interrupt_flag(Some(flag));
+        Self {
+            executor,
+            #[cfg(unix)]
+            signal_id,
+        }
+    }
+}
+
+impl Drop for NativeInterruptGuard<'_> {
+    fn drop(&mut self) {
+        self.executor.set_interrupt_flag(None);
+        #[cfg(unix)]
+        if let Some(signal_id) = self.signal_id.take() {
+            signal_hook::low_level::unregister(signal_id);
+        }
+    }
 }
 
 /// Return whether a parsed native command list directly invokes Git.
@@ -1606,9 +1693,7 @@ fn execute_command_or_dialect_island_with_extensions(
     if output_mode == ExecutionOutputMode::RichViewport
         && installed.is_none()
         && interactive_dialect_island(source).is_none()
-        && parse_command_list(source)
-            .map(|list| list.pipelines.iter().any(|pipeline| pipeline.background))
-            .unwrap_or(false)
+        && program_has_background(source)
     {
         return Err(ShellError::new(
             ErrorCode::Validation,
@@ -1622,6 +1707,8 @@ fn execute_command_or_dialect_island_with_extensions(
     // Trusted foreground terminal sessions have no arbitrary host-call deadline.
     // Sandboxed, scripting, plugin, and noninteractive requests still use the
     // common bounded ExecutionPlan below.
+    let interrupt = NativeInterruptGuard::install(executor);
+    let executor = &mut *interrupt.executor;
     #[cfg(unix)]
     if output_mode == ExecutionOutputMode::RichViewport
         && installed.is_none()
@@ -2259,6 +2346,97 @@ fn interactive_environment_snapshot(
         .collect())
 }
 
+/// Largest `init.qrl` the interactive shell runs at startup, in bytes.
+const INIT_SCRIPT_BYTES_MAX: usize = 256 * 1024;
+
+/// Run `init.qrl` from the configuration directory, if present, in the
+/// session's own executor, so its aliases, functions, and variables stay
+/// defined for the session. Each complete statement runs in order with
+/// inherited output. A failing statement is reported and the rest still run,
+/// as in a shell startup file; a file that cannot be read or split is
+/// reported and skipped entirely.
+fn run_init_script(executor: &mut NativeExecutor) {
+    let Some(directory) = extensions::resolve_config_directory(
+        std::env::var_os("QUIRL_CONFIG_DIR"),
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    ) else {
+        return;
+    };
+    let path = directory.join("init.qrl");
+    for error in run_init_script_file(executor, &path) {
+        let _ = io::stderr().write_all(render_error(&error, false).as_bytes());
+    }
+}
+
+/// Run one startup script and return every error it produced.
+fn run_init_script_file(executor: &mut NativeExecutor, path: &Path) -> Vec<ShellError> {
+    let bytes = match bounded_file::read_optional_regular_file(bounded_file::ReadFileOptions {
+        path,
+        bytes_max: INIT_SCRIPT_BYTES_MAX,
+        context: "startup script",
+        help: "Keep init.qrl a regular file under 256 KiB",
+        io_error_code: ErrorCode::Io,
+    }) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Vec::new(),
+        Err(error) => return vec![error],
+    };
+    let Ok(source) = String::from_utf8(bytes) else {
+        return vec![
+            ShellError::new(
+                ErrorCode::Validation,
+                format!("{} is not valid UTF-8", path.display()),
+            )
+            .with_help("Save init.qrl as UTF-8 text"),
+        ];
+    };
+    let split = quirl_syntax::split_script_statements(&source);
+    if let Some(diagnostic) = split.diagnostics.first() {
+        return vec![
+            ShellError::new(
+                ErrorCode::InvalidCommand,
+                format!(
+                    "{}:{}: {}",
+                    path.display(),
+                    line_number(&source, diagnostic.start),
+                    diagnostic.message
+                ),
+            )
+            .with_help(diagnostic.help.clone()),
+        ];
+    }
+    let mut errors = Vec::new();
+    for statement in split.statements {
+        let line = line_number(&source, statement.span.start);
+        if quirl_syntax::data_statement_expression(statement.text.trim()).is_some() {
+            errors.push(
+                ShellError::new(
+                    ErrorCode::InvalidCommand,
+                    format!(
+                        "{}:{line}: data statements cannot run at startup",
+                        path.display()
+                    ),
+                )
+                .with_help("Keep init.qrl to shell commands, aliases, and functions"),
+            );
+            continue;
+        }
+        let guard = NativeInterruptGuard::install(executor);
+        if let Err(error) = guard.executor.execute_interactive(statement.text) {
+            errors.push(error.with_context(format!("{}:{line}", path.display())));
+        }
+    }
+    errors
+}
+
+/// One-based line number of byte `offset` in `source`.
+fn line_number(source: &str, offset: usize) -> usize {
+    source
+        .get(..offset)
+        .map_or(1, |prefix| prefix.matches('\n').count().saturating_add(1))
+}
+
 fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
     set_product_identity(&product_build_identity())?;
     let mut executor = NativeExecutor::default();
@@ -2291,6 +2469,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
         &home_directory,
     )?;
     print_banner(&active_config);
+    run_init_script(&mut executor);
     let mut project_refresh = configured_project_refresh(&active_config.projects);
     attach_project_refresh(&mut line_editor, project_refresh.as_ref());
     // The Codex-only preview deliberately leaves the legacy automatic local
@@ -3641,18 +3820,21 @@ impl SessionEditor {
     fn read_line(&mut self, prompt: &mut QuirlPrompt) -> Result<InteractiveSignal, ShellError> {
         match self {
             Self::Rich(editor) => editor.read_line(prompt),
-            Self::Simple(editor) => editor
-                .read_line(prompt)
-                .map(|signal| match signal {
-                    reedline::Signal::Success(buffer) => InteractiveSignal::Success(buffer),
-                    reedline::Signal::CtrlC => InteractiveSignal::CtrlC,
-                    reedline::Signal::CtrlD => InteractiveSignal::CtrlD,
-                    reedline::Signal::HostCommand(command) => {
-                        InteractiveSignal::HostCommand(command)
-                    }
-                    _ => InteractiveSignal::CtrlC,
-                })
-                .map_err(quirl_ui::editor_read_error),
+            Self::Simple(editor) => {
+                quirl_ui::set_simple_editor_mode(prompt.mode());
+                editor
+                    .read_line(prompt)
+                    .map(|signal| match signal {
+                        reedline::Signal::Success(buffer) => InteractiveSignal::Success(buffer),
+                        reedline::Signal::CtrlC => InteractiveSignal::CtrlC,
+                        reedline::Signal::CtrlD => InteractiveSignal::CtrlD,
+                        reedline::Signal::HostCommand(command) => {
+                            InteractiveSignal::HostCommand(command)
+                        }
+                        _ => InteractiveSignal::CtrlC,
+                    })
+                    .map_err(quirl_ui::editor_read_error)
+            }
         }
     }
 
@@ -6165,17 +6347,52 @@ mod tests {
     }
 
     #[test]
-    fn native_lines_need_no_island_and_control_forms_become_quoted_evals() {
+    fn native_lines_need_no_island_and_unsupported_forms_become_quoted_evals() {
+        for native in [
+            "git status && echo done",
+            r#"for f in a; do echo "it's"; done"#,
+            "greet() { echo hi; }",
+            "if true; then echo yes; fi",
+        ] {
+            assert_eq!(posix_control_island(native).unwrap(), None, "{native}");
+        }
         assert_eq!(
-            posix_control_island("git status && echo done").unwrap(),
-            None
+            posix_control_island(r#"[[ -n "it's" ]] && echo ok"#).unwrap(),
+            Some(r#"eval '[[ -n "it'\''s" ]] && echo ok'"#.to_owned())
         );
+        let error = posix_control_island("greet() { echo hi; }; [[ -n x ]]").unwrap_err();
+        assert!(error.message.contains("cannot persist"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_script_defines_aliases_and_functions_and_reports_failures_by_line() {
+        let directory = std::env::temp_dir().join(format!("quirl-init-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("init.qrl");
+        std::fs::write(
+            &path,
+            "# startup\nalias greet='printf hi'\nshout() {\n  printf '%s!' \"$1\"\n}\nfalse_command_that_does_not_exist_quirl\nexport QUIRL_INIT_PROOF=yes\n",
+        )
+        .unwrap();
+        let mut executor = NativeExecutor::default();
+        let errors = run_init_script_file(&mut executor, &path);
+        assert!(errors.len() <= 1, "{errors:?}");
+        assert_eq!(executor.function_names(), ["shout"]);
         assert_eq!(
-            posix_control_island(r#"for f in a; do echo "it's"; done"#).unwrap(),
-            Some(r#"eval 'for f in a; do echo "it'\''s"; done'"#.to_owned())
+            executor.aliases(),
+            [("greet".to_owned(), "printf hi".to_owned())]
         );
-        let error = posix_control_island("greet() { echo hi; }").unwrap_err();
-        assert!(error.message.contains("functions do not persist"));
+        let outcome = executor
+            .execute_capture("greet; shout loud; printf \" $QUIRL_INIT_PROOF\"")
+            .unwrap();
+        assert_eq!(outcome.stdout.as_deref(), Some("hiloud! yes"));
+        assert!(run_init_script_file(&mut executor, &directory.join("missing.qrl")).is_empty());
+        std::fs::write(&path, "for x in a; do\n").unwrap();
+        let errors = run_init_script_file(&mut NativeExecutor::default(), &path);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains(":1:") || errors[0].message.contains(":2:"));
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[cfg(unix)]
