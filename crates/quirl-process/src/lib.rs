@@ -18,12 +18,15 @@
 
 mod builtin;
 mod developer_context;
+mod echo_builtin;
+mod field_split;
 pub mod local_completion;
 #[cfg(unix)]
 mod posix_island;
 #[cfg(unix)]
 pub mod pty;
 mod spawn_lock;
+mod test_builtin;
 
 pub use developer_context::{DeveloperContextProbe, DeveloperContextSnapshot};
 use spawn_lock::spawn_guard_scope;
@@ -113,8 +116,45 @@ pub(crate) struct SessionEnvironment {
     variables: BTreeMap<OsString, OsString>,
     /// Unexported shell variables, such as those set by a bare `NAME=value`.
     locals: BTreeMap<OsString, OsString>,
+    /// Name and value bytes summed over both maps. Kept in step with every
+    /// mutation so single-name updates check the byte limit in O(log n)
+    /// instead of rescanning the whole environment.
+    retained_bytes: usize,
+    /// Count limit for both maps together. Stored on the instance, not read
+    /// from the constant, so a small-limit test can exercise the real trip path.
+    variables_max: usize,
+    /// Byte limit for both maps together, stored for the same reason.
+    bytes_max: usize,
     initialization_error: Option<quirl_core::ShellError>,
     generation: u64,
+}
+
+/// The binding one name holds after a single-name mutation.
+enum Binding {
+    /// Exported with this value, and absent from the locals.
+    Exported(OsString),
+    /// Unexported with this value, and absent from the exports.
+    Local(OsString),
+    /// Absent from both maps.
+    Unset,
+}
+
+impl Binding {
+    /// The value this binding stores, or `None` when the name is unset.
+    fn value(&self) -> Option<&OsString> {
+        match self {
+            Self::Exported(value) | Self::Local(value) => Some(value),
+            Self::Unset => None,
+        }
+    }
+
+    /// The exported value this binding stores, which is what children see.
+    fn exported(&self) -> Option<&OsString> {
+        match self {
+            Self::Exported(value) => Some(value),
+            Self::Local(_) | Self::Unset => None,
+        }
+    }
 }
 
 impl Default for SessionEnvironment {
@@ -127,6 +167,8 @@ impl Default for SessionEnvironment {
                 OsString::from("PPID"),
                 OsString::from(std::os::unix::process::parent_id().to_string()),
             );
+            environment.retained_bytes =
+                retained_bytes_of(&environment.variables, &environment.locals);
         }
         environment
     }
@@ -147,15 +189,24 @@ impl SessionEnvironment {
         bytes_max: usize,
     ) -> Self {
         match Self::from_iter_with_limits(variables, variables_max, bytes_max) {
+            // The streaming check above counts every pair it reads, including
+            // a repeated name that the map then overwrites. The cache instead
+            // reflects the map contents, which is what later mutations change.
             Ok(variables) => Self {
+                retained_bytes: retained_bytes_of(&variables, &BTreeMap::new()),
                 variables,
                 locals: BTreeMap::new(),
+                variables_max,
+                bytes_max,
                 initialization_error: None,
                 generation: 0,
             },
             Err(error) => Self {
                 variables: BTreeMap::new(),
                 locals: BTreeMap::new(),
+                retained_bytes: 0,
+                variables_max,
+                bytes_max,
                 initialization_error: Some(error),
                 generation: 0,
             },
@@ -248,6 +299,10 @@ impl SessionEnvironment {
         assignments: &[(String, String)],
     ) -> Result<(), quirl_core::ShellError> {
         self.ensure_valid()?;
+        if let [(name, value)] = assignments {
+            validate_environment_assignment(name, value)?;
+            return self.replace_name(name, Binding::Exported(OsString::from(value)));
+        }
         let mut exported = self.variables.clone();
         let mut locals = self.locals.clone();
         for (name, value) in assignments {
@@ -265,6 +320,15 @@ impl SessionEnvironment {
         assignments: &[(String, String)],
     ) -> Result<(), quirl_core::ShellError> {
         self.ensure_valid()?;
+        if let [(name, value)] = assignments {
+            validate_environment_assignment(name, value)?;
+            let binding = if self.variables.contains_key(OsStr::new(name)) {
+                Binding::Exported(OsString::from(value))
+            } else {
+                Binding::Local(OsString::from(value))
+            };
+            return self.replace_name(name, binding);
+        }
         let mut exported = self.variables.clone();
         let mut locals = self.locals.clone();
         for (name, value) in assignments {
@@ -283,6 +347,14 @@ impl SessionEnvironment {
     /// A name with no value stays unset, matching `export NAME` in `sh`.
     fn export_names(&mut self, names: &[String]) -> Result<(), quirl_core::ShellError> {
         self.ensure_valid()?;
+        if let [name] = names {
+            validate_environment_assignment(name, "")?;
+            // A name that is not a local has nothing to export, so nothing changes.
+            if let Some(value) = self.locals.get(OsStr::new(name)).cloned() {
+                return self.replace_name(name, Binding::Exported(value));
+            }
+            return Ok(());
+        }
         let mut exported = self.variables.clone();
         let mut locals = self.locals.clone();
         for name in names {
@@ -297,6 +369,10 @@ impl SessionEnvironment {
     /// Remove variables, as `unset NAME` does. Unknown names are ignored.
     fn unset_names(&mut self, names: &[String]) -> Result<(), quirl_core::ShellError> {
         self.ensure_valid()?;
+        if let [name] = names {
+            validate_environment_assignment(name, "")?;
+            return self.replace_name(name, Binding::Unset);
+        }
         let mut exported = self.variables.clone();
         let mut locals = self.locals.clone();
         for name in names {
@@ -319,49 +395,444 @@ impl SessionEnvironment {
         self.commit(imported, locals)
     }
 
+    /// Number of names across both maps, which the variable limit bounds.
+    fn variable_count(&self) -> usize {
+        self.variables.len().saturating_add(self.locals.len())
+    }
+
+    /// The generation after one more exported-map change. Failing here,
+    /// before any map is touched, keeps an overflowing update all-or-nothing.
+    fn next_generation(&self) -> Result<u64, quirl_core::ShellError> {
+        self.generation.checked_add(1).ok_or_else(|| {
+            quirl_core::ShellError::new(
+                quirl_core::ErrorCode::ResourceLimit,
+                "session environment has been updated too many times to track safely",
+            )
+            .with_help("Restart Quirl before applying another environment update")
+        })
+    }
+
+    /// Change one name's binding in place, the hot path for single-name
+    /// mutations such as `NAME=value` inside a loop.
+    ///
+    /// Every limit and the generation are projected from the name's current
+    /// entry before either map is touched, so an error leaves the state as it
+    /// was. The generation advances only when the exported map changes, which
+    /// is when children would see a different environment.
+    fn replace_name(&mut self, name: &str, next: Binding) -> Result<(), quirl_core::ShellError> {
+        let name = OsString::from(name);
+        let current_exported = self.variables.get(&name);
+        let current = current_exported.or_else(|| self.locals.get(&name));
+        let current_bytes = current.map_or(0, |value| entry_bytes(&name, value));
+        debug_assert!(
+            self.retained_bytes >= current_bytes,
+            "cached retained bytes must include every stored entry"
+        );
+
+        let variable_count = self
+            .variable_count()
+            .saturating_sub(usize::from(current.is_some()))
+            .saturating_add(usize::from(next.value().is_some()));
+        if variable_count > self.variables_max {
+            return Err(environment_variable_limit_error(
+                self.variables_max,
+                variable_count,
+            ));
+        }
+        let next_bytes = next.value().map_or(0, |value| entry_bytes(&name, value));
+        let retained_bytes = self
+            .retained_bytes
+            .saturating_sub(current_bytes)
+            .saturating_add(next_bytes);
+        if retained_bytes > self.bytes_max {
+            return Err(environment_byte_limit_error(self.bytes_max, retained_bytes));
+        }
+        let generation = if current_exported == next.exported() {
+            None
+        } else {
+            Some(self.next_generation()?)
+        };
+
+        match next {
+            Binding::Exported(value) => {
+                self.locals.remove(&name);
+                self.variables.insert(name, value);
+            }
+            Binding::Local(value) => {
+                self.variables.remove(&name);
+                self.locals.insert(name, value);
+            }
+            Binding::Unset => {
+                self.variables.remove(&name);
+                self.locals.remove(&name);
+            }
+        }
+        self.retained_bytes = retained_bytes;
+        if let Some(generation) = generation {
+            self.generation = generation;
+        }
+        Ok(())
+    }
+
     /// Validate both maps against the shared limits, then publish them.
+    ///
+    /// This clone-based path serves multi-name calls and imports, which are
+    /// rare, so rescanning the maps here is acceptable.
     fn commit(
         &mut self,
         exported: BTreeMap<OsString, OsString>,
         locals: BTreeMap<OsString, OsString>,
     ) -> Result<(), quirl_core::ShellError> {
         let variable_count = exported.len().saturating_add(locals.len());
-        if variable_count > SESSION_ENVIRONMENT_VARIABLES_MAX {
+        if variable_count > self.variables_max {
             return Err(environment_variable_limit_error(
-                SESSION_ENVIRONMENT_VARIABLES_MAX,
+                self.variables_max,
                 variable_count,
             ));
         }
-        let retained_bytes =
-            exported
-                .iter()
-                .chain(locals.iter())
-                .fold(0_usize, |retained, (name, value)| {
-                    retained
-                        .saturating_add(name.len())
-                        .saturating_add(value.len())
-                });
-        if retained_bytes > SESSION_ENVIRONMENT_BYTES_MAX {
-            return Err(environment_byte_limit_error(
-                SESSION_ENVIRONMENT_BYTES_MAX,
-                retained_bytes,
-            ));
+        let retained_bytes = retained_bytes_of(&exported, &locals);
+        if retained_bytes > self.bytes_max {
+            return Err(environment_byte_limit_error(self.bytes_max, retained_bytes));
         }
         // Children observe only exported variables, so only those advance
         // the generation that tells observers to refresh derived state.
         if exported != self.variables {
-            let generation = self.generation.checked_add(1).ok_or_else(|| {
-                quirl_core::ShellError::new(
-                    quirl_core::ErrorCode::ResourceLimit,
-                    "session environment has been updated too many times to track safely",
-                )
-                .with_help("Restart Quirl before applying another environment update")
-            })?;
+            let generation = self.next_generation()?;
             self.variables = exported;
             self.generation = generation;
         }
         self.locals = locals;
+        self.retained_bytes = retained_bytes;
         Ok(())
+    }
+}
+
+/// Bytes one stored entry retains: its name plus its value.
+fn entry_bytes(name: &OsStr, value: &OsStr) -> usize {
+    name.len().saturating_add(value.len())
+}
+
+/// Bytes retained across both maps, the total the byte limit bounds.
+fn retained_bytes_of(
+    variables: &BTreeMap<OsString, OsString>,
+    locals: &BTreeMap<OsString, OsString>,
+) -> usize {
+    variables
+        .iter()
+        .chain(locals.iter())
+        .fold(0_usize, |retained, (name, value)| {
+            retained.saturating_add(entry_bytes(name, value))
+        })
+}
+
+#[cfg(test)]
+mod session_environment_tests {
+    use super::{BTreeMap, OsStr, OsString, SessionEnvironment, retained_bytes_of};
+    use quirl_core::ErrorCode;
+
+    fn exported_fixture(pairs: &[(&str, &str)]) -> SessionEnvironment {
+        SessionEnvironment::capture(
+            pairs
+                .iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+        )
+    }
+
+    fn limited_fixture(
+        pairs: &[(&str, &str)],
+        variables_max: usize,
+        bytes_max: usize,
+    ) -> SessionEnvironment {
+        SessionEnvironment::capture_with_limits(
+            pairs
+                .iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+            variables_max,
+            bytes_max,
+        )
+    }
+
+    /// Checks the cache against a full recount of both maps, and that a name
+    /// is never both exported and local. Each mutation test calls this after
+    /// it changes state, so a drifted byte total fails at the mutation that
+    /// caused it.
+    fn assert_cached_totals(environment: &SessionEnvironment) {
+        assert_eq!(
+            environment.retained_bytes,
+            retained_bytes_of(&environment.variables, &environment.locals),
+            "cached retained bytes must equal a recount of both maps"
+        );
+        assert!(
+            environment
+                .variables
+                .keys()
+                .all(|name| !environment.locals.contains_key(name)),
+            "a name must never be both exported and local"
+        );
+    }
+
+    /// Whether two environments hold the same observable state. Used to show
+    /// that a rejected update changed nothing, not just that it returned an error.
+    fn assert_same_state(before: &SessionEnvironment, after: &SessionEnvironment) {
+        assert_eq!(before.variables, after.variables);
+        assert_eq!(before.locals, after.locals);
+        assert_eq!(before.generation, after.generation);
+        assert_eq!(before.retained_bytes, after.retained_bytes);
+    }
+
+    fn local_of(environment: &SessionEnvironment, name: &str) -> Option<OsString> {
+        environment.locals.get(OsStr::new(name)).cloned()
+    }
+
+    fn exported_of(environment: &SessionEnvironment, name: &str) -> Option<OsString> {
+        environment.variables.get(OsStr::new(name)).cloned()
+    }
+
+    #[test]
+    fn assigning_new_name_creates_local_without_bumping_generation() {
+        let mut environment = exported_fixture(&[]);
+
+        environment
+            .assign_variables(&[("NEW".to_owned(), "1".to_owned())])
+            .unwrap();
+
+        assert_eq!(local_of(&environment, "NEW"), Some(OsString::from("1")));
+        assert_eq!(exported_of(&environment, "NEW"), None);
+        assert_eq!(environment.generation, 0);
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn overwriting_exported_variable_keeps_export_and_bumps_generation() {
+        let mut environment = exported_fixture(&[("PATH_LIKE", "old")]);
+
+        environment
+            .assign_variables(&[("PATH_LIKE".to_owned(), "new".to_owned())])
+            .unwrap();
+
+        assert_eq!(exported_of(&environment, "PATH_LIKE"), Some("new".into()));
+        assert_eq!(local_of(&environment, "PATH_LIKE"), None);
+        assert_eq!(environment.generation, 1);
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn assigning_same_value_to_exported_variable_keeps_generation() {
+        let mut environment = exported_fixture(&[("SAME", "value")]);
+
+        environment
+            .assign_variables(&[("SAME".to_owned(), "value".to_owned())])
+            .unwrap();
+
+        assert_eq!(environment.generation, 0);
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn locals_never_bump_generation_when_they_change() {
+        let mut environment = exported_fixture(&[]);
+
+        environment
+            .assign_variables(&[("LOCAL".to_owned(), "one".to_owned())])
+            .unwrap();
+        environment
+            .assign_variables(&[("LOCAL".to_owned(), "two".to_owned())])
+            .unwrap();
+
+        assert_eq!(local_of(&environment, "LOCAL"), Some("two".into()));
+        assert_eq!(environment.generation, 0);
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn byte_limit_rejects_growth_past_exact_boundary_without_mutating() {
+        // "A" + "1234" is 5 bytes; the limit allows exactly 6.
+        let mut environment = limited_fixture(&[("A", "1234")], 100, 6);
+        let before = environment.clone();
+
+        let error = environment
+            .assign_variables(&[("B".to_owned(), "xy".to_owned())])
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("observed 8"));
+        assert_same_state(&before, &environment);
+
+        environment
+            .assign_variables(&[("A".to_owned(), "12345".to_owned())])
+            .unwrap();
+        assert_eq!(exported_of(&environment, "A"), Some("12345".into()));
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn count_limit_rejects_new_name_without_mutating() {
+        let mut environment = limited_fixture(&[("A", "1")], 1, 100);
+        let before = environment.clone();
+
+        let error = environment
+            .set_variables(&[("B".to_owned(), "2".to_owned())])
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("observed 2"));
+        assert_same_state(&before, &environment);
+    }
+
+    #[test]
+    fn count_limit_allows_replacing_an_existing_name_at_capacity() {
+        let mut environment = limited_fixture(&[("A", "1")], 1, 100);
+
+        environment
+            .set_variables(&[("A".to_owned(), "2".to_owned())])
+            .unwrap();
+
+        assert_eq!(exported_of(&environment, "A"), Some("2".into()));
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn invalid_single_assignment_leaves_environment_unchanged() {
+        let mut environment = exported_fixture(&[("A", "1")]);
+        let before = environment.clone();
+
+        let error = environment
+            .set_variables(&[("INVALID-NAME".to_owned(), "2".to_owned())])
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_same_state(&before, &environment);
+    }
+
+    #[test]
+    fn generation_overflow_rejects_export_change_without_mutating() {
+        let mut environment = exported_fixture(&[("A", "1")]);
+        environment.generation = u64::MAX;
+        let before = environment.clone();
+
+        let error = environment
+            .assign_variables(&[("A".to_owned(), "2".to_owned())])
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert_same_state(&before, &environment);
+    }
+
+    #[test]
+    fn unset_removes_name_from_exports_and_locals_and_fixes_byte_total() {
+        let mut environment = exported_fixture(&[("A", "11")]);
+        environment
+            .assign_variables(&[("L".to_owned(), "222".to_owned())])
+            .unwrap();
+
+        environment.unset_names(&["L".to_owned()]).unwrap();
+        assert_eq!(local_of(&environment, "L"), None);
+        assert_eq!(environment.generation, 0);
+        assert_cached_totals(&environment);
+
+        environment.unset_names(&["A".to_owned()]).unwrap();
+        assert_eq!(exported_of(&environment, "A"), None);
+        assert_eq!(environment.generation, 1);
+        assert_eq!(environment.retained_bytes, 0);
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn export_names_moves_local_to_exported_and_bumps_generation() {
+        let mut environment = exported_fixture(&[]);
+        environment
+            .assign_variables(&[("MOVE".to_owned(), "7".to_owned())])
+            .unwrap();
+
+        environment.export_names(&["MOVE".to_owned()]).unwrap();
+
+        assert_eq!(exported_of(&environment, "MOVE"), Some("7".into()));
+        assert_eq!(local_of(&environment, "MOVE"), None);
+        assert_eq!(environment.generation, 1);
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn export_names_of_unset_name_changes_nothing() {
+        let mut environment = exported_fixture(&[("A", "1")]);
+        let before = environment.clone();
+
+        environment.export_names(&["MISSING".to_owned()]).unwrap();
+
+        assert_same_state(&before, &environment);
+    }
+
+    #[test]
+    fn repeated_name_in_one_assign_call_keeps_last_value() {
+        let mut environment = exported_fixture(&[("EXPORTED", "0")]);
+
+        environment
+            .assign_variables(&[
+                ("LOCAL".to_owned(), "first".to_owned()),
+                ("LOCAL".to_owned(), "second".to_owned()),
+                ("EXPORTED".to_owned(), "1".to_owned()),
+                ("EXPORTED".to_owned(), "2".to_owned()),
+            ])
+            .unwrap();
+
+        assert_eq!(local_of(&environment, "LOCAL"), Some("second".into()));
+        assert_eq!(exported_of(&environment, "EXPORTED"), Some("2".into()));
+        assert_eq!(environment.generation, 1);
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn import_exported_recounts_bytes_and_keeps_unexported_locals() {
+        let mut environment = exported_fixture(&[("OLD", "1")]);
+        environment
+            .assign_variables(&[("KEEP".to_owned(), "22".to_owned())])
+            .unwrap();
+        let imported = BTreeMap::from([(OsString::from("NEW"), OsString::from("333"))]);
+
+        environment.import_exported(imported).unwrap();
+
+        assert_eq!(exported_of(&environment, "OLD"), None);
+        assert_eq!(exported_of(&environment, "NEW"), Some("333".into()));
+        assert_eq!(local_of(&environment, "KEEP"), Some("22".into()));
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn cache_matches_recount_after_200_fixed_mixed_operations() {
+        // Fixed-seed xorshift, so every run replays the same operation
+        // sequence. The names are few so that overwrites, exports, unsets,
+        // and multi-name calls all hit the same entries.
+        let mut seed: u64 = 0x5eed_0bad_c0de_0001;
+        let mut next_roll = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut environment = exported_fixture(&[("SEED_EXPORT", "start")]);
+
+        for _ in 0..200 {
+            let roll = next_roll();
+            let name = format!("V{}", roll % 6);
+            let value = "x".repeat(usize::try_from(roll % 5).unwrap());
+            let other = format!("V{}", (roll >> 8) % 6);
+            match (roll >> 16) % 6 {
+                0 => environment.assign_variables(&[(name, value)]).unwrap(),
+                1 => environment.set_variables(&[(name, value)]).unwrap(),
+                2 => environment.export_names(&[name]).unwrap(),
+                3 => environment.unset_names(&[name]).unwrap(),
+                4 => environment
+                    .assign_variables(&[(name, value.clone()), (other, value)])
+                    .unwrap(),
+                _ => environment
+                    .import_exported(BTreeMap::from([(
+                        OsString::from(name),
+                        OsString::from(value),
+                    )]))
+                    .unwrap(),
+            }
+            assert_cached_totals(&environment);
+        }
     }
 }
 
