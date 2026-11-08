@@ -27,11 +27,12 @@ pub use surface::{
     InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch,
     InteractivePanelProvider, InteractivePanelSnapshot, InteractiveProjectEntry,
     InteractiveProjectProvider, InteractiveProjectSnapshot, InteractiveRuntimeSnapshot,
-    InteractiveSignal, JOB_ACTION_ITEMS_MAX, JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX,
-    PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX, PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
-    PROJECT_FIELD_BYTES_MAX, PROJECT_ITEMS_MAX, PROJECT_RETAINED_BYTES_MAX,
-    PROJECT_STATUS_BYTES_MAX, ProjectCloneChoice, RichSurface, SurfaceKind, complete_listing,
-    select_surface, set_product_identity,
+    InteractiveSessionCommand, InteractiveSessionCommandKind, InteractiveSignal,
+    JOB_ACTION_ITEMS_MAX, JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX,
+    PANEL_FIELD_BYTES_MAX, PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX, PROJECT_FIELD_BYTES_MAX,
+    PROJECT_ITEMS_MAX, PROJECT_RETAINED_BYTES_MAX, PROJECT_STATUS_BYTES_MAX, ProjectCloneChoice,
+    RichSurface, SESSION_COMMAND_NAME_BYTES_MAX, SESSION_COMMAND_TEXT_BYTES_MAX,
+    SESSION_COMMANDS_MAX, SurfaceKind, complete_listing, select_surface, set_product_identity,
 };
 
 /// Escape `text` as one unquoted shell word, the way interactive completion
@@ -752,7 +753,7 @@ fn configured_editor(
         .with_hinter(Box::new(
             DefaultHinter::default().with_style(theme.ansi_hint()),
         ))
-        .with_validator(Box::new(DefaultValidator))
+        .with_validator(Box::new(ProgramValidator))
         .with_edit_mode(configured_edit_mode_with_picker(
             &config.editor.keymap,
             picker_invocation,
@@ -770,6 +771,60 @@ fn configured_editor(
             line_editor.with_highlighter(Box::new(SemanticHighlighter::new(catalog, theme)));
     }
     line_editor
+}
+
+/// Grammar mode of the simple editor's current `read_line`, read by
+/// [`ProgramValidator`]. Reedline validators only receive the buffer, and a
+/// process runs one interactive editor, so a process-wide cell is the
+/// narrowest channel; [`set_simple_editor_mode`] updates it before each read.
+static SIMPLE_EDITOR_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tell the simple editor's validator which grammar the next line uses, so
+/// Enter continues an unfinished compound command only in Normal mode.
+pub fn set_simple_editor_mode(mode: Mode) {
+    let encoded = match mode {
+        Mode::Command => 0,
+        Mode::Data => 1,
+        Mode::Natural => 2,
+    };
+    SIMPLE_EDITOR_MODE.store(encoded, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Continue the line on Enter while Normal-mode input ends inside an
+/// unfinished construct (an open loop, quote, or trailing `|`), and keep
+/// reedline's bracket balancing for the other grammars.
+struct ProgramValidator;
+
+impl reedline::Validator for ProgramValidator {
+    fn validate(&self, line: &str) -> reedline::ValidationResult {
+        if SIMPLE_EDITOR_MODE.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            if opens_dialect_island(line) {
+                return DefaultValidator.validate(line);
+            }
+            return match quirl_syntax::parse_program(line, &quirl_syntax::NoAliases) {
+                Err(quirl_syntax::ProgramError::Incomplete(_)) => {
+                    reedline::ValidationResult::Incomplete
+                }
+                // A valid native line is complete even with an unbalanced
+                // literal bracket, as in `echo {`.
+                Ok(_) => reedline::ValidationResult::Complete,
+                // Islands such as `bash {` and unsupported forms such as
+                // `(cd /tmp &&` keep reedline's bracket balancing.
+                Err(_) => DefaultValidator.validate(line),
+            };
+        }
+        DefaultValidator.validate(line)
+    }
+}
+
+/// Whether `line` starts an explicit `bash { ... }` or `zsh { ... }` island,
+/// whose body is another shell's grammar and is balanced by braces.
+fn opens_dialect_island(line: &str) -> bool {
+    let line = line.trim_start();
+    ["bash", "zsh"].iter().any(|shell| {
+        line.strip_prefix(shell)
+            .is_some_and(|rest| rest.trim_start().starts_with('{'))
+    })
 }
 
 fn editor_cursor_config() -> CursorConfig {
@@ -3917,6 +3972,32 @@ mod tests {
                 .unwrap()
                 .contains("source: catalog")
         );
+    }
+
+    #[test]
+    fn simple_editor_continues_unfinished_native_constructs_islands_and_subshells() {
+        use reedline::{ValidationResult, Validator};
+        set_simple_editor_mode(Mode::Command);
+        for line in [
+            "for x in a; do",
+            "bash { echo hi",
+            "(cd /tmp &&",
+            "echo 'open",
+        ] {
+            assert!(
+                matches!(
+                    ProgramValidator.validate(line),
+                    ValidationResult::Incomplete
+                ),
+                "{line}"
+            );
+        }
+        for line in ["echo {", "for x in a; do echo; done", "bash { echo hi; }"] {
+            assert!(
+                matches!(ProgramValidator.validate(line), ValidationResult::Complete),
+                "{line}"
+            );
+        }
     }
 
     #[test]

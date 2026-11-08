@@ -11,11 +11,21 @@
 use serde::{Deserialize, Serialize};
 use std::{fmt, ops::Range, str::FromStr};
 
+mod program;
+
+pub use program::{
+    ALIAS_EXPANSIONS_MAX, ALIAS_VALUE_BYTES_MAX, AliasLookup, AndOrList, CaseArm, CaseClause,
+    CommandNode, CompoundCommand, CompoundList, ConditionalBranch, ConnectedPipeline, ForClause,
+    FunctionDefinition, IfClause, ListItem, LoopClause, NoAliases, PROGRAM_NESTING_MAX,
+    PipelineNode, Program, ProgramError, RedirectedCompound, is_function_name, is_incomplete,
+    is_reserved_word, is_shell_name, parse_program,
+};
+
 /// Versioned, machine-readable evidence for Quirl's current native compatibility subset and
 /// the frozen 1.0 C1/C2 disposition.
 pub const COMPATIBILITY_MATRIX_JSON: &str = include_str!("../compatibility-v0.1.json");
 /// Current serialized version of the native command grammar.
-pub const GRAMMAR_PROTOCOL_VERSION: u32 = 3;
+pub const GRAMMAR_PROTOCOL_VERSION: u32 = 4;
 /// Schema version of the JSON evidence embedded in [`COMPATIBILITY_MATRIX_JSON`].
 pub const COMPATIBILITY_MATRIX_SCHEMA_VERSION: u32 = 3;
 /// Canonical structural description used to fingerprint the command grammar.
@@ -23,7 +33,7 @@ pub const COMPATIBILITY_MATRIX_SCHEMA_VERSION: u32 = 3;
 /// Any change to serialized shapes, token semantics, supported expansions, or
 /// the referenced compatibility matrix must update this descriptor and the
 /// corresponding protocol version.
-pub const GRAMMAR_SCHEMA_DESCRIPTOR: &str = "quirl.command-grammar@3{CommandList{deny_unknown;pipelines:array<Pipeline>;connectors:array<and|or|sequence>;invariant:connectors.len+1=pipelines.len};Pipeline{deny_unknown;commands:array<SimpleCommand>;background:bool};SimpleCommand{deny_unknown;words:nonempty-array<string>;word_ir:array<Word>;redirects:array<Redirect>};Word{deny_unknown;parts:nonempty-array<WordPart>};WordPart{deny_unknown;text:string;quoting:unquoted|single|double|escaped};Redirect{deny_unknown;fd:u8;kind:input|output|append|here_string|duplicate_input|duplicate_output;path:string;target:Word};tokens:word|pipe|and|or|semicolon|newline|input|output|append|here_string|fd_duplicate|background;lines:unquoted-LF-sequences|leading-blank-trailing-LF-ignored|LF-after-pipe-and-or-continues|backslash-LF-removed|quoted-LF-literal|unquoted-CR-whitespace|backslash-CRLF-keeps-escaped-CR-then-separates;expansion:parameter|special|arithmetic|command|pathname;compatibility_matrix:quirl-syntax/compatibility-v0.1.json@schema3}";
+pub const GRAMMAR_SCHEMA_DESCRIPTOR: &str = "quirl.command-grammar@4{CommandList{deny_unknown;pipelines:array<Pipeline>;connectors:array<and|or|sequence>;invariant:connectors.len+1=pipelines.len};Pipeline{deny_unknown;commands:array<SimpleCommand>;background:bool};SimpleCommand{deny_unknown;words:nonempty-array<string>;word_ir:array<Word>;redirects:array<Redirect>};Word{deny_unknown;parts:nonempty-array<WordPart>};WordPart{deny_unknown;text:string;quoting:unquoted|single|double|escaped};Redirect{deny_unknown;fd:u8;kind:input|output|append|here_string|duplicate_input|duplicate_output;path:string;target:Word};Program{deny_unknown;body:CompoundList};CompoundList{deny_unknown;items:array<ListItem>};ListItem{deny_unknown;and_or:AndOrList;background:bool};AndOrList{deny_unknown;first:PipelineNode;rest:array<ConnectedPipeline>};ConnectedPipeline{deny_unknown;connector:and|or;pipeline:PipelineNode};PipelineNode{deny_unknown;negated:bool;commands:nonempty-array<CommandNode>};CommandNode:simple(SimpleCommand)|compound(CompoundCommand)|redirected_compound(RedirectedCompound)|function_definition(FunctionDefinition);RedirectedCompound{deny_unknown;command:CompoundCommand;redirects:nonempty-array<Redirect>};CompoundCommand:brace_group(CompoundList)|if(IfClause)|for(ForClause)|while(LoopClause)|until(LoopClause)|case(CaseClause);IfClause{deny_unknown;branches:array<ConditionalBranch>;else_body:null|CompoundList};ConditionalBranch{deny_unknown;condition:CompoundList;body:CompoundList};ForClause{deny_unknown;variable:string;words:null|array<Word>;body:CompoundList};LoopClause{deny_unknown;condition:CompoundList;body:CompoundList};CaseClause{deny_unknown;subject:Word;arms:array<CaseArm>};CaseArm{deny_unknown;patterns:nonempty-array<Word>;body:CompoundList};FunctionDefinition{deny_unknown;name:string;body:CompoundCommand;source:string};tokens:word|pipe|and|or|semicolon|double_semicolon|newline|input|output|append|here_string|fd_duplicate|background;comments:hash-at-word-start-to-LF;lines:unquoted-LF-sequences|leading-blank-trailing-LF-ignored|LF-after-pipe-and-or-continues|backslash-LF-removed|quoted-LF-literal|unquoted-CR-whitespace|backslash-CRLF-keeps-escaped-CR-then-separates;expansion:parameter|positional|special|arithmetic|command|pathname|field-splitting;aliases:posix-command-position;compatibility_matrix:quirl-syntax/compatibility-v0.1.json@schema3}";
 
 const MAX_COMMAND_SUBSTITUTION_DEPTH: usize = 64;
 
@@ -160,7 +170,7 @@ pub enum RedirectKind {
     HereString,
     /// Duplicate an input descriptor (`<&`); reserved by the IR but rejected in native C1.
     DuplicateInput,
-    /// Duplicate an output descriptor (`>&`); native C1 accepts only `2>&1`.
+    /// Duplicate an output descriptor (`>&`); native C1 accepts `2>&1` and `>&2`.
     DuplicateOutput,
 }
 
@@ -195,8 +205,13 @@ enum TokenKind {
     Pipe,
     And,
     Or,
-    Redirect { fd: u8, kind: RedirectKind },
+    Redirect {
+        fd: u8,
+        kind: RedirectKind,
+    },
     Semicolon,
+    /// `;;`, which ends a `case` arm in a compound program.
+    DoubleSemicolon,
     Newline,
     Background,
 }
@@ -226,6 +241,9 @@ pub struct HighlightSpan {
 pub enum HighlightKind {
     /// First word of a command or pipeline stage.
     Command,
+    /// Unquoted reserved word at command position, such as `if`, `done`, `{`, or
+    /// `function`. The `in` of a `for` or `case` clause is also a keyword.
+    Keyword,
     /// Non-command word whose raw source starts with `-`.
     Flag,
     /// Ordinary argument text, including whitespace and neutral data-mode text.
@@ -299,10 +317,127 @@ pub fn highlight(line: &str, mode: Mode) -> Vec<HighlightSpan> {
     }
 }
 
+/// The word a compound-command keyword is still waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingWord {
+    /// No reserved-word construct is waiting for its next word.
+    None,
+    /// The loop variable of `for` or the subject of `case` comes next; `in` may follow it.
+    Subject,
+    /// The word after a `for` variable or `case` subject: `in` is a keyword here only.
+    AwaitIn,
+    /// The name of a `function NAME` definition comes next.
+    FunctionName,
+}
+
+/// Command-position state threaded through the lexer tokens of one line.
+///
+/// Keeping this state in one place makes the rules visible: an operator starts a
+/// new command, leading keywords such as `if` keep the next word in command
+/// position, and trailing keywords such as `done` end the command they close.
+#[derive(Debug)]
+struct HighlightState {
+    command_position: bool,
+    redirect_target: bool,
+    pending: PendingWord,
+}
+
+impl HighlightState {
+    const fn new() -> Self {
+        Self {
+            command_position: true,
+            redirect_target: false,
+            pending: PendingWord::None,
+        }
+    }
+
+    fn operator(&mut self) -> HighlightKind {
+        self.command_position = true;
+        self.pending = PendingWord::None;
+        HighlightKind::Operator
+    }
+
+    fn redirect(&mut self) -> HighlightKind {
+        self.redirect_target = true;
+        HighlightKind::Redirect
+    }
+
+    fn word(&mut self, raw: &str, word: &Word) -> HighlightKind {
+        let plain = plain_unquoted(raw, word);
+        match (self.pending, plain) {
+            (PendingWord::FunctionName, _) => {
+                // The body of `function NAME` starts at command position.
+                self.pending = PendingWord::None;
+                self.command_position = true;
+                return HighlightKind::Command;
+            }
+            (PendingWord::Subject, _) => {
+                self.pending = PendingWord::AwaitIn;
+                self.command_position = false;
+                return classify_word(raw, word);
+            }
+            (PendingWord::AwaitIn, Some("in")) => {
+                self.pending = PendingWord::None;
+                self.command_position = false;
+                return HighlightKind::Keyword;
+            }
+            (PendingWord::AwaitIn, _) => self.pending = PendingWord::None,
+            (PendingWord::None, _) => {}
+        }
+        if self.redirect_target {
+            self.redirect_target = false;
+            return HighlightKind::PathLike;
+        }
+        if self.command_position {
+            return self.command_word(raw, plain);
+        }
+        classify_word(raw, word)
+    }
+
+    fn command_word(&mut self, raw: &str, plain: Option<&str>) -> HighlightKind {
+        match plain {
+            Some("if" | "then" | "elif" | "else" | "do" | "while" | "until" | "!" | "{") => {
+                // The next word is still a command, as in `if git status`.
+                HighlightKind::Keyword
+            }
+            Some("fi" | "done" | "esac" | "}") => {
+                self.command_position = false;
+                HighlightKind::Keyword
+            }
+            Some("for" | "case") => {
+                self.command_position = false;
+                self.pending = PendingWord::Subject;
+                HighlightKind::Keyword
+            }
+            Some("function") => {
+                self.command_position = false;
+                self.pending = PendingWord::FunctionName;
+                HighlightKind::Keyword
+            }
+            _ => {
+                self.command_position = false;
+                // `name()` opens a function body, which starts at command position.
+                if raw.strip_suffix("()").is_some_and(|name| !name.is_empty()) {
+                    self.command_position = true;
+                }
+                HighlightKind::Command
+            }
+        }
+    }
+}
+
+/// Returns the raw text when `word` is one unquoted fragment, which is the only form
+/// that can be a reserved word.
+fn plain_unquoted<'a>(raw: &'a str, word: &Word) -> Option<&'a str> {
+    match word.parts.as_slice() {
+        [part] if part.quoting == Quoting::Unquoted => Some(raw),
+        _ => None,
+    }
+}
+
 fn highlight_tokens(line: &str, tokens: &[Token]) -> Vec<HighlightSpan> {
     let mut classified = Vec::with_capacity(tokens.len());
-    let mut command_position = true;
-    let mut redirect_target = false;
+    let mut state = HighlightState::new();
     for token in tokens {
         let raw = line.get(token.start..token.end).unwrap_or_default();
         let kind = match &token.kind {
@@ -310,26 +445,11 @@ fn highlight_tokens(line: &str, tokens: &[Token]) -> Vec<HighlightSpan> {
             | TokenKind::And
             | TokenKind::Or
             | TokenKind::Semicolon
+            | TokenKind::DoubleSemicolon
             | TokenKind::Newline
-            | TokenKind::Background => {
-                command_position = true;
-                HighlightKind::Operator
-            }
-            TokenKind::Redirect { .. } => {
-                redirect_target = true;
-                HighlightKind::Redirect
-            }
-            TokenKind::Word(word) => {
-                if command_position {
-                    command_position = false;
-                    HighlightKind::Command
-                } else if redirect_target {
-                    redirect_target = false;
-                    HighlightKind::PathLike
-                } else {
-                    classify_word(raw, word)
-                }
-            }
+            | TokenKind::Background => state.operator(),
+            TokenKind::Redirect { .. } => state.redirect(),
+            TokenKind::Word(word) => state.word(raw, word),
         };
         classified.push((token.start..token.end, kind));
     }
@@ -464,11 +584,11 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
                 };
                 if *kind == RedirectKind::DuplicateInput
                     || (*kind == RedirectKind::DuplicateOutput
-                        && (*fd != 2 || target.text() != "1"))
+                        && !is_standard_duplication(*fd, &target.text()))
                 {
                     return Err(syntax_error(
                         token,
-                        "native C1 supports only `2>&1` descriptor duplication",
+                        "native C1 supports only `2>&1` and `>&2` descriptor duplication",
                         "Use `bash { ... }` or `zsh { ... }` for this descriptor graph",
                     ));
                 }
@@ -511,6 +631,13 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
                         ));
                     }
                 });
+            }
+            TokenKind::DoubleSemicolon => {
+                return Err(syntax_error(
+                    token,
+                    "`;;` only ends a `case` arm",
+                    "Use a single `;` to separate commands",
+                ));
             }
             TokenKind::Background => {
                 commands.push(finish_command(
@@ -592,13 +719,67 @@ pub struct DialectControlForm {
     /// Whether the form defines a shell function (`name()` or `function`),
     /// which cannot outlive the shell that runs it.
     pub defines_function: bool,
+    /// Why the native grammar leaves this form to a reference shell.
+    pub reason: &'static str,
 }
 
-/// Return the first compound or expansion form that Quirl's native grammar
-/// leaves to a reference shell, such as `for`, `{ ...; }`, `[[`, or `{a,b}`.
-/// Returns `None` for native input and for input that does not tokenize.
+/// Return the first form in `input` that Quirl's native program grammar
+/// leaves to a reference shell, such as `[[`, a subshell, brace expansion, or a
+/// loop used as a pipeline stage. Natively executable control flow such as
+/// `for`, `if`, `case`, and function definitions returns `None`, as does input
+/// that is incomplete or invalid. Aliases are not applied.
+///
+/// [`DialectControlForm::defines_function`] is set when the input also
+/// defines a function anywhere, since that function could not outlive the
+/// reference shell.
 pub fn dialect_control_form(input: &str) -> Option<DialectControlForm> {
-    first_dialect_form(&lex_command(input).ok()?)
+    let Err(ProgramError::Unsupported(mut form)) = parse_program(input, &NoAliases) else {
+        return None;
+    };
+    form.defines_function |= lex_command(input)
+        .ok()
+        .and_then(|tokens| first_dialect_form(&tokens))
+        .is_some_and(|first| first.defines_function)
+        || defines_function_anywhere(input);
+    Some(form)
+}
+
+/// Whether any command-position word in `input` starts a function definition.
+fn defines_function_anywhere(input: &str) -> bool {
+    let Ok(tokens) = lex_command(input) else {
+        return false;
+    };
+    let mut command_position = true;
+    let mut previous_function_name = false;
+    for token in &tokens {
+        match &token.kind {
+            TokenKind::Word(word) => {
+                let text = word.text();
+                if previous_function_name && text == "()" {
+                    return true;
+                }
+                if command_position
+                    && (text == "function"
+                        || text
+                            .strip_suffix("()")
+                            .is_some_and(program::is_function_name))
+                {
+                    return true;
+                }
+                previous_function_name = command_position && program::is_function_name(&text);
+                command_position = is_reserved_word(&text) && text != "in";
+            }
+            TokenKind::Redirect { .. } => {
+                previous_function_name = false;
+                command_position = false;
+            }
+            _ => {
+                previous_function_name = false;
+                command_position = true;
+            }
+        }
+    }
+    false
 }
 
 /// Keep the native grammar deliberately unambiguous: compound dialect syntax cannot silently
@@ -627,6 +808,7 @@ fn first_dialect_form(tokens: &[Token]) -> Option<DialectControlForm> {
                 start: token.start,
                 end: token.end,
                 defines_function: false,
+                reason: "brace expansion is Bash and Zsh syntax",
             });
         }
         if redirect_target {
@@ -639,6 +821,7 @@ fn first_dialect_form(tokens: &[Token]) -> Option<DialectControlForm> {
             | TokenKind::And
             | TokenKind::Or
             | TokenKind::Semicolon
+            | TokenKind::DoubleSemicolon
             | TokenKind::Newline
             | TokenKind::Background => command_position = true,
             TokenKind::Word(word) => {
@@ -665,6 +848,7 @@ fn first_dialect_form(tokens: &[Token]) -> Option<DialectControlForm> {
                         start: token.start,
                         end: token.end,
                         defines_function,
+                        reason: "compound commands need the compound program grammar",
                     });
                 }
                 command_position = false;
@@ -720,51 +904,343 @@ pub fn data_statement_expression(line: &str) -> Option<&str> {
     (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim_start())
 }
 
+/// Largest statement, in bytes of source text, that [`split_script_statements`] accepts.
+///
+/// Joining re-checks the growing statement after each added line, so the
+/// work for one statement grows with lines × bytes. These bounds keep the
+/// worst case near 64 MiB of lexing, about a tenth of a second.
+pub const SCRIPT_STATEMENT_BYTES_MAX: usize = 64 * 1024;
+/// Most physical lines one script statement may span.
+pub const SCRIPT_STATEMENT_LINES_MAX: usize = 2_000;
+
+/// Bounds applied while splitting one script. Tests lower them so oversize cases stay cheap.
+#[derive(Debug, Clone, Copy)]
+struct ScriptStatementLimits {
+    bytes_max: usize,
+    lines_max: usize,
+}
+
+impl ScriptStatementLimits {
+    const DEFAULT: Self = Self {
+        bytes_max: SCRIPT_STATEMENT_BYTES_MAX,
+        lines_max: SCRIPT_STATEMENT_LINES_MAX,
+    };
+}
+
+/// One complete statement of a native `.qrl` script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptStatement<'a> {
+    /// Source text from the first non-blank byte through the last non-blank byte, including
+    /// interior line feeds and indentation.
+    pub text: &'a str,
+    /// Absolute half-open byte range of `text` within the script.
+    pub span: Range<usize>,
+}
+
+/// The complete statements of a script and the diagnostics found while splitting it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptSplit<'a> {
+    /// Complete statements in source order.
+    pub statements: Vec<ScriptStatement<'a>>,
+    /// Unterminated or oversized statements in source order. Their statements are omitted.
+    pub diagnostics: Vec<CommandSyntaxError>,
+    /// Whether splitting stopped at a statement bound. The last diagnostic then reports that bound
+    /// and no later statement is returned, because the oversized statement's extent, and so the
+    /// start of the next statement, is unknown.
+    pub limit_exceeded: bool,
+}
+
+/// Split a native `.qrl` script into complete statements without validating command syntax.
+///
+/// The shebang, blank lines, and `#` comment lines are skipped. A `data <expr>` line is one
+/// statement. Any other line starts a command statement, and following lines are joined while the
+/// text still ends inside a construct, so `for ...; do` through `done` is one statement. A `data`
+/// line never joins a pending command: the pending command is then reported as unterminated if it is
+/// still incomplete. An unterminated statement is a diagnostic derived from the parser's
+/// end-of-input error, pointing at that error's span or, when it has none, at the statement's last
+/// token.
+///
+/// A statement longer than [`SCRIPT_STATEMENT_BYTES_MAX`] bytes or
+/// [`SCRIPT_STATEMENT_LINES_MAX`] lines is a diagnostic, and splitting stops there. Joining reparses
+/// the growing statement, so one statement costs work quadratic in its line count; the bounds keep
+/// that finite. Every span is absolute within `source`, and nothing is executed.
+pub fn split_script_statements(source: &str) -> ScriptSplit<'_> {
+    split_script_statements_with_limits(source, ScriptStatementLimits::DEFAULT)
+}
+
+fn split_script_statements_with_limits(
+    source: &str,
+    limits: ScriptStatementLimits,
+) -> ScriptSplit<'_> {
+    let lines = script_lines(source);
+    let mut split = ScriptSplit {
+        statements: Vec::new(),
+        diagnostics: Vec::new(),
+        limit_exceeded: false,
+    };
+    let mut index = 0_usize;
+    while let Some(line) = lines.get(index) {
+        // The shebang is a `#` line, so it is skipped with the other comments.
+        let trimmed = line.text.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            index = index.saturating_add(1);
+            continue;
+        }
+        let Some(joined) = join_statement(source, &lines, index, limits) else {
+            break;
+        };
+        match joined {
+            Joined::Complete { span, next } => {
+                split.statements.push(ScriptStatement {
+                    text: source.get(span.clone()).unwrap_or_default(),
+                    span,
+                });
+                index = next;
+            }
+            Joined::Unterminated { diagnostic, next } => {
+                split.diagnostics.push(diagnostic);
+                index = next;
+            }
+            Joined::Oversized(diagnostic) => {
+                // Later lines cannot be attributed to statements once a boundary is unknown.
+                split.diagnostics.push(diagnostic);
+                split.limit_exceeded = true;
+                break;
+            }
+        }
+    }
+    split
+}
+
+/// One physical line of a script.
+struct ScriptLine<'a> {
+    /// Absolute byte offset of the line's first byte.
+    start: usize,
+    /// Line text without its line feed.
+    text: &'a str,
+}
+
+fn script_lines(source: &str) -> Vec<ScriptLine<'_>> {
+    let mut start = 0_usize;
+    source
+        .split_inclusive('\n')
+        .map(|raw| {
+            let line = ScriptLine {
+                start,
+                text: raw.strip_suffix('\n').unwrap_or(raw),
+            };
+            start = start.saturating_add(raw.len());
+            line
+        })
+        .collect()
+}
+
+/// The outcome of joining physical lines into one statement.
+enum Joined {
+    /// A complete statement spanning `span`; splitting resumes at line `next`.
+    Complete { span: Range<usize>, next: usize },
+    /// An incomplete statement. Its statement is omitted and splitting resumes at line `next`.
+    Unterminated {
+        diagnostic: CommandSyntaxError,
+        next: usize,
+    },
+    /// A statement over a bound. The diagnostic points at its first line.
+    Oversized(CommandSyntaxError),
+}
+
+/// Join the physical lines of the statement that begins at line `first`.
+///
+/// Returns `None` only when `first` is out of range. A `data` line is complete on its own and is
+/// never extended. A command line is extended one line at a time while it is incomplete, and
+/// extension stops before a `data` line.
+fn join_statement(
+    source: &str,
+    lines: &[ScriptLine<'_>],
+    first: usize,
+    limits: ScriptStatementLimits,
+) -> Option<Joined> {
+    let first_line = lines.get(first)?;
+    let head = statement_span(first_line, first_line);
+    let joinable = data_statement_expression(first_line.text.trim()).is_none();
+    let mut last = first;
+    loop {
+        let span = statement_span(first_line, lines.get(last)?);
+        if span.len() > limits.bytes_max {
+            return Some(Joined::Oversized(bytes_limit_diagnostic(
+                &head,
+                span.len(),
+                limits,
+            )));
+        }
+        let next = last.saturating_add(1);
+        if !joinable {
+            return Some(Joined::Complete { span, next });
+        }
+        let text = source.get(span.clone()).unwrap_or_default();
+        let Err(ProgramError::Incomplete(error)) = parse_program(text, &NoAliases) else {
+            return Some(Joined::Complete { span, next });
+        };
+        let Some(following) = lines.get(next) else {
+            return Some(Joined::Unterminated {
+                diagnostic: unterminated_diagnostic(error, &span, text),
+                next,
+            });
+        };
+        if data_statement_expression(following.text.trim()).is_some() {
+            return Some(Joined::Unterminated {
+                diagnostic: unterminated_diagnostic(error, &span, text),
+                next,
+            });
+        }
+        // Adding `following` would make the statement `next - first + 1` lines long.
+        if next.saturating_sub(first) >= limits.lines_max {
+            return Some(Joined::Oversized(lines_limit_diagnostic(&head, limits)));
+        }
+        last = next;
+    }
+}
+
+/// The span from the first non-blank byte of `first` through the last non-blank byte of `last`.
+fn statement_span(first: &ScriptLine<'_>, last: &ScriptLine<'_>) -> Range<usize> {
+    let indentation = first
+        .text
+        .len()
+        .saturating_sub(first.text.trim_start().len());
+    let start = first.start.saturating_add(indentation);
+    let end = last
+        .start
+        .saturating_add(last.text.trim_end().len())
+        .max(start);
+    start..end
+}
+
+fn bytes_limit_diagnostic(
+    head: &Range<usize>,
+    observed: usize,
+    limits: ScriptStatementLimits,
+) -> CommandSyntaxError {
+    CommandSyntaxError {
+        message: format!(
+            "script statement is {observed} bytes, over the {}-byte limit",
+            limits.bytes_max
+        ),
+        start: head.start,
+        end: head.end,
+        help: STATEMENT_SIZE_HELP.to_owned(),
+    }
+}
+
+fn lines_limit_diagnostic(
+    head: &Range<usize>,
+    limits: ScriptStatementLimits,
+) -> CommandSyntaxError {
+    CommandSyntaxError {
+        message: format!(
+            "script statement spans more than {} lines",
+            limits.lines_max
+        ),
+        start: head.start,
+        end: head.end,
+        help: STATEMENT_SIZE_HELP.to_owned(),
+    }
+}
+
+const STATEMENT_SIZE_HELP: &str =
+    "Split the statement, for example by moving a long loop body into a function";
+
+/// Derive the diagnostic for a statement that ends inside a construct.
+///
+/// `text` is the statement without trailing whitespace, and `span` is its absolute range. An
+/// end-of-input error has no width, so the diagnostic then points at the statement's last token.
+fn unterminated_diagnostic(
+    error: CommandSyntaxError,
+    span: &Range<usize>,
+    text: &str,
+) -> CommandSyntaxError {
+    let trimmed = text.trim_end();
+    let end = span.start.saturating_add(trimmed.len());
+    let (start, end) = if error.start < error.end {
+        (
+            span.start.saturating_add(error.start),
+            span.start.saturating_add(error.end),
+        )
+    } else {
+        let width = trimmed.chars().next_back().map_or(0, char::len_utf8);
+        (end.saturating_sub(width), end)
+    };
+    CommandSyntaxError {
+        message: error.message,
+        start,
+        end,
+        help: error.help,
+    }
+}
+
 /// Validate a line-oriented native Quirl script without executing it.
 ///
 /// `.qrl` is the canonical extension; `.quirl` and `.🌀` are accepted aliases
 /// at the CLI and language-service boundaries.
 ///
-/// Command statements use the same compatibility parser as interactive execution. `data`
-/// statements are recognized as a separate language island and require a non-empty expression.
-/// Every returned span is absolute within `source` and diagnostics retain source order. The
-/// checker scans linearly, does not execute source or recurse, and does not impose a byte limit;
-/// file-reading callers must reject oversized source before invoking it.
+/// Statements come from [`split_script_statements`]. Each command statement is checked with the
+/// native program grammar, and a `data` statement must have an expression. Every returned span is
+/// absolute within `source`, and diagnostics are in source order. The checker does not execute
+/// source or recurse. It does not bound the source size, so file-reading callers must reject
+/// oversized source before invoking it; each statement is bounded by the splitter.
 pub fn check_script(source: &str) -> Vec<CommandSyntaxError> {
-    let mut diagnostics = Vec::new();
-    let mut offset = 0_usize;
-    for (line_index, raw_line) in source.split_inclusive('\n').enumerate() {
-        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
-        let trimmed = line.trim();
-        let leading = line.len().saturating_sub(line.trim_start().len());
-        if (line_index == 0 && trimmed.starts_with("#!"))
-            || trimmed.is_empty()
-            || trimmed.starts_with('#')
-        {
-            offset = offset.saturating_add(raw_line.len());
-            continue;
+    let split = split_script_statements(source);
+    let mut diagnostics = split.diagnostics;
+    for statement in &split.statements {
+        match data_statement_expression(statement.text) {
+            Some("") => diagnostics.push(CommandSyntaxError {
+                message: "data statement requires an expression".to_owned(),
+                start: statement.span.start,
+                end: statement.span.end,
+                help: "Add a structured-data expression after `data`".to_owned(),
+            }),
+            Some(_) => {}
+            None => diagnostics.extend(
+                check_command_statement(statement.text)
+                    .map(|error| rebase_diagnostic(error, statement.span.start)),
+            ),
         }
-        if let Some(expression) = data_statement_expression(trimmed) {
-            if expression.is_empty() {
-                diagnostics.push(CommandSyntaxError {
-                    message: "data statement requires an expression".to_owned(),
-                    start: offset.saturating_add(leading),
-                    end: offset.saturating_add(leading).saturating_add(trimmed.len()),
-                    help: "Add a structured-data expression after `data`".to_owned(),
-                });
-            }
-            offset = offset.saturating_add(raw_line.len());
-            continue;
-        }
-        if let Err(mut error) = parse_command_list(trimmed) {
-            let line_start = offset.saturating_add(leading);
-            error.start = error.start.saturating_add(line_start);
-            error.end = error.end.saturating_add(line_start);
-            diagnostics.push(error);
-        }
-        offset = offset.saturating_add(raw_line.len());
     }
+    diagnostics.sort_by_key(|diagnostic| diagnostic.start);
     diagnostics
+}
+
+/// Validate one complete command statement with the native program grammar.
+///
+/// Returns the statement's diagnostic with offsets relative to `statement`; callers that know the
+/// statement's position in a larger script rebase them. An unsupported form is a diagnostic here,
+/// because `.qrl` scripts have no reference-shell fallback.
+pub fn check_command_statement(statement: &str) -> Option<CommandSyntaxError> {
+    match parse_program(statement, &NoAliases) {
+        Ok(_) => None,
+        // A complete statement cannot end inside a construct, so an incomplete error only occurs
+        // for partial text, and it is reported like any other syntax error.
+        Err(ProgramError::Incomplete(error) | ProgramError::Syntax(error)) => Some(error),
+        Err(ProgramError::Unsupported(form)) => Some(CommandSyntaxError {
+            message: format!(
+                "`{}` is not supported in .qrl scripts: {}",
+                form.text, form.reason
+            ),
+            start: form.start,
+            end: form.end,
+            help: "Run it with a reference shell: wrap it in `bash { ... }` or run the file with `quirl run --lang bash`".to_owned(),
+        }),
+    }
+}
+
+fn rebase_diagnostic(mut diagnostic: CommandSyntaxError, base: usize) -> CommandSyntaxError {
+    diagnostic.start = diagnostic.start.saturating_add(base);
+    diagnostic.end = diagnostic.end.saturating_add(base);
+    diagnostic
+}
+
+/// Whether `fd>&target` is one of the two native duplications: `2>&1`
+/// (standard error to standard output) or `1>&2` (the reverse).
+fn is_standard_duplication(fd: u8, target: &str) -> bool {
+    matches!((fd, target), (2, "1") | (1, "2"))
 }
 
 fn finish_command(
@@ -980,6 +1456,15 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
             quote_open = Some(index);
             continue;
         }
+        // A `#` that begins a word starts a comment that runs to the end of
+        // the physical line, as in POSIX `sh` and interactive Bash. The line
+        // feed itself still separates commands.
+        if character == '#' && word_start.is_none() && fragment.is_empty() && parts.is_empty() {
+            while characters.peek().is_some_and(|(_, next)| *next != '\n') {
+                characters.next();
+            }
+            continue;
+        }
         if character.is_whitespace() {
             push_word(
                 &mut tokens,
@@ -1025,6 +1510,10 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
                 Some((TokenKind::And, 2))
             }
             '&' => Some((TokenKind::Background, 1)),
+            ';' if characters.peek().is_some_and(|(_, next)| *next == ';') => {
+                characters.next();
+                Some((TokenKind::DoubleSemicolon, 2))
+            }
             ';' => Some((TokenKind::Semicolon, 1)),
             '<' if characters.peek().is_some_and(|(_, next)| *next == '(') => {
                 return Err(CommandSyntaxError {
@@ -1407,6 +1896,11 @@ mod tests {
             "unterminated 'quote",
             "echo 👨‍👩‍👧‍👦 > ./out",
             "a && b || c; d &",
+            "for x in a b; do echo $x; done",
+            "if git status; then\necho ok\nelif false; then echo no\nelse echo else; fi",
+            "case $x in a) echo a;; *) echo b;; esac",
+            "function greet { echo hi; }",
+            "greet() {\n  echo hi\n}",
             "\0\u{1b}\u{85}",
             long.as_str(),
         ];
@@ -1437,6 +1931,97 @@ mod tests {
         assert!(spans.iter().any(|span| {
             span.kind == HighlightKind::Command && source.get(span.range.clone()) == Some("tr")
         }));
+    }
+
+    /// Returns each non-blank span's text with its kind, in source order.
+    fn word_kinds(source: &str) -> Vec<(&str, HighlightKind)> {
+        highlight(source, Mode::Command)
+            .into_iter()
+            .filter_map(|span| {
+                let text = source.get(span.range.clone())?;
+                (!text.trim().is_empty()).then_some((text, span.kind))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reserved_words_at_command_position_are_keywords() {
+        use HighlightKind::{Argument, Command, Keyword, Operator};
+        assert_eq!(
+            word_kinds("if git status; then echo ok; fi"),
+            vec![
+                ("if", Keyword),
+                ("git", Command),
+                ("status", Argument),
+                (";", Operator),
+                ("then", Keyword),
+                ("echo", Command),
+                ("ok", Argument),
+                (";", Operator),
+                ("fi", Keyword),
+            ]
+        );
+    }
+
+    #[test]
+    fn loop_variable_and_in_are_not_commands() {
+        use HighlightKind::{Argument, Command, Keyword, Operator};
+        assert_eq!(
+            word_kinds("for x in a b; do echo $x; done"),
+            vec![
+                ("for", Keyword),
+                ("x", Argument),
+                ("in", Keyword),
+                ("a", Argument),
+                ("b", Argument),
+                (";", Operator),
+                ("do", Keyword),
+                ("echo", Command),
+                ("$x", HighlightKind::Expansion),
+                (";", Operator),
+                ("done", Keyword),
+            ]
+        );
+    }
+
+    #[test]
+    fn case_subject_is_followed_by_an_in_keyword() {
+        let kinds = word_kinds("case $x in");
+        assert_eq!(kinds[0], ("case", HighlightKind::Keyword));
+        assert_eq!(kinds[2], ("in", HighlightKind::Keyword));
+    }
+
+    #[test]
+    fn function_names_and_name_parens_are_commands_before_a_body_keyword() {
+        use HighlightKind::{Argument, Command, Keyword, Operator};
+        assert_eq!(
+            word_kinds("function greet { echo hi; }"),
+            vec![
+                ("function", Keyword),
+                ("greet", Command),
+                ("{", Keyword),
+                ("echo", Command),
+                ("hi", Argument),
+                (";", Operator),
+                ("}", Keyword),
+            ]
+        );
+        let kinds = word_kinds("greet() { echo hi; }");
+        assert_eq!(kinds[0], ("greet()", Command));
+        assert_eq!(kinds[1], ("{", Keyword));
+    }
+
+    #[test]
+    fn reserved_words_outside_command_position_or_quoted_are_plain_text() {
+        use HighlightKind::{Argument, Command, StringSingle};
+        assert_eq!(
+            word_kinds("echo if 'done'"),
+            vec![
+                ("echo", Command),
+                ("if", Argument),
+                ("'done'", StringSingle),
+            ]
+        );
     }
     use serde::Deserialize;
     use std::{collections::HashSet, process::Command};
@@ -1599,14 +2184,14 @@ mod tests {
     }
 
     #[test]
-    fn carriage_returns_and_hash_words_keep_their_existing_quote_semantics() {
+    fn carriage_returns_and_hash_words_keep_quote_semantics_and_comments_end_lines() {
         let graph =
-            parse_command_list("printf a\\\r\nprintf '#quoted' word#suffix #literal\n").unwrap();
+            parse_command_list("printf a\\\r\nprintf '#quoted' word#suffix #comment\n").unwrap();
         assert_eq!(graph.pipelines.len(), 2);
         assert_eq!(graph.pipelines[0].commands[0].words, ["printf", "a\r"]);
         assert_eq!(
             graph.pipelines[1].commands[0].words,
-            ["printf", "#quoted", "word#suffix", "#literal"]
+            ["printf", "#quoted", "word#suffix"]
         );
     }
 
@@ -1665,6 +2250,225 @@ mod tests {
     }
 
     #[test]
+    fn script_splitter_joins_a_multi_line_loop_into_one_statement() {
+        let source = "echo before\nfor name in a b; do\n  echo \"$name\"\ndone\necho after\n";
+        let split = split_script_statements(source);
+        assert!(split.diagnostics.is_empty());
+        assert!(!split.limit_exceeded);
+        let texts = split
+            .statements
+            .iter()
+            .map(|statement| statement.text)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            [
+                "echo before",
+                "for name in a b; do\n  echo \"$name\"\ndone",
+                "echo after"
+            ]
+        );
+        for statement in &split.statements {
+            assert_eq!(source.get(statement.span.clone()), Some(statement.text));
+        }
+    }
+
+    #[test]
+    fn script_splitter_joins_a_function_definition_across_lines() {
+        let source = "greet() {\n  printf '%s\\n' \"$1\"\n}\ngreet hi\n";
+        let split = split_script_statements(source);
+        assert!(split.diagnostics.is_empty());
+        let texts = split
+            .statements
+            .iter()
+            .map(|statement| statement.text)
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["greet() {\n  printf '%s\\n' \"$1\"\n}", "greet hi"]);
+    }
+
+    #[test]
+    fn script_splitter_keeps_nested_constructs_in_one_statement() {
+        let source = "for x in 1 2; do\n  if test \"$x\" = 1; then\n    echo one\n  else\n    echo other\n  fi\ndone\necho end\n";
+        let split = split_script_statements(source);
+        assert!(split.diagnostics.is_empty());
+        assert_eq!(split.statements.len(), 2);
+        assert!(split.statements[0].text.ends_with("\ndone"));
+        assert_eq!(split.statements[1].text, "echo end");
+    }
+
+    #[test]
+    fn script_splitter_keeps_comment_lines_inside_a_loop_body_in_the_statement() {
+        let source = "while true; do\n  # wait for the next turn\n  break\ndone\n# trailing comment\necho after\n";
+        let split = split_script_statements(source);
+        assert!(split.diagnostics.is_empty());
+        let texts = split
+            .statements
+            .iter()
+            .map(|statement| statement.text)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            [
+                "while true; do\n  # wait for the next turn\n  break\ndone",
+                "echo after"
+            ]
+        );
+    }
+
+    #[test]
+    fn script_splitter_ends_pending_commands_before_a_data_line() {
+        let source = "echo a\ndata [1, 2]\necho b\n";
+        let split = split_script_statements(source);
+        assert!(split.diagnostics.is_empty());
+        let texts = split
+            .statements
+            .iter()
+            .map(|statement| statement.text)
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["echo a", "data [1, 2]", "echo b"]);
+    }
+
+    #[test]
+    fn script_splitter_reports_a_construct_interrupted_by_a_data_line_as_unterminated() {
+        let source = "for x in a; do\ndata [1]\ndone\n";
+        let split = split_script_statements(source);
+        assert_eq!(split.diagnostics.len(), 1);
+        assert!(split.diagnostics[0].message.contains("`done`"));
+        let texts = split
+            .statements
+            .iter()
+            .map(|statement| statement.text)
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["data [1]", "done"]);
+    }
+
+    #[test]
+    fn script_splitter_reports_an_unterminated_loop_at_end_of_input_on_its_last_token() {
+        let source = "echo ok\nfor x in a; do\n  echo $x\n";
+        let split = split_script_statements(source);
+        assert_eq!(
+            split
+                .statements
+                .iter()
+                .map(|statement| statement.text)
+                .collect::<Vec<_>>(),
+            ["echo ok"]
+        );
+        let [diagnostic] = split.diagnostics.as_slice() else {
+            panic!("expected one unterminated diagnostic");
+        };
+        assert_eq!(
+            diagnostic.message,
+            "expected `done` before the end of input"
+        );
+        let last_token_end = source.trim_end().len();
+        assert_eq!(diagnostic.end, last_token_end);
+        assert_eq!(diagnostic.start, last_token_end - 1);
+    }
+
+    #[test]
+    fn script_splitter_stops_at_a_statement_over_the_line_limit() {
+        let source = "echo a\nfor x in a; do\n:\n:\ndone\necho z\n";
+        let split = split_script_statements_with_limits(
+            source,
+            ScriptStatementLimits {
+                bytes_max: 1024,
+                lines_max: 3,
+            },
+        );
+        assert!(split.limit_exceeded);
+        assert_eq!(
+            split
+                .statements
+                .iter()
+                .map(|statement| statement.text)
+                .collect::<Vec<_>>(),
+            ["echo a"]
+        );
+        let [diagnostic] = split.diagnostics.as_slice() else {
+            panic!("expected one limit diagnostic");
+        };
+        assert!(diagnostic.message.contains("more than 3 lines"));
+        assert_eq!(diagnostic.start, source.find("for").unwrap());
+    }
+
+    #[test]
+    fn script_splitter_rejects_a_statement_over_the_byte_limit() {
+        let source = "echo short\necho this statement is far too long\n";
+        let split = split_script_statements_with_limits(
+            source,
+            ScriptStatementLimits {
+                bytes_max: 16,
+                lines_max: 10,
+            },
+        );
+        assert!(split.limit_exceeded);
+        assert_eq!(split.statements.len(), 1);
+        let [diagnostic] = split.diagnostics.as_slice() else {
+            panic!("expected one limit diagnostic");
+        };
+        assert!(diagnostic.message.contains("16-byte limit"));
+        assert_eq!(diagnostic.start, source.find("echo this").unwrap());
+    }
+
+    #[test]
+    fn script_checker_accepts_multi_line_loops_and_functions() {
+        let source = "for x in a; do\n  echo $x\ndone\nf() {\n  return 0\n}\n";
+        assert!(check_script(source).is_empty());
+    }
+
+    #[test]
+    fn script_checker_reports_unsupported_forms_with_a_reference_shell_suggestion() {
+        let source = "echo ok\n[[ -f x ]]\n";
+        let diagnostics = check_script(source);
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one unsupported diagnostic");
+        };
+        assert_eq!(source.get(diagnostic.start..diagnostic.end), Some("[["));
+        assert!(diagnostic.message.contains("not supported in .qrl scripts"));
+        assert!(diagnostic.message.contains("[["));
+        assert!(diagnostic.help.contains("bash { ... }"));
+        assert!(diagnostic.help.contains("--lang bash"));
+    }
+
+    #[test]
+    fn script_checker_reports_a_syntax_error_inside_a_loop_with_an_absolute_span() {
+        let source = "echo ok\nfor x in a; do\n  echo ok |\ndone\n";
+        let diagnostics = check_script(source);
+        assert!(!diagnostics.is_empty());
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.start >= source.find("for").unwrap()
+                && source.get(diagnostic.start..diagnostic.end).is_some()
+        }));
+    }
+
+    #[test]
+    fn script_checker_reports_an_unterminated_construct_at_end_of_input() {
+        let source = "echo ok\nf() {\n  echo body\n";
+        let diagnostics = check_script(source);
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one unterminated diagnostic");
+        };
+        assert!(diagnostic.message.contains("before the end of input"));
+        assert_eq!(diagnostic.end, source.trim_end().len());
+    }
+
+    #[test]
+    fn script_checker_validates_a_statement_after_a_data_line_with_absolute_spans() {
+        let source = "data [1]\nprintf ok |\ndata\necho last\n";
+        let diagnostics = check_script(source);
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(
+            source.get(diagnostics[0].start..diagnostics[0].end),
+            Some("|")
+        );
+        assert_eq!(
+            source.get(diagnostics[1].start..diagnostics[1].end),
+            Some("data")
+        );
+    }
+
+    #[test]
     fn data_statement_classifier_accepts_whitespace_without_matching_command_names() {
         assert_eq!(data_statement_expression("data\t[1, 2]"), Some("[1, 2]"));
         assert_eq!(
@@ -1679,9 +2483,9 @@ mod tests {
     fn compatibility_matrix_is_versioned_complete_and_schema_checked() {
         let matrix: CompatibilityMatrix = serde_json::from_str(COMPATIBILITY_MATRIX_JSON).unwrap();
         assert_eq!(matrix.schema_version, 3);
-        assert_eq!(matrix.matrix_version, "0.1");
+        assert_eq!(matrix.matrix_version, "0.2");
         assert_eq!(matrix.target_contract_version, "1.0");
-        assert_eq!(matrix.compatibility_level, "C1-core-unix+C2-runner");
+        assert_eq!(matrix.compatibility_level, "C1-posix-native-unix+C2-runner");
         assert_eq!(matrix.contract_status, "frozen_disposition");
         assert!(!matrix.scope.is_empty());
         assert!(!matrix.differential_fixtures.is_empty());
@@ -1712,6 +2516,8 @@ mod tests {
                 "export_assignment",
                 "expansions",
                 "conditionals_and_control",
+                "functions",
+                "aliases",
                 "interactive_dialect_islands",
                 "bash_script_runner",
                 "zsh_script_runner",
@@ -1854,24 +2660,39 @@ mod tests {
     }
 
     #[test]
-    fn dialect_control_forms_are_reported_with_function_definitions_marked() {
-        let form = dialect_control_form("cd /tmp && for f in *; do echo $f; done").unwrap();
-        assert_eq!(form.text, "for");
+    fn only_forms_outside_the_native_program_grammar_are_dialect_forms() {
+        for native in [
+            "cd /tmp && for f in *; do echo $f; done",
+            "greet() { echo hi; }",
+            "function greet { echo hi; }",
+            "if true; then echo yes; fi",
+            "echo for '{a,b}' ${HOME}",
+            "echo 'unclosed",
+        ] {
+            assert_eq!(dialect_control_form(native), None, "{native}");
+        }
+        assert_eq!(dialect_control_form("{ echo a; } > out"), None);
+        let form = dialect_control_form("{ echo a; } < in").unwrap();
+        assert_eq!(form.text, "<");
         assert!(!form.defines_function);
-        assert_eq!(dialect_control_form("{ echo a; } > out").unwrap().text, "{");
+        assert!(form.reason.contains("subshell"));
         assert_eq!(dialect_control_form("echo {a,b}").unwrap().text, "{a,b}");
+        assert_eq!(dialect_control_form("[[ -n x ]]").unwrap().text, "[[");
         assert!(
-            dialect_control_form("greet() { echo hi; }")
+            dialect_control_form("greet() { echo hi; }; [[ -n x ]]")
                 .unwrap()
                 .defines_function
         );
         assert!(
-            dialect_control_form("function greet { echo hi; }")
+            dialect_control_form("[[ -n x ]] && function greet { echo hi; }")
                 .unwrap()
                 .defines_function
         );
-        assert_eq!(dialect_control_form("echo for '{a,b}' ${HOME}"), None);
-        assert_eq!(dialect_control_form("echo 'unclosed"), None);
+        assert!(
+            !dialect_control_form("echo greet; [[ -n x ]]")
+                .unwrap()
+                .defines_function
+        );
     }
 
     #[test]
@@ -1883,7 +2704,7 @@ mod tests {
                 .iter()
                 .all(|part| part.quoting == Quoting::Double)
         );
-        for source in ["echo nope 3> output", "echo nope 1>&2", "cat 0<&1"] {
+        for source in ["echo nope 3> output", "echo nope 1>&3", "cat 0<&1"] {
             let error = parse_command_list(source).unwrap_err();
             assert!(error.help.contains("bash { ... }"));
         }
@@ -1987,7 +2808,7 @@ mod tests {
                 continue;
             }
             for fixture in &matrix.differential_fixtures {
-                parse_command_list(&fixture.source).unwrap();
+                parse_program(&fixture.source, &NoAliases).unwrap();
                 let mut command = Command::new(shell);
                 if shell == "bash" {
                     command.args(["--noprofile", "--norc", "-c", &fixture.source]);

@@ -85,6 +85,7 @@ const CHECK_NAMES: &[&str] = &[
     "rich-review-regressions",
     "native-job-control",
     "noninteractive-dialect-islands",
+    "native-control-flow",
     "suspend-resume",
     "fallbacks",
     "no-color-preserves-semantic-hints",
@@ -523,7 +524,7 @@ pub(super) fn run(_root: &Path, binary: &Path, selected: &[String]) -> Result<()
     Ok(())
 }
 
-fn checks() -> [CheckCase; 43] {
+fn checks() -> [CheckCase; 44] {
     [
         CheckCase {
             name: "rich-editing",
@@ -684,6 +685,10 @@ fn checks() -> [CheckCase; 43] {
         CheckCase {
             name: "noninteractive-dialect-islands",
             run: check_noninteractive_dialect_islands,
+        },
+        CheckCase {
+            name: "native-control-flow",
+            run: check_native_control_flow,
         },
         CheckCase {
             name: "suspend-resume",
@@ -3820,6 +3825,127 @@ fn wait_for_fixture_child(session: &mut Session, pid_path: &Path) -> Result<(), 
         ),
     )
     .into())
+}
+
+/// Labels a failed journey step so the harness error names the step that broke.
+fn native_control_flow_step(step: &str, error: TaskError) -> TaskError {
+    io::Error::other(format!("native-control-flow step {step:?} failed: {error}")).into()
+}
+
+/// Drives an unfinished compound command, a function, an alias, and an
+/// interrupted loop through one rich editor session. A loop that never spawns
+/// a process must be stopped by the native SIGINT guard without killing Quirl.
+fn check_native_control_flow(binary: &Path) -> Result<(), TaskError> {
+    let mut session = Session::new(binary, SessionOptions::default())?;
+    session.pty.wait_for(STARTUP_MARKER)?;
+
+    // Enter inside an unfinished compound command inserts a line feed. The
+    // first line stays in the editor, and nothing may run until `done`.
+    let open_start = session.pty.output().len();
+    session.pty.type_text("for i in 1 2 3; do")?;
+    session.pty.send(key::ENTER)?;
+    session
+        .pty
+        .wait_for_screen("unfinished for loop in editor", |screen| {
+            screen.text().contains("for i in 1 2 3; do")
+        })
+        .map_err(|error| native_control_flow_step("unfinished for loop rendered", error))?;
+    session.pty.drain_for(Duration::from_millis(300))?;
+    assert_loop_not_run(&session, open_start, "first Enter inside for loop")?;
+
+    session.pty.type_text("printf 'L%s;' \"$i\"")?;
+    session.pty.send(key::ENTER)?;
+    session.pty.drain_for(Duration::from_millis(300))?;
+    assert_loop_not_run(&session, open_start, "body line inside for loop")?;
+
+    let done_start = session.pty.output().len();
+    session.pty.type_text("done")?;
+    session.pty.send(key::ENTER)?;
+    // The renderer moves the cursor between iterations, so the three markers
+    // are not contiguous in the raw transcript. Require them as rendered rows.
+    session
+        .pty
+        .wait_for_screen("for loop markers L1; L2; L3; rendered", |screen| {
+            let lines = screen.lines();
+            ["L1;", "L2;", "L3;"]
+                .iter()
+                .all(|marker| lines.iter().any(|line| line.trim() == *marker))
+        })
+        .map_err(|error| native_control_flow_step("for loop output", error))?;
+    wait_for_rich_input_since(&mut session, done_start)
+        .map_err(|error| native_control_flow_step("for loop prompt return", error))?;
+
+    enter_definition_and_wait_for_prompt(
+        &mut session,
+        "greet() { printf 'HELLO_%s\\n' \"$1\"; }",
+        "function definition",
+    )?;
+    execute_and_resume_with_marker(&mut session, "greet QUIRL", b"HELLO_QUIRL")
+        .map_err(|error| native_control_flow_step("function call output", error))?;
+
+    enter_definition_and_wait_for_prompt(
+        &mut session,
+        "alias shout='printf LOUD_%s\\n'",
+        "alias definition",
+    )?;
+    execute_and_resume_with_marker(&mut session, "shout ALIAS", b"LOUD_ALIAS")
+        .map_err(|error| native_control_flow_step("alias call output", error))?;
+
+    // The loop body is a no-op and spawns nothing, so only the executor's
+    // SIGINT check can stop it.
+    let loop_start = session.pty.output().len();
+    session.pty.type_text("while true; do :; done")?;
+    session.pty.send(key::ENTER)?;
+    session.pty.drain_for(Duration::from_millis(300))?;
+    session.pty.send(key::CTRL_C)?;
+    wait_for_rich_input_since(&mut session, loop_start)
+        .map_err(|error| native_control_flow_step("Ctrl-C returns to prompt", error))?;
+
+    execute_and_resume_with_marker(&mut session, "printf 'ALIVE_%s\\n' 42", b"ALIVE_42")
+        .map_err(|error| native_control_flow_step("shell survives Ctrl-C", error))?;
+
+    let cleanup_start = session.pty.output().len();
+    ensure_status(
+        send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
+        0,
+        "native control-flow exit",
+    )?;
+    ensure_terminal_restored(&session, cleanup_start, "native control-flow exit")
+}
+
+/// Enters a definition that prints nothing and waits for the editor to resume.
+fn enter_definition_and_wait_for_prompt(
+    session: &mut Session,
+    command: &str,
+    step: &str,
+) -> Result<(), TaskError> {
+    let start = session.pty.output().len();
+    session
+        .pty
+        .type_text(command)
+        .map_err(|error| native_control_flow_step(step, error))?;
+    session
+        .pty
+        .send(key::ENTER)
+        .map_err(|error| native_control_flow_step(step, error))?;
+    wait_for_rich_input_since(session, start).map_err(|error| native_control_flow_step(step, error))
+}
+
+/// Fails if the unfinished `for` loop executed, detected by its marker output
+/// or by a completed command record for its first line.
+fn assert_loop_not_run(session: &Session, start: usize, step: &str) -> Result<(), TaskError> {
+    let emitted = session.pty.output().get(start..).unwrap_or_default();
+    if contains(emitted, b"L1;") || session.pty.screen().text().contains("❯ for i in 1 2 3") {
+        return Err(native_control_flow_step(
+            step,
+            io::Error::other(format!(
+                "unfinished compound command was submitted; screen=\n{}",
+                session.pty.screen().text()
+            ))
+            .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn check_fallbacks(binary: &Path) -> Result<(), TaskError> {

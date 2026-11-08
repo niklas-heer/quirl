@@ -10,7 +10,7 @@ cargo xtask check
 It checks Rust and Quirl formatting, denies every Clippy warning, rejects
 undocumented public Rust APIs, builds workspace Rustdoc with warnings denied,
 runs the full workspace, executes 128 deterministic generated C1 differential
-cases against each available reference shell, runs the fixed 43-check real-PTY matrix
+cases against each available reference shell, runs the fixed 44-check real-PTY matrix
 and a seeded 12-journey keyboard session on Unix, and runs guest-side Lua tests.
 
 ## Local Linux validation with Docker or Colima

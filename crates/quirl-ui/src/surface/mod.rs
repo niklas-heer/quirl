@@ -22,8 +22,10 @@ pub use runtime::{
     InteractiveActivitySnapshot, InteractiveDataSnapshot, InteractiveEnvironmentSnapshot,
     InteractiveHomeDirectory, InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus,
     InteractivePanelBatch, InteractivePanelProvider, InteractivePanelSnapshot,
-    InteractiveRuntimeSnapshot, JOB_ACTION_ITEMS_MAX, JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX,
-    PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX, PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
+    InteractiveRuntimeSnapshot, InteractiveSessionCommand, InteractiveSessionCommandKind,
+    JOB_ACTION_ITEMS_MAX, JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX,
+    PANEL_FIELD_BYTES_MAX, PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
+    SESSION_COMMAND_NAME_BYTES_MAX, SESSION_COMMAND_TEXT_BYTES_MAX, SESSION_COMMANDS_MAX,
 };
 
 /// One-shot rich-session loader that returns the complete immutable catalog.
@@ -198,7 +200,7 @@ use quirl_core::{
     replace_file_atomically,
 };
 use quirl_lua::QuirlConfig;
-use quirl_syntax::{Mode, parse_command_list};
+use quirl_syntax::Mode;
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
     backend::{Backend, CrosstermBackend},
@@ -1285,7 +1287,14 @@ impl RichSurface {
 
     /// Replace the bounded immutable job and typed-result sources for the next frame.
     pub fn install_runtime_snapshot(&mut self, snapshot: InteractiveRuntimeSnapshot) {
-        self.runtime.install_snapshot(snapshot);
+        if self.runtime.install_snapshot(snapshot) {
+            // Both consumers share one immutable list, so a session change is
+            // one Arc publication rather than a copy per consumer.
+            let commands = self.runtime.session_commands();
+            self.input_analysis
+                .set_session_commands(Arc::clone(&commands));
+            self.completion.set_session_commands(commands);
+        }
     }
 
     /// Share the composition root's bounded raw HOME with filesystem completion.
@@ -4023,15 +4032,9 @@ fn with_completion_suffix(
 }
 
 fn input_is_incomplete(buffer: &str, mode: Mode) -> bool {
-    if mode != Mode::Command {
-        return false;
-    }
-    parse_command_list(buffer).is_err_and(|error| {
-        error.message.starts_with("unclosed ")
-            || error.message.contains("ends with an escape")
-            || (error.message.contains("expected a command")
-                && buffer.trim_end().ends_with(['|', '&']))
-    })
+    // Only command input has a grammar that can be unfinished; data mode keeps
+    // Enter as submit, as before.
+    mode == Mode::Command && quirl_syntax::is_incomplete(buffer)
 }
 
 fn transcript_visible_rows_for_terminal(rows: u16, follows_tail: bool) -> usize {
@@ -4308,6 +4311,25 @@ mod tests {
     fn incomplete_quotes_continue_instead_of_executing() {
         assert!(input_is_incomplete("printf 'hello", Mode::Command));
         assert!(!input_is_incomplete("printf hello", Mode::Command));
+    }
+
+    #[test]
+    fn unfinished_compound_commands_continue_while_complete_ones_submit() {
+        assert!(input_is_incomplete("for x in a b; do", Mode::Command));
+        assert!(input_is_incomplete("if true; then", Mode::Command));
+        assert!(input_is_incomplete("greet() {", Mode::Command));
+        assert!(input_is_incomplete("case $x in", Mode::Command));
+        assert!(!input_is_incomplete(
+            "for x in a b; do echo $x; done",
+            Mode::Command
+        ));
+        assert!(!input_is_incomplete("echo done", Mode::Command));
+    }
+
+    #[test]
+    fn data_mode_never_continues_a_line() {
+        assert!(!input_is_incomplete("for x in a b; do", Mode::Data));
+        assert!(!input_is_incomplete("printf 'hello", Mode::Data));
     }
 
     #[test]

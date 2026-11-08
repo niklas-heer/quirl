@@ -16,14 +16,22 @@
     )
 )]
 
+#[cfg(unix)]
+mod arithmetic;
 mod builtin;
 mod developer_context;
+#[cfg(unix)]
+mod echo_builtin;
+#[cfg(unix)]
+mod field_split;
 pub mod local_completion;
 #[cfg(unix)]
 mod posix_island;
 #[cfg(unix)]
 pub mod pty;
 mod spawn_lock;
+#[cfg(unix)]
+mod test_builtin;
 
 pub use developer_context::{DeveloperContextProbe, DeveloperContextSnapshot};
 use spawn_lock::spawn_guard_scope;
@@ -113,8 +121,52 @@ pub(crate) struct SessionEnvironment {
     variables: BTreeMap<OsString, OsString>,
     /// Unexported shell variables, such as those set by a bare `NAME=value`.
     locals: BTreeMap<OsString, OsString>,
+    /// Name and value bytes summed over both maps. Kept in step with every
+    /// mutation so single-name updates check the byte limit in O(log n)
+    /// instead of rescanning the whole environment.
+    retained_bytes: usize,
+    /// Count limit for both maps together. Stored on the instance, not read
+    /// from the constant, so a small-limit test can exercise the real trip path.
+    variables_max: usize,
+    /// Byte limit for both maps together, stored for the same reason.
+    bytes_max: usize,
     initialization_error: Option<quirl_core::ShellError>,
     generation: u64,
+}
+
+/// The binding one name holds after a single-name mutation.
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "only Unix shell assignments create unexported bindings"
+    )
+)]
+enum Binding {
+    /// Exported with this value, and absent from the locals.
+    Exported(OsString),
+    /// Unexported with this value, and absent from the exports.
+    Local(OsString),
+    /// Absent from both maps.
+    Unset,
+}
+
+impl Binding {
+    /// The value this binding stores, or `None` when the name is unset.
+    fn value(&self) -> Option<&OsString> {
+        match self {
+            Self::Exported(value) | Self::Local(value) => Some(value),
+            Self::Unset => None,
+        }
+    }
+
+    /// The exported value this binding stores, which is what children see.
+    fn exported(&self) -> Option<&OsString> {
+        match self {
+            Self::Exported(value) => Some(value),
+            Self::Local(_) | Self::Unset => None,
+        }
+    }
 }
 
 impl Default for SessionEnvironment {
@@ -127,6 +179,8 @@ impl Default for SessionEnvironment {
                 OsString::from("PPID"),
                 OsString::from(std::os::unix::process::parent_id().to_string()),
             );
+            environment.retained_bytes =
+                retained_bytes_of(&environment.variables, &environment.locals);
         }
         environment
     }
@@ -147,15 +201,24 @@ impl SessionEnvironment {
         bytes_max: usize,
     ) -> Self {
         match Self::from_iter_with_limits(variables, variables_max, bytes_max) {
+            // The streaming check above counts every pair it reads, including
+            // a repeated name that the map then overwrites. The cache instead
+            // reflects the map contents, which is what later mutations change.
             Ok(variables) => Self {
+                retained_bytes: retained_bytes_of(&variables, &BTreeMap::new()),
                 variables,
                 locals: BTreeMap::new(),
+                variables_max,
+                bytes_max,
                 initialization_error: None,
                 generation: 0,
             },
             Err(error) => Self {
                 variables: BTreeMap::new(),
                 locals: BTreeMap::new(),
+                retained_bytes: 0,
+                variables_max,
+                bytes_max,
                 initialization_error: Some(error),
                 generation: 0,
             },
@@ -214,6 +277,7 @@ impl SessionEnvironment {
     /// expansion's unset-only operators (`${VAR-word}`, `${VAR+word}`,
     /// `${VAR=word}`, `${VAR?word}`) need this distinction; `value` alone
     /// cannot provide it because it returns an empty string for both.
+    #[cfg(test)]
     fn is_set(&self, name: &str) -> bool {
         self.lookup(name).is_some()
     }
@@ -242,12 +306,45 @@ impl SessionEnvironment {
         })
     }
 
+    /// The value of `name` and whether it is exported, so `local` can put it
+    /// back when a function returns.
+    fn saved_variable(&self, name: &str) -> Option<(OsString, bool)> {
+        let name = OsStr::new(name);
+        self.variables
+            .get(name)
+            .map(|value| (value.clone(), true))
+            .or_else(|| self.locals.get(name).map(|value| (value.clone(), false)))
+    }
+
+    /// Put back a value captured by [`Self::saved_variable`]: `None` unsets
+    /// the name, otherwise it gets the value and export attribute it had.
+    fn restore_variable(
+        &mut self,
+        name: &str,
+        saved: Option<(OsString, bool)>,
+    ) -> Result<(), quirl_core::ShellError> {
+        self.unset_names(&[name.to_owned()])?;
+        let Some((value, exported)) = saved else {
+            return Ok(());
+        };
+        let assignment = [(name.to_owned(), value.to_string_lossy().into_owned())];
+        if exported {
+            self.set_variables(&assignment)
+        } else {
+            self.assign_variables(&assignment)
+        }
+    }
+
     /// Set and export variables, as `export NAME=value` does.
     fn set_variables(
         &mut self,
         assignments: &[(String, String)],
     ) -> Result<(), quirl_core::ShellError> {
         self.ensure_valid()?;
+        if let [(name, value)] = assignments {
+            validate_environment_assignment(name, value)?;
+            return self.replace_name(name, Binding::Exported(OsString::from(value)));
+        }
         let mut exported = self.variables.clone();
         let mut locals = self.locals.clone();
         for (name, value) in assignments {
@@ -265,6 +362,15 @@ impl SessionEnvironment {
         assignments: &[(String, String)],
     ) -> Result<(), quirl_core::ShellError> {
         self.ensure_valid()?;
+        if let [(name, value)] = assignments {
+            validate_environment_assignment(name, value)?;
+            let binding = if self.variables.contains_key(OsStr::new(name)) {
+                Binding::Exported(OsString::from(value))
+            } else {
+                Binding::Local(OsString::from(value))
+            };
+            return self.replace_name(name, binding);
+        }
         let mut exported = self.variables.clone();
         let mut locals = self.locals.clone();
         for (name, value) in assignments {
@@ -283,6 +389,14 @@ impl SessionEnvironment {
     /// A name with no value stays unset, matching `export NAME` in `sh`.
     fn export_names(&mut self, names: &[String]) -> Result<(), quirl_core::ShellError> {
         self.ensure_valid()?;
+        if let [name] = names {
+            validate_environment_assignment(name, "")?;
+            // A name that is not a local has nothing to export, so nothing changes.
+            if let Some(value) = self.locals.get(OsStr::new(name)).cloned() {
+                return self.replace_name(name, Binding::Exported(value));
+            }
+            return Ok(());
+        }
         let mut exported = self.variables.clone();
         let mut locals = self.locals.clone();
         for name in names {
@@ -297,6 +411,10 @@ impl SessionEnvironment {
     /// Remove variables, as `unset NAME` does. Unknown names are ignored.
     fn unset_names(&mut self, names: &[String]) -> Result<(), quirl_core::ShellError> {
         self.ensure_valid()?;
+        if let [name] = names {
+            validate_environment_assignment(name, "")?;
+            return self.replace_name(name, Binding::Unset);
+        }
         let mut exported = self.variables.clone();
         let mut locals = self.locals.clone();
         for name in names {
@@ -319,49 +437,463 @@ impl SessionEnvironment {
         self.commit(imported, locals)
     }
 
+    /// Number of names across both maps, which the variable limit bounds.
+    fn variable_count(&self) -> usize {
+        self.variables.len().saturating_add(self.locals.len())
+    }
+
+    /// The generation after one more exported-map change. Failing here,
+    /// before any map is touched, keeps an overflowing update all-or-nothing.
+    fn next_generation(&self) -> Result<u64, quirl_core::ShellError> {
+        self.generation.checked_add(1).ok_or_else(|| {
+            quirl_core::ShellError::new(
+                quirl_core::ErrorCode::ResourceLimit,
+                "session environment has been updated too many times to track safely",
+            )
+            .with_help("Restart Quirl before applying another environment update")
+        })
+    }
+
+    /// Change one name's binding in place, the hot path for single-name
+    /// mutations such as `NAME=value` inside a loop.
+    ///
+    /// Every limit and the generation are projected from the name's current
+    /// entry before either map is touched, so an error leaves the state as it
+    /// was. The generation advances only when the exported map changes, which
+    /// is when children would see a different environment.
+    fn replace_name(&mut self, name: &str, next: Binding) -> Result<(), quirl_core::ShellError> {
+        let name = OsString::from(name);
+        let current_exported = self.variables.get(&name);
+        let current = current_exported.or_else(|| self.locals.get(&name));
+        let current_bytes = current.map_or(0, |value| entry_bytes(&name, value));
+        debug_assert!(
+            self.retained_bytes >= current_bytes,
+            "cached retained bytes must include every stored entry"
+        );
+
+        let variable_count = self
+            .variable_count()
+            .saturating_sub(usize::from(current.is_some()))
+            .saturating_add(usize::from(next.value().is_some()));
+        if variable_count > self.variables_max {
+            return Err(environment_variable_limit_error(
+                self.variables_max,
+                variable_count,
+            ));
+        }
+        let next_bytes = next.value().map_or(0, |value| entry_bytes(&name, value));
+        let retained_bytes = self
+            .retained_bytes
+            .saturating_sub(current_bytes)
+            .saturating_add(next_bytes);
+        if retained_bytes > self.bytes_max {
+            return Err(environment_byte_limit_error(self.bytes_max, retained_bytes));
+        }
+        let generation = if current_exported == next.exported() {
+            None
+        } else {
+            Some(self.next_generation()?)
+        };
+
+        match next {
+            Binding::Exported(value) => {
+                self.locals.remove(&name);
+                self.variables.insert(name, value);
+            }
+            Binding::Local(value) => {
+                self.variables.remove(&name);
+                self.locals.insert(name, value);
+            }
+            Binding::Unset => {
+                self.variables.remove(&name);
+                self.locals.remove(&name);
+            }
+        }
+        self.retained_bytes = retained_bytes;
+        if let Some(generation) = generation {
+            self.generation = generation;
+        }
+        Ok(())
+    }
+
     /// Validate both maps against the shared limits, then publish them.
+    ///
+    /// This clone-based path serves multi-name calls and imports, which are
+    /// rare, so rescanning the maps here is acceptable.
     fn commit(
         &mut self,
         exported: BTreeMap<OsString, OsString>,
         locals: BTreeMap<OsString, OsString>,
     ) -> Result<(), quirl_core::ShellError> {
         let variable_count = exported.len().saturating_add(locals.len());
-        if variable_count > SESSION_ENVIRONMENT_VARIABLES_MAX {
+        if variable_count > self.variables_max {
             return Err(environment_variable_limit_error(
-                SESSION_ENVIRONMENT_VARIABLES_MAX,
+                self.variables_max,
                 variable_count,
             ));
         }
-        let retained_bytes =
-            exported
-                .iter()
-                .chain(locals.iter())
-                .fold(0_usize, |retained, (name, value)| {
-                    retained
-                        .saturating_add(name.len())
-                        .saturating_add(value.len())
-                });
-        if retained_bytes > SESSION_ENVIRONMENT_BYTES_MAX {
-            return Err(environment_byte_limit_error(
-                SESSION_ENVIRONMENT_BYTES_MAX,
-                retained_bytes,
-            ));
+        let retained_bytes = retained_bytes_of(&exported, &locals);
+        if retained_bytes > self.bytes_max {
+            return Err(environment_byte_limit_error(self.bytes_max, retained_bytes));
         }
         // Children observe only exported variables, so only those advance
         // the generation that tells observers to refresh derived state.
         if exported != self.variables {
-            let generation = self.generation.checked_add(1).ok_or_else(|| {
-                quirl_core::ShellError::new(
-                    quirl_core::ErrorCode::ResourceLimit,
-                    "session environment has been updated too many times to track safely",
-                )
-                .with_help("Restart Quirl before applying another environment update")
-            })?;
+            let generation = self.next_generation()?;
             self.variables = exported;
             self.generation = generation;
         }
         self.locals = locals;
+        self.retained_bytes = retained_bytes;
         Ok(())
+    }
+}
+
+/// Bytes one stored entry retains: its name plus its value.
+fn entry_bytes(name: &OsStr, value: &OsStr) -> usize {
+    name.len().saturating_add(value.len())
+}
+
+/// Bytes retained across both maps, the total the byte limit bounds.
+fn retained_bytes_of(
+    variables: &BTreeMap<OsString, OsString>,
+    locals: &BTreeMap<OsString, OsString>,
+) -> usize {
+    variables
+        .iter()
+        .chain(locals.iter())
+        .fold(0_usize, |retained, (name, value)| {
+            retained.saturating_add(entry_bytes(name, value))
+        })
+}
+
+#[cfg(test)]
+mod session_environment_tests {
+    use super::{BTreeMap, OsStr, OsString, SessionEnvironment, retained_bytes_of};
+    use quirl_core::ErrorCode;
+
+    fn exported_fixture(pairs: &[(&str, &str)]) -> SessionEnvironment {
+        SessionEnvironment::capture(
+            pairs
+                .iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+        )
+    }
+
+    fn limited_fixture(
+        pairs: &[(&str, &str)],
+        variables_max: usize,
+        bytes_max: usize,
+    ) -> SessionEnvironment {
+        SessionEnvironment::capture_with_limits(
+            pairs
+                .iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+            variables_max,
+            bytes_max,
+        )
+    }
+
+    /// Checks the cache against a full recount of both maps, and that a name
+    /// is never both exported and local. Each mutation test calls this after
+    /// it changes state, so a drifted byte total fails at the mutation that
+    /// caused it.
+    fn assert_cached_totals(environment: &SessionEnvironment) {
+        assert_eq!(
+            environment.retained_bytes,
+            retained_bytes_of(&environment.variables, &environment.locals),
+            "cached retained bytes must equal a recount of both maps"
+        );
+        assert!(
+            environment
+                .variables
+                .keys()
+                .all(|name| !environment.locals.contains_key(name)),
+            "a name must never be both exported and local"
+        );
+    }
+
+    /// Whether two environments hold the same observable state. Used to show
+    /// that a rejected update changed nothing, not just that it returned an error.
+    fn assert_same_state(before: &SessionEnvironment, after: &SessionEnvironment) {
+        assert_eq!(before.variables, after.variables);
+        assert_eq!(before.locals, after.locals);
+        assert_eq!(before.generation, after.generation);
+        assert_eq!(before.retained_bytes, after.retained_bytes);
+    }
+
+    fn local_of(environment: &SessionEnvironment, name: &str) -> Option<OsString> {
+        environment.locals.get(OsStr::new(name)).cloned()
+    }
+
+    fn exported_of(environment: &SessionEnvironment, name: &str) -> Option<OsString> {
+        environment.variables.get(OsStr::new(name)).cloned()
+    }
+
+    #[test]
+    fn assigning_new_name_creates_local_without_bumping_generation() {
+        let mut environment = exported_fixture(&[]);
+
+        environment
+            .assign_variables(&[("NEW".to_owned(), "1".to_owned())])
+            .unwrap();
+
+        assert_eq!(local_of(&environment, "NEW"), Some(OsString::from("1")));
+        assert_eq!(exported_of(&environment, "NEW"), None);
+        assert_eq!(environment.generation, 0);
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn overwriting_exported_variable_keeps_export_and_bumps_generation() {
+        let mut environment = exported_fixture(&[("PATH_LIKE", "old")]);
+
+        environment
+            .assign_variables(&[("PATH_LIKE".to_owned(), "new".to_owned())])
+            .unwrap();
+
+        assert_eq!(exported_of(&environment, "PATH_LIKE"), Some("new".into()));
+        assert_eq!(local_of(&environment, "PATH_LIKE"), None);
+        assert_eq!(environment.generation, 1);
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn assigning_same_value_to_exported_variable_keeps_generation() {
+        let mut environment = exported_fixture(&[("SAME", "value")]);
+
+        environment
+            .assign_variables(&[("SAME".to_owned(), "value".to_owned())])
+            .unwrap();
+
+        assert_eq!(environment.generation, 0);
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn locals_never_bump_generation_when_they_change() {
+        let mut environment = exported_fixture(&[]);
+
+        environment
+            .assign_variables(&[("LOCAL".to_owned(), "one".to_owned())])
+            .unwrap();
+        environment
+            .assign_variables(&[("LOCAL".to_owned(), "two".to_owned())])
+            .unwrap();
+
+        assert_eq!(local_of(&environment, "LOCAL"), Some("two".into()));
+        assert_eq!(environment.generation, 0);
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn byte_limit_rejects_growth_past_exact_boundary_without_mutating() {
+        // "A" + "1234" is 5 bytes; the limit allows exactly 6.
+        let mut environment = limited_fixture(&[("A", "1234")], 100, 6);
+        let before = environment.clone();
+
+        let error = environment
+            .assign_variables(&[("B".to_owned(), "xy".to_owned())])
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("observed 8"));
+        assert_same_state(&before, &environment);
+
+        environment
+            .assign_variables(&[("A".to_owned(), "12345".to_owned())])
+            .unwrap();
+        assert_eq!(exported_of(&environment, "A"), Some("12345".into()));
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn count_limit_rejects_new_name_without_mutating() {
+        let mut environment = limited_fixture(&[("A", "1")], 1, 100);
+        let before = environment.clone();
+
+        let error = environment
+            .set_variables(&[("B".to_owned(), "2".to_owned())])
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("observed 2"));
+        assert_same_state(&before, &environment);
+    }
+
+    #[test]
+    fn count_limit_allows_replacing_an_existing_name_at_capacity() {
+        let mut environment = limited_fixture(&[("A", "1")], 1, 100);
+
+        environment
+            .set_variables(&[("A".to_owned(), "2".to_owned())])
+            .unwrap();
+
+        assert_eq!(exported_of(&environment, "A"), Some("2".into()));
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn invalid_single_assignment_leaves_environment_unchanged() {
+        let mut environment = exported_fixture(&[("A", "1")]);
+        let before = environment.clone();
+
+        let error = environment
+            .set_variables(&[("INVALID-NAME".to_owned(), "2".to_owned())])
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_same_state(&before, &environment);
+    }
+
+    #[test]
+    fn generation_overflow_rejects_export_change_without_mutating() {
+        let mut environment = exported_fixture(&[("A", "1")]);
+        environment.generation = u64::MAX;
+        let before = environment.clone();
+
+        let error = environment
+            .assign_variables(&[("A".to_owned(), "2".to_owned())])
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert_same_state(&before, &environment);
+    }
+
+    #[test]
+    fn unset_removes_name_from_exports_and_locals_and_fixes_byte_total() {
+        let mut environment = exported_fixture(&[("A", "11")]);
+        environment
+            .assign_variables(&[("L".to_owned(), "222".to_owned())])
+            .unwrap();
+
+        environment.unset_names(&["L".to_owned()]).unwrap();
+        assert_eq!(local_of(&environment, "L"), None);
+        assert_eq!(environment.generation, 0);
+        assert_cached_totals(&environment);
+
+        environment.unset_names(&["A".to_owned()]).unwrap();
+        assert_eq!(exported_of(&environment, "A"), None);
+        assert_eq!(environment.generation, 1);
+        assert_eq!(environment.retained_bytes, 0);
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn export_names_moves_local_to_exported_and_bumps_generation() {
+        let mut environment = exported_fixture(&[]);
+        environment
+            .assign_variables(&[("MOVE".to_owned(), "7".to_owned())])
+            .unwrap();
+
+        environment.export_names(&["MOVE".to_owned()]).unwrap();
+
+        assert_eq!(exported_of(&environment, "MOVE"), Some("7".into()));
+        assert_eq!(local_of(&environment, "MOVE"), None);
+        assert_eq!(environment.generation, 1);
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn export_names_of_unset_name_changes_nothing() {
+        let mut environment = exported_fixture(&[("A", "1")]);
+        let before = environment.clone();
+
+        environment.export_names(&["MISSING".to_owned()]).unwrap();
+
+        assert_same_state(&before, &environment);
+    }
+
+    #[test]
+    fn repeated_name_in_one_assign_call_keeps_last_value() {
+        let mut environment = exported_fixture(&[("EXPORTED", "0")]);
+
+        environment
+            .assign_variables(&[
+                ("LOCAL".to_owned(), "first".to_owned()),
+                ("LOCAL".to_owned(), "second".to_owned()),
+                ("EXPORTED".to_owned(), "1".to_owned()),
+                ("EXPORTED".to_owned(), "2".to_owned()),
+            ])
+            .unwrap();
+
+        assert_eq!(local_of(&environment, "LOCAL"), Some("second".into()));
+        assert_eq!(exported_of(&environment, "EXPORTED"), Some("2".into()));
+        assert_eq!(environment.generation, 1);
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn import_exported_recounts_bytes_and_keeps_unexported_locals() {
+        let mut environment = exported_fixture(&[("OLD", "1")]);
+        environment
+            .assign_variables(&[("KEEP".to_owned(), "22".to_owned())])
+            .unwrap();
+        let imported = BTreeMap::from([(OsString::from("NEW"), OsString::from("333"))]);
+
+        environment.import_exported(imported).unwrap();
+
+        assert_eq!(exported_of(&environment, "OLD"), None);
+        assert_eq!(exported_of(&environment, "NEW"), Some("333".into()));
+        assert_eq!(local_of(&environment, "KEEP"), Some("22".into()));
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn cache_matches_recount_after_200_fixed_mixed_operations() {
+        // Fixed-seed xorshift, so every run replays the same operation
+        // sequence. The names are few so that overwrites, exports, unsets,
+        // and multi-name calls all hit the same entries.
+        let mut seed: u64 = 0x5eed_0bad_c0de_0001;
+        let mut next_roll = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut environment = exported_fixture(&[("SEED_EXPORT", "start")]);
+
+        for _ in 0..200 {
+            let roll = next_roll();
+            let name = format!("V{}", roll % 6);
+            let value = "x".repeat(usize::try_from(roll % 5).unwrap());
+            let other = format!("V{}", (roll >> 8) % 6);
+            match (roll >> 16) % 6 {
+                0 => environment.assign_variables(&[(name, value)]).unwrap(),
+                1 => environment.set_variables(&[(name, value)]).unwrap(),
+                2 => environment.export_names(&[name]).unwrap(),
+                3 => environment.unset_names(&[name]).unwrap(),
+                4 => environment
+                    .assign_variables(&[(name, value.clone()), (other, value)])
+                    .unwrap(),
+                _ => environment
+                    .import_exported(BTreeMap::from([(
+                        OsString::from(name),
+                        OsString::from(value),
+                    )]))
+                    .unwrap(),
+            }
+            assert_cached_totals(&environment);
+        }
+    }
+}
+
+/// Shell variables as seen by `$(( ))`: reads use the session's value, and
+/// assignment operators set the variable as a bare `NAME=value` would.
+#[cfg(unix)]
+struct SessionArithmetic<'a>(&'a mut SessionEnvironment);
+
+#[cfg(unix)]
+impl arithmetic::ArithmeticVariables for SessionArithmetic<'_> {
+    fn get(&self, name: &str) -> Option<String> {
+        self.0
+            .lookup(name)
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    fn set(&mut self, name: &str, value: i64) -> Result<(), quirl_core::ShellError> {
+        self.0
+            .assign_variables(&[(name.to_owned(), value.to_string())])
     }
 }
 
@@ -441,7 +973,7 @@ fn noninteractive_process_error(source: &str, message: &str) -> quirl_core::Shel
 }
 
 /// Version of the serialized native runner contract.
-pub const RUNNER_PROTOCOL_VERSION: u32 = 3;
+pub const RUNNER_PROTOCOL_VERSION: u32 = 4;
 /// Historical runner version retained as fail-closed compatibility evidence.
 pub const RUNNER_PROTOCOL_VERSION_V1: u32 = 1;
 /// Default bytes retained for final stdout and, separately, aggregate stderr
@@ -472,7 +1004,7 @@ pub const RETAINED_JOBS_MAX: usize = 1024;
 /// Historical runner-v1 descriptor retained verbatim for compatibility review.
 pub const RUNNER_SCHEMA_DESCRIPTOR_V1: &str = "quirl.runner@1{input:quirl.command-grammar@1,native-source-bytes<=1048576,native-pipelines<=256,native-stages-per-pipeline<=64,here-string-bytes-including-newline<=262144,arithmetic-source-bytes<=16384,arithmetic-depth<=64;ProcessBackend{execute_capture(source)->CommandOutcome;execute_interactive(source)->CommandOutcome;jobs()->array<JobState>;foreground_job(id)->JobState;cancel_job(id)->JobState;suspend_job(id)->JobState};JobState{deny_unknown;id:u32;command:string;status:running|stopped|done;process_group:null|i32;exit_status:null|i32};CommandOutcome{status:i32;stdout:null|string;stderr:null|string};capture:default-retained-per-stream=1048576|caller-tighter,drain-excess-then-ResourceLimit-with-retained-and-discarded-byte-context;interactive:inherit-streams-without-retention-limit;byte-pipeline:ordered;redirection:input|output|append|here-string;background:terminal-ampersand;cancel-status:130;errors:ShellError;platform:suspend-unavailable-on-windows}";
 /// Canonical descriptor hashed to identify the native runner contract.
-pub const RUNNER_SCHEMA_DESCRIPTOR: &str = "quirl.runner@3{input:quirl.command-grammar@3,native-source-bytes<=1048576,native-pipelines<=256,native-stages-per-pipeline<=64,retained-jobs<=1024,job-id:u32-nonzero-wrap-skip-visible,here-string-bytes-including-newline<=262144,arithmetic-source-bytes<=16384,arithmetic-depth<=64;ProcessBackend{execute(source)->CommandOutcome;execute_capture(source)->CommandOutcome;jobs()->array<JobState>;cancel_job(id)->JobState;suspend_job(id)->JobState};JobState{deny_unknown;id:u32-nonzero;command:string;status:running|stopped|done;process_group:null|i32;exit_status:null|i32};CommandOutcome{status:i32;stdout:null|string;stderr:null|string};capture:default-retained-per-stream=1048576|caller-tighter,drain-excess-then-ResourceLimit-with-retained-and-discarded-byte-context;interactive:inherit-streams-without-retention-limit;byte-pipeline:ordered;redirection:input-source-order-last-wins|output|append|here-string;background:terminal-ampersand;cancel-status:130;errors:ShellError;platform:suspend-unavailable-on-windows;compatibility:frozen-major-v1-fails-closed}";
+pub const RUNNER_SCHEMA_DESCRIPTOR: &str = "quirl.runner@4{input:quirl.command-grammar@4,native-source-bytes<=1048576,native-program-pipelines<=4096,function-call-depth<=100,session-functions<=1024,session-aliases<=1024,definition-bytes<=65536,word-fields<=65536,native-stages-per-pipeline<=64,retained-jobs<=1024,job-id:u32-nonzero-wrap-skip-visible,here-string-bytes-including-newline<=262144,arithmetic-source-bytes<=16384,arithmetic-depth<=64;ProcessBackend{execute(source)->CommandOutcome;execute_capture(source)->CommandOutcome;jobs()->array<JobState>;cancel_job(id)->JobState;suspend_job(id)->JobState};JobState{deny_unknown;id:u32-nonzero;command:string;status:running|stopped|done;process_group:null|i32;exit_status:null|i32};CommandOutcome{status:i32;stdout:null|string;stderr:null|string};capture:default-retained-per-stream=1048576|caller-tighter,drain-excess-then-ResourceLimit-with-retained-and-discarded-byte-context;interactive:inherit-streams-without-retention-limit;byte-pipeline:ordered;redirection:input-source-order-last-wins|output|append|here-string;background:simple-pipeline-list-items;cancel-status:130;errors:ShellError;platform:suspend-unavailable-on-windows;compatibility:frozen-major-v1-fails-closed}";
 
 /// Historical encoded runner-v1 job fixture retained for compatibility evidence.
 pub const RUNNER_JOB_STATE_FIXTURE_V1: &str =
@@ -508,7 +1040,9 @@ pub fn validate_runner_protocol_version(version: u32) -> Result<(), quirl_core::
     .with_context(format!(
         "supported runner protocol version: {RUNNER_PROTOCOL_VERSION}"
     ))
-    .with_help("Use a client and Quirl build that both implement runner protocol v2"))
+    .with_help(format!(
+        "Use a client and Quirl build that both implement runner protocol v{RUNNER_PROTOCOL_VERSION}"
+    )))
 }
 
 fn allocate_job_id(next_job_id: &mut u32, visible_ids: &[u32]) -> Option<u32> {
@@ -550,6 +1084,7 @@ fn interior_nul_error(context: &str) -> quirl_core::ShellError {
     .with_help("Remove the NUL byte; operating-system arguments and paths cannot contain NUL")
 }
 
+#[cfg(not(unix))]
 fn validate_native_plan(graph: &quirl_syntax::CommandList) -> Result<(), quirl_core::ShellError> {
     if graph.pipelines.len() > NATIVE_PIPELINES_MAX {
         return Err(quirl_core::ShellError::new(
@@ -576,6 +1111,17 @@ fn validate_native_plan(graph: &quirl_syntax::CommandList) -> Result<(), quirl_c
             .with_help("Split the pipeline or use intermediate files"));
         }
         for command in &pipeline.commands {
+            // The Windows backend only implements `2>&1`; refuse `>&2` rather
+            // than routing it the wrong way.
+            if command.redirects.iter().any(|redirect| {
+                redirect.kind == quirl_syntax::RedirectKind::DuplicateOutput && redirect.fd != 2
+            }) {
+                return Err(quirl_core::ShellError::new(
+                    quirl_core::ErrorCode::InvalidCommand,
+                    "`>&2` is not supported by the Windows executor",
+                )
+                .with_help("Write to standard error from the program itself, or use `2>&1`"));
+            }
             if command
                 .redirects
                 .iter()
@@ -586,6 +1132,104 @@ fn validate_native_plan(graph: &quirl_syntax::CommandList) -> Result<(), quirl_c
                     "native C1 does not support input-descriptor duplication",
                 )
                 .with_help("Use an input file, a here-string, or an explicit Bash/Zsh island"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Most pipelines, counted across every nested list, in one native program.
+pub const NATIVE_PROGRAM_PIPELINES_MAX: usize = 4096;
+
+/// Map a program parse failure to the executor's error contract, keeping the
+/// span so renderers can point at the offending text.
+#[cfg(unix)]
+fn program_error(error: quirl_syntax::ProgramError, input: &str) -> quirl_core::ShellError {
+    use quirl_core::{ErrorCode, ShellError};
+    let (message, start, end, help) = match error {
+        quirl_syntax::ProgramError::Incomplete(error) | quirl_syntax::ProgramError::Syntax(error) => {
+            (error.message, error.start, error.end, error.help)
+        }
+        quirl_syntax::ProgramError::Unsupported(form) => (
+            format!("`{}` is not native in Quirl: {}", form.text, form.reason),
+            form.start,
+            form.end,
+            "Run it in `bash { ... }` or `zsh { ... }`; at the interactive prompt Quirl does this automatically".to_owned(),
+        ),
+    };
+    ShellError::new(ErrorCode::InvalidCommand, message)
+        .with_label(Some("command".to_owned()), start, end, "syntax error")
+        .with_help(help)
+        .with_command(input)
+}
+
+/// Enforce pipeline-count, stage-count, and descriptor rules over every list
+/// of a program. Walks with an explicit stack; the parser already bounds depth.
+#[cfg(unix)]
+fn validate_native_program(program: &quirl_syntax::Program) -> Result<(), quirl_core::ShellError> {
+    use quirl_syntax::{CommandNode, CompoundCommand};
+    let mut pending = vec![&program.body];
+    let mut pipeline_count = 0_usize;
+    while let Some(list) = pending.pop() {
+        for pipeline in list.items.iter().flat_map(|item| item.and_or.pipelines()) {
+            pipeline_count = pipeline_count.saturating_add(1);
+            if pipeline_count > NATIVE_PROGRAM_PIPELINES_MAX {
+                return Err(quirl_core::ShellError::new(
+                    quirl_core::ErrorCode::ResourceLimit,
+                    "native program exceeds its pipeline limit",
+                )
+                .with_context(format!("limit {NATIVE_PROGRAM_PIPELINES_MAX} pipelines"))
+                .with_help("Split the program into smaller commands or a script"));
+            }
+            if pipeline.commands.len() > NATIVE_PIPELINE_STAGES_MAX {
+                return Err(quirl_core::ShellError::new(
+                    quirl_core::ErrorCode::ResourceLimit,
+                    "native pipeline exceeds its stage limit",
+                )
+                .with_context(format!(
+                    "limit {NATIVE_PIPELINE_STAGES_MAX} stages; observed {} stages",
+                    pipeline.commands.len()
+                ))
+                .with_help("Split the pipeline or use intermediate files"));
+            }
+            for command in &pipeline.commands {
+                let compound = match command {
+                    CommandNode::Simple(simple) => {
+                        if simple.redirects.iter().any(|redirect| {
+                            redirect.kind == quirl_syntax::RedirectKind::DuplicateInput
+                        }) {
+                            return Err(quirl_core::ShellError::new(
+                                quirl_core::ErrorCode::InvalidCommand,
+                                "native C1 does not support input-descriptor duplication",
+                            )
+                            .with_help(
+                                "Use an input file, a here-string, or an explicit Bash/Zsh island",
+                            ));
+                        }
+                        continue;
+                    }
+                    CommandNode::Compound(compound) => compound,
+                    CommandNode::RedirectedCompound(redirected) => &redirected.command,
+                    CommandNode::FunctionDefinition(definition) => &definition.body,
+                };
+                match compound {
+                    CompoundCommand::BraceGroup(list) => pending.push(list),
+                    CompoundCommand::If(clause) => {
+                        for branch in &clause.branches {
+                            pending.push(&branch.condition);
+                            pending.push(&branch.body);
+                        }
+                        pending.extend(clause.else_body.as_ref());
+                    }
+                    CompoundCommand::For(clause) => pending.push(&clause.body),
+                    CompoundCommand::While(clause) | CompoundCommand::Until(clause) => {
+                        pending.push(&clause.condition);
+                        pending.push(&clause.body);
+                    }
+                    CompoundCommand::Case(clause) => {
+                        pending.extend(clause.arms.iter().map(|arm| &arm.body));
+                    }
+                }
             }
         }
     }
@@ -625,7 +1269,9 @@ fn validate_prepared_terminal_pipeline(
             let supported = match redirect.kind {
                 RedirectKind::Input | RedirectKind::HereString => redirect.fd == 0,
                 RedirectKind::Output | RedirectKind::Append => matches!(redirect.fd, 1 | 2),
-                RedirectKind::DuplicateOutput => redirect.fd == 2 && redirect.path == "1",
+                RedirectKind::DuplicateOutput => {
+                    matches!((redirect.fd, redirect.path.as_str()), (2, "1") | (1, "2"))
+                }
                 RedirectKind::DuplicateInput => false,
             };
             if !supported || !redirect.target.parts.is_empty() {
@@ -719,11 +1365,12 @@ mod simulation_support {
 
 #[cfg(unix)]
 mod platform {
+    mod interpreter;
+
     use super::{
-        ARITHMETIC_DEPTH_MAX, ARITHMETIC_SOURCE_BYTES_MAX, DEFAULT_CAPTURE_BYTES,
-        EXPANSION_BYTES_MAX, HERE_STRING_BYTES_MAX, ObservedActivity, OutputObserver,
-        PARAMETER_PATTERN_BYTES_MAX, RETAINED_JOBS_MAX, SessionEnvironment, allocate_job_id,
-        builtin, validate_native_plan, validate_native_source,
+        DEFAULT_CAPTURE_BYTES, EXPANSION_BYTES_MAX, HERE_STRING_BYTES_MAX, ObservedActivity,
+        OutputObserver, PARAMETER_PATTERN_BYTES_MAX, RETAINED_JOBS_MAX, SessionEnvironment,
+        allocate_job_id, builtin, program_error, validate_native_program, validate_native_source,
     };
 
     use nix::{
@@ -740,9 +1387,9 @@ mod platform {
     use quirl_core::{
         CommandOutcome, ErrorCode, OutputStream, ProcessRequest, ShellError, escape_terminal_line,
     };
-    use quirl_syntax::{
-        ListConnector, Pipeline, Quoting, RedirectKind, SimpleCommand, Word, parse_command_list,
-    };
+    #[cfg(test)]
+    use quirl_syntax::parse_command_list;
+    use quirl_syntax::{Pipeline, Quoting, RedirectKind, SimpleCommand, Word};
     use serde::{Deserialize, Serialize};
     #[cfg(test)]
     use std::env;
@@ -893,7 +1540,26 @@ mod platform {
         value: String,
         pathname: bool,
         literal_prefix_bytes: usize,
+        /// Where field splitting and `"$@"` may divide `value`.
+        marks: FieldMarks,
+        /// Whether the word had a quoted part that keeps an empty result as
+        /// one empty field. A `"$@"` with no positional parameters does not count.
+        has_quoted_part: bool,
     }
+
+    /// Positions in an expanded word that field splitting must respect.
+    #[derive(Default)]
+    struct FieldMarks {
+        /// Byte ranges produced by unquoted expansions; only these split on `IFS`.
+        splittable: Vec<std::ops::Range<usize>>,
+        /// Byte offsets where `"$@"` starts a new field.
+        breaks: Vec<usize>,
+    }
+
+    /// Largest `$(...)` source or output, and default-word expansion, in bytes.
+    const SUBSTITUTION_BYTES_MAX: usize = 16 * 1024;
+    /// Most fields one word may expand into after splitting and globbing.
+    const WORD_FIELDS_MAX: usize = 65_536;
 
     impl ExpansionBudget {
         fn new() -> Self {
@@ -1124,6 +1790,31 @@ mod platform {
         substitution_stderr: String,
         noninteractive_host: bool,
         environment: SessionEnvironment,
+        /// Session functions by name, shared so a running body can redefine itself.
+        functions: std::collections::BTreeMap<String, Arc<quirl_syntax::FunctionDefinition>>,
+        /// Session aliases, applied to command names when source is parsed.
+        aliases: std::collections::BTreeMap<String, String>,
+        /// Changes whenever a session function or alias is defined, replaced, or removed.
+        session_commands_generation: u64,
+        /// `$1`, `$2`, ... of the innermost running function.
+        positional: Vec<String>,
+        /// Number of function calls currently running.
+        call_depth: usize,
+        /// Number of loops enclosing the running command in the current function.
+        loop_depth: usize,
+        /// Variables each running function declared `local`, to restore on return.
+        local_frames: Vec<Vec<interpreter::SavedLocal>>,
+        /// A `break`, `continue`, `return`, or abort requested by the command
+        /// that just ran, consumed by the enclosing list.
+        pending_flow: Option<interpreter::Flow>,
+        /// Host flag set by `SIGINT`; loops and lists stop when it is set.
+        interrupt: Option<Arc<std::sync::atomic::AtomicBool>>,
+        /// Output of an in-process first pipeline stage, fed to the next
+        /// spawned pipeline's first stage as standard input.
+        pending_stdin: Option<Vec<u8>>,
+        /// Output redirections of the enclosing redirected compound commands,
+        /// outermost first, applied before each command's own.
+        inherited_redirects: Vec<quirl_syntax::Redirect>,
         #[cfg(test)]
         fail_stopped_terminal_mode_read: bool,
     }
@@ -1604,6 +2295,17 @@ mod platform {
                 substitution_stderr: String::new(),
                 noninteractive_host: false,
                 environment: SessionEnvironment::default(),
+                functions: std::collections::BTreeMap::new(),
+                aliases: std::collections::BTreeMap::new(),
+                session_commands_generation: 0,
+                positional: Vec::new(),
+                call_depth: 0,
+                loop_depth: 0,
+                local_frames: Vec::new(),
+                pending_flow: None,
+                interrupt: None,
+                pending_stdin: None,
+                inherited_redirects: Vec::new(),
                 #[cfg(test)]
                 fail_stopped_terminal_mode_read: false,
             }
@@ -1647,6 +2349,37 @@ mod platform {
             }
             self.previous_status = status;
             Ok(())
+        }
+
+        /// Share the host's interrupt flag, normally set by a `SIGINT` handler
+        /// while a command runs. Lists and loops check it before every command
+        /// and iteration, so Ctrl-C stops even a loop that never starts a
+        /// process; the host clears the flag before the next command.
+        pub fn set_interrupt_flag(&mut self, flag: Option<Arc<std::sync::atomic::AtomicBool>>) {
+            self.interrupt = flag;
+        }
+
+        /// Names of the session's functions, sorted.
+        pub fn function_names(&self) -> Vec<String> {
+            self.functions.keys().cloned().collect()
+        }
+
+        /// The session's aliases as name and value, sorted by name.
+        pub fn aliases(&self) -> Vec<(String, String)> {
+            self.aliases
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect()
+        }
+
+        /// Generation of the session's function and alias definitions.
+        ///
+        /// The value changes whenever [`Self::function_names`] or
+        /// [`Self::aliases`] may have changed, so a host can rebuild a derived
+        /// list only when this number moves. The counter saturates at
+        /// `u64::MAX` instead of wrapping to a previously observed value.
+        pub const fn session_commands_generation(&self) -> u64 {
+            self.session_commands_generation
         }
 
         /// Replace one variable in this executor's private environment snapshot.
@@ -1939,73 +2672,16 @@ mod platform {
                 request.ensure_active()?;
             }
             validate_native_source(input)?;
-            let graph = parse_command_list(input).map_err(|error| {
-                ShellError::new(ErrorCode::InvalidCommand, error.message)
-                    .with_label(
-                        Some("command".to_owned()),
-                        error.start,
-                        error.end,
-                        "syntax error",
-                    )
-                    .with_help(error.help)
-                    .with_command(input)
-            })?;
-            validate_native_plan(&graph)?;
+            let program = quirl_syntax::parse_program(input, &self.aliases)
+                .map_err(|error| program_error(error, input))?;
+            validate_native_program(&program)?;
             if let Some(request) = request {
                 request.ensure_active()?;
             }
-            if graph.pipelines.is_empty() {
+            if program.body.items.is_empty() {
                 return Ok(outcome(0, None, None));
             }
-
-            let mut last = outcome(self.previous_status, None, None);
-            let mut captured_stdout = String::new();
-            let mut captured_stderr = String::new();
-            for (index, pipeline) in graph.pipelines.iter().enumerate() {
-                if index > 0 {
-                    let connector = graph
-                        .connectors
-                        .get(index.saturating_sub(1))
-                        .copied()
-                        .ok_or_else(|| {
-                            ShellError::new(
-                                ErrorCode::InvalidCommand,
-                                "command list is missing a pipeline connector",
-                            )
-                            .with_help("Re-enter the command so it can be parsed again")
-                        })?;
-                    if (matches!(connector, ListConnector::And) && last.status != 0)
-                        || (matches!(connector, ListConnector::Or) && last.status == 0)
-                    {
-                        continue;
-                    }
-                }
-                last = self.execute_pipeline(
-                    pipeline,
-                    input,
-                    capture,
-                    request,
-                    observer,
-                    last.status,
-                )?;
-                if capture {
-                    append_captured_output(
-                        &mut captured_stdout,
-                        last.stdout.as_deref().unwrap_or_default(),
-                        retained_output_limit(request.map(|request| request.request)),
-                    )?;
-                    append_captured_output(
-                        &mut captured_stderr,
-                        last.stderr.as_deref().unwrap_or_default(),
-                        retained_output_limit(request.map(|request| request.request)),
-                    )?;
-                }
-            }
-            if capture {
-                last.stdout = Some(captured_stdout);
-                last.stderr = Some(captured_stderr);
-            }
-            Ok(last)
+            self.execute_program(&program, input, capture, request, observer)
         }
 
         /// Execute one pipeline, then surface any standard error its `$(...)`
@@ -2069,11 +2745,69 @@ mod platform {
             }
             let pipeline = self.expand_pipeline(pipeline, request, previous_status)?;
             let pipeline = &pipeline;
+            if pipeline
+                .commands
+                .iter()
+                .any(|command| command.words.is_empty())
+            {
+                // Every word expanded to nothing, as `$EMPTY` alone does.
+                // A lone command then does nothing and succeeds, as in `sh`.
+                if pipeline.commands.len() == 1 {
+                    return Ok(outcome(0, Some(String::new()), Some(String::new())));
+                }
+                return Err(ShellError::new(
+                    ErrorCode::InvalidCommand,
+                    "a pipeline stage expanded to no command",
+                )
+                .with_command(source)
+                .with_help("Quote the expansion or check that the variable is set"));
+            }
+            if let [command] = pipeline.commands.as_slice()
+                && !self.noninteractive_host
+            {
+                if let Some(definition) = command
+                    .words
+                    .first()
+                    .and_then(|name| self.functions.get(name))
+                    .cloned()
+                {
+                    return self.call_function(
+                        &definition,
+                        command,
+                        source,
+                        capture,
+                        request,
+                        observer,
+                        previous_status,
+                    );
+                }
+                if let Some(result) =
+                    self.execute_native_builtin(command, capture, request, previous_status)?
+                {
+                    return Ok(result);
+                }
+            }
             if self.noninteractive_host && pipeline.background {
                 return Err(super::noninteractive_process_error(
                     source,
                     "background execution is unavailable to isolated Lua",
                 ));
+            }
+            // Background pipelines keep every stage a process so job control
+            // can observe, suspend, and resume each one.
+            if pipeline.commands.len() > 1
+                && !pipeline.background
+                && !self.noninteractive_host
+                && let Some(result) = self.execute_in_process_first_stage(
+                    pipeline,
+                    source,
+                    capture,
+                    request,
+                    observer,
+                    previous_status,
+                )?
+            {
+                return Ok(result);
             }
             if pipeline.commands.len() == 1 {
                 let Some(command) = pipeline.commands.first() else {
@@ -2128,6 +2862,7 @@ mod platform {
         ) -> Result<CommandOutcome, ShellError> {
             if capture
                 && !pipeline.background
+                && self.pending_stdin.is_none()
                 && let Some(observer) = observer
             {
                 let environment = self.environment_snapshot()?;
@@ -2320,11 +3055,30 @@ mod platform {
                 if prefixed {
                     words.push(crate::PREFIX_ASSIGNMENT_RUNNER.to_owned());
                 }
+                // Declaration utilities take `NAME=value` operands whose
+                // values are not field-split or globbed, as in POSIX and
+                // Bash, so `export PATH=/a:$PATH` keeps a PATH with spaces.
+                let declaration = forms
+                    .get(assignment_count)
+                    .and_then(|name| match name.parts.as_slice() {
+                        [part] if part.quoting == Quoting::Unquoted => Some(part.text.as_str()),
+                        _ => None,
+                    })
+                    .is_some_and(|name| {
+                        matches!(
+                            name,
+                            "export" | "local" | "readonly" | "alias" | "declare" | "typeset"
+                        )
+                    });
                 for (index, word) in forms.iter().enumerate() {
-                    if prefixed
-                        && index < assignment_count
-                        && let Some((name, value)) = crate::assignment_parts(word)
-                    {
+                    let declaration_operand = declaration && index > assignment_count;
+                    let unsplit_assignment =
+                        if (prefixed && index < assignment_count) || declaration_operand {
+                            crate::assignment_parts(word)
+                        } else {
+                            None
+                        };
+                    if let Some((name, value)) = unsplit_assignment {
                         let expanded = self.expand_word(
                             &value,
                             MAX_SUBSTITUTION_BYTES,
@@ -2335,30 +3089,12 @@ mod platform {
                         words.push(format!("{name}={}", expanded.value));
                         continue;
                     }
-                    let ExpandedWord {
-                        value,
-                        pathname,
-                        literal_prefix_bytes,
-                    } = self.expand_word(
+                    words.extend(self.expand_word_fields(
                         word,
-                        MAX_SUBSTITUTION_BYTES,
                         request,
                         previous_status,
                         &mut budget,
-                    )?;
-                    let matches = if pathname {
-                        pathname_expand(&value, literal_prefix_bytes, budget.retained_bytes)?
-                    } else {
-                        Vec::new()
-                    };
-                    if matches.is_empty() {
-                        words.push(value);
-                    } else {
-                        for value in &matches {
-                            budget.claim(value)?;
-                        }
-                        words.extend(matches);
-                    }
+                    )?);
                 }
                 command.words = words;
                 if prefixed {
@@ -2386,6 +3122,55 @@ mod platform {
             Ok(expanded)
         }
 
+        /// Expand one word into the fields a command receives: parameter,
+        /// arithmetic, and command expansion, then POSIX field splitting of
+        /// unquoted expansion results on `IFS`, then pathname expansion of
+        /// each field when the word's literal text requested it.
+        fn expand_word_fields(
+            &mut self,
+            word: &Word,
+            request: Option<RequestContext<'_>>,
+            previous_status: i32,
+            budget: &mut ExpansionBudget,
+        ) -> Result<Vec<String>, ShellError> {
+            let expanded = self.expand_word(
+                word,
+                SUBSTITUTION_BYTES_MAX,
+                request,
+                previous_status,
+                budget,
+            )?;
+            let ifs = self
+                .environment
+                .lookup("IFS")
+                .map(|ifs| ifs.to_string_lossy().into_owned());
+            let fields = split_expanded_word(&expanded, ifs.as_deref())?;
+            if !expanded.pathname {
+                return Ok(fields);
+            }
+            let mut words = Vec::with_capacity(fields.len());
+            for (index, field) in fields.into_iter().enumerate() {
+                let prefix = if index == 0 {
+                    expanded.literal_prefix_bytes.min(field.len())
+                } else {
+                    0
+                };
+                let matches = pathname_expand(&field, prefix, budget.retained_bytes)?;
+                if matches.is_empty() {
+                    words.push(field);
+                } else {
+                    for value in &matches {
+                        budget.claim(value)?;
+                    }
+                    words.extend(matches);
+                }
+                if words.len() > WORD_FIELDS_MAX {
+                    return Err(word_fields_error());
+                }
+            }
+            Ok(words)
+        }
+
         fn expand_word(
             &mut self,
             word: &Word,
@@ -2403,6 +3188,13 @@ mod platform {
             let mut value = String::new();
             let mut pathname = false;
             let mut literal_prefix_bytes = 0;
+            let mut marks = FieldMarks::default();
+            let has_quoted_part = word.parts.iter().any(|part| {
+                part.quoting != Quoting::Unquoted
+                    && !(part.quoting == Quoting::Double
+                        && part.text == "$@"
+                        && self.positional.is_empty())
+            });
             for (index, part) in word.parts.iter().enumerate() {
                 let expand_home = index == 0
                     && part.quoting == Quoting::Unquoted
@@ -2433,19 +3225,37 @@ mod platform {
                     budget.append(&mut value, text)?;
                     continue;
                 }
-                pathname |= part.quoting == Quoting::Unquoted
-                    && text
-                        .chars()
-                        .any(|character| matches!(character, '*' | '?' | '['));
-                self.expand_fragment(text, limit, request, previous_status, &mut value, budget)?;
+                pathname |= part.quoting == Quoting::Unquoted && has_glob_pattern(text);
+                self.expand_fragment(
+                    text,
+                    limit,
+                    request,
+                    previous_status,
+                    &mut value,
+                    budget,
+                    Some(&mut marks),
+                    part.quoting == Quoting::Double,
+                )?;
             }
             Ok(ExpandedWord {
                 value,
                 pathname,
                 literal_prefix_bytes,
+                marks,
+                has_quoted_part,
             })
         }
 
+        /// Expand parameters, arithmetic, and command substitutions in one
+        /// unquoted or double-quoted fragment, appending to `output`.
+        ///
+        /// When `marks` is present, the byte ranges each expansion produced
+        /// are recorded for field splitting (unquoted fragments only), and a
+        /// double-quoted `$@` records a field break between parameters.
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "the expansion state is threaded explicitly to keep budgets and ordering visible"
+        )]
         fn expand_fragment(
             &mut self,
             text: &str,
@@ -2454,9 +3264,38 @@ mod platform {
             previous_status: i32,
             output: &mut String,
             budget: &mut ExpansionBudget,
+            mut marks: Option<&mut FieldMarks>,
+            quoted: bool,
         ) -> Result<(), ShellError> {
             let mut index = 0;
             while index < text.len() {
+                let expansion_start = output.len();
+                let rest_for_special = text.get(index..).unwrap_or_default();
+                if let Some((consumed, special)) =
+                    self.special_parameter_at(rest_for_special, quoted)
+                {
+                    match special {
+                        SpecialExpansion::Text(value) => budget.append(output, &value)?,
+                        SpecialExpansion::Fields(values) => {
+                            for (position, value) in values.iter().enumerate() {
+                                if position > 0
+                                    && let Some(marks) = marks.as_deref_mut()
+                                {
+                                    marks.breaks.push(output.len());
+                                }
+                                budget.append(output, value)?;
+                            }
+                        }
+                    }
+                    if !quoted
+                        && let Some(marks) = marks.as_deref_mut()
+                        && output.len() > expansion_start
+                    {
+                        marks.splittable.push(expansion_start..output.len());
+                    }
+                    index = index.saturating_add(consumed);
+                    continue;
+                }
                 let rest = text.get(index..).ok_or_else(|| {
                     expansion_error(
                         "expansion cursor is not a UTF-8 boundary",
@@ -2476,8 +3315,33 @@ mod platform {
                             "Re-enter the arithmetic expansion",
                         )
                     })?;
-                    let value = evaluate_arithmetic(expression)?.to_string();
+                    // POSIX expands parameters, command substitutions, and
+                    // nested arithmetic inside `$(( ))` before evaluating it.
+                    let expanded_expression;
+                    let expression = if expression.contains('$') {
+                        let mut expanded = String::new();
+                        self.expand_fragment(
+                            expression,
+                            limit,
+                            request,
+                            previous_status,
+                            &mut expanded,
+                            budget,
+                            None,
+                            true,
+                        )?;
+                        expanded_expression = expanded;
+                        expanded_expression.as_str()
+                    } else {
+                        expression
+                    };
+                    let value = crate::arithmetic::evaluate_arithmetic(
+                        expression,
+                        &mut crate::SessionArithmetic(&mut self.environment),
+                    )?
+                    .to_string();
                     budget.append(output, &value)?;
+                    record_splittable(marks.as_deref_mut(), quoted, expansion_start, output.len());
                     index = index
                         .saturating_add(3)
                         .saturating_add(close)
@@ -2528,14 +3392,22 @@ mod platform {
                     }
                     self.substitution_stderr
                         .push_str(stderr.get(..end).unwrap_or_default());
+                    // The nested capture already stops at the default
+                    // retained-output limit; this keeps the bound explicit.
                     let stdout = nested.stdout.unwrap_or_default();
-                    if stdout.len() > limit {
-                        return Err(expansion_error(
+                    if stdout.len() > DEFAULT_CAPTURE_BYTES {
+                        return Err(ShellError::new(
+                            ErrorCode::ResourceLimit,
                             "command substitution exceeded its output budget",
-                            "Write large output to a file before substituting it",
-                        ));
+                        )
+                        .with_context(format!(
+                            "limit {DEFAULT_CAPTURE_BYTES} bytes; observed {} bytes",
+                            stdout.len()
+                        ))
+                        .with_help("Write large output to a file before substituting it"));
                     }
                     budget.append(output, stdout.trim_end_matches('\n'))?;
+                    record_splittable(marks.as_deref_mut(), quoted, expansion_start, output.len());
                     index = index
                         .saturating_add(2)
                         .saturating_add(close)
@@ -2562,6 +3434,7 @@ mod platform {
                         budget,
                     )?;
                     budget.append(output, &value)?;
+                    record_splittable(marks.as_deref_mut(), quoted, expansion_start, output.len());
                     index = index.saturating_add(3).saturating_add(close);
                     continue;
                 }
@@ -2572,12 +3445,6 @@ mod platform {
                     };
                     if character == '?' {
                         let value = previous_status.to_string();
-                        budget.append(output, &value)?;
-                        index = index.saturating_add(2);
-                        continue;
-                    }
-                    if character == '$' {
-                        let value = std::process::id().to_string();
                         budget.append(output, &value)?;
                         index = index.saturating_add(2);
                         continue;
@@ -2596,6 +3463,12 @@ mod platform {
                         })?;
                         let value = self.environment.value(name);
                         budget.append(output, &value)?;
+                        record_splittable(
+                            marks.as_deref_mut(),
+                            quoted,
+                            expansion_start,
+                            output.len(),
+                        );
                         index = index.saturating_add(1).saturating_add(length);
                         continue;
                     }
@@ -2633,23 +3506,32 @@ mod platform {
             previous_status: i32,
             budget: &mut ExpansionBudget,
         ) -> Result<String, ShellError> {
+            if matches!(spec, "#" | "@" | "*" | "$" | "?") {
+                return Ok(match spec {
+                    "#" => self.positional.len().to_string(),
+                    "$" => std::process::id().to_string(),
+                    "?" => previous_status.to_string(),
+                    _ => self.positional.join(" "),
+                });
+            }
             if let Some(rest) = spec.strip_prefix('#') {
-                let name_length = identifier_length(rest);
+                let name_length = parameter_name_length(rest);
                 if name_length == rest.len() && name_length > 0 {
-                    return Ok(self.environment.value(rest).chars().count().to_string());
+                    let value = self.parameter_value(rest).unwrap_or_default();
+                    return Ok(value.chars().count().to_string());
                 }
             }
-            let name_length = identifier_length(spec);
+            let name_length = parameter_name_length(spec);
             let name = spec.get(..name_length).unwrap_or_default();
             let operator = spec.get(name_length..).unwrap_or_default();
             if operator.is_empty() || name.is_empty() {
-                // Either a bare `${VAR}` lookup, or a shape this expander does
-                // not model (for example a positional parameter); both fall
-                // back to the original whole-spec name lookup.
-                return Ok(self.environment.value(spec));
+                // A bare `${VAR}` or `${1}` lookup, or a shape this expander
+                // does not model, which falls back to a whole-spec lookup.
+                return Ok(self.parameter_value(spec).unwrap_or_default());
             }
-            let is_set = self.environment.is_set(name);
-            let value = self.environment.value(name);
+            let parameter = self.parameter_value(name);
+            let is_set = parameter.is_some();
+            let value = parameter.unwrap_or_default();
             if let Some(word) = operator.strip_prefix(":-") {
                 return if value.is_empty() {
                     self.expand_default_word(word, limit, request, previous_status, budget)
@@ -2734,6 +3616,59 @@ mod platform {
             ))
         }
 
+        /// The value of a named or positional parameter, or `None` when unset.
+        fn parameter_value(&self, name: &str) -> Option<String> {
+            if !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit()) {
+                let index = name.parse::<usize>().ok()?;
+                if index == 0 {
+                    return Some("quirl".to_owned());
+                }
+                return self.positional.get(index.saturating_sub(1)).cloned();
+            }
+            self.environment
+                .lookup(name)
+                .map(|value| value.to_string_lossy().into_owned())
+        }
+
+        /// Recognize `$#`, `$@`, `$*`, `$$`, and `$0`..`$9` at the start of
+        /// `rest`, returning the bytes consumed and the expansion.
+        fn special_parameter_at(
+            &self,
+            rest: &str,
+            quoted: bool,
+        ) -> Option<(usize, SpecialExpansion)> {
+            let mut characters = rest.chars();
+            if characters.next() != Some('$') {
+                return None;
+            }
+            let character = characters.next()?;
+            let expansion = match character {
+                '#' => SpecialExpansion::Text(self.positional.len().to_string()),
+                '$' => SpecialExpansion::Text(std::process::id().to_string()),
+                '@' if quoted => SpecialExpansion::Fields(self.positional.clone()),
+                '*' if quoted => {
+                    let separator = self.environment.lookup("IFS").map_or_else(
+                        || " ".to_owned(),
+                        |ifs| {
+                            ifs.to_string_lossy()
+                                .chars()
+                                .next()
+                                .map(String::from)
+                                .unwrap_or_default()
+                        },
+                    );
+                    SpecialExpansion::Text(self.positional.join(&separator))
+                }
+                '@' | '*' => SpecialExpansion::Text(self.positional.join(" ")),
+                '0'..='9' => SpecialExpansion::Text(
+                    self.parameter_value(character.encode_utf8(&mut [0; 4]))
+                        .unwrap_or_default(),
+                ),
+                _ => return None,
+            };
+            Some((2, expansion))
+        }
+
         fn expand_default_word(
             &mut self,
             word: &str,
@@ -2743,7 +3678,16 @@ mod platform {
             budget: &mut ExpansionBudget,
         ) -> Result<String, ShellError> {
             let mut expanded = String::new();
-            self.expand_fragment(word, limit, request, previous_status, &mut expanded, budget)?;
+            self.expand_fragment(
+                word,
+                limit,
+                request,
+                previous_status,
+                &mut expanded,
+                budget,
+                None,
+                false,
+            )?;
             Ok(expanded)
         }
 
@@ -2769,8 +3713,12 @@ mod platform {
                     Some(outcome(0, Some(String::new()), Some(String::new())))
                 }
                 "unset" => {
-                    let names = builtin::unset_operands(&command.words)?;
-                    self.environment.unset_names(&names)?;
+                    let operands = builtin::unset_operands(&command.words)?;
+                    if operands.functions {
+                        self.unset_functions(&operands.names);
+                    } else {
+                        self.environment.unset_names(&operands.names)?;
+                    }
                     Some(outcome(0, Some(String::new()), Some(String::new())))
                 }
                 "jobs" => {
@@ -2824,6 +3772,7 @@ mod platform {
             // Extension callbacks and other user code must stay outside this
             // window so an early child notification cannot observe half a job.
             let mut spawned = PipelineConstructionGuard::new();
+            let mut initial_input = self.pending_stdin.take();
             let mut previous_reader: Option<PipeReader> = None;
             let mut capture_reader = None;
             let mut stderr_readers = Vec::new();
@@ -2853,8 +3802,15 @@ mod platform {
                 let input = input_stdio(
                     command,
                     previous_reader.take(),
-                    index > 0,
-                    self.noninteractive_host,
+                    InputContext {
+                        has_upstream: index > 0,
+                        stdin_is_null: self.noninteractive_host,
+                        initial: if index == 0 {
+                            initial_input.take()
+                        } else {
+                            None
+                        },
+                    },
                     request,
                 )?;
                 let (stdout, next_reader, writer, redirected_stdout) =
@@ -2914,6 +3870,11 @@ mod platform {
                 } else {
                     stderr_stdio(command, capture_streams, request)?
                 };
+                let (stdout, stderr, own_stderr_reader) = if stdout_duplicates_stderr(command)? {
+                    stdout_into_stderr(command, capture_streams, request)?
+                } else {
+                    (stdout, stderr, None)
+                };
                 process.stdin(input.stdio).stdout(stdout).stderr(stderr);
                 process.process_group(spawned.process_group.unwrap_or(0));
                 let mut child = crate::spawn_serialized(&mut process).map_err(|error| {
@@ -2932,6 +3893,15 @@ mod platform {
                     spawned.push(child)?;
                 }
                 if let Some(stderr) = child_stderr {
+                    stderr_readers.push(spawn_reader_with_budget(
+                        stderr,
+                        Arc::clone(&stderr_budget),
+                        output_sender
+                            .clone()
+                            .map(|sender| (sender, OutputStream::Stderr)),
+                    )?);
+                }
+                if let Some(stderr) = own_stderr_reader {
                     stderr_readers.push(spawn_reader_with_budget(
                         stderr,
                         Arc::clone(&stderr_budget),
@@ -3274,6 +4244,122 @@ mod platform {
         }
     }
 
+    /// Whether unquoted `text` asks for pathname expansion: it contains `*`,
+    /// `?`, or a `[` with a later `]`. A lone `[`, as in `[ -n x ]`, is an
+    /// ordinary word, so the shell never scans a directory for it.
+    fn has_glob_pattern(text: &str) -> bool {
+        let mut open_bracket = false;
+        for character in text.chars() {
+            match character {
+                '*' | '?' => return true,
+                '[' => open_bracket = true,
+                ']' if open_bracket => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn word_fields_error() -> ShellError {
+        ShellError::new(
+            ErrorCode::ResourceLimit,
+            "one word expanded into too many fields",
+        )
+        .with_context(format!("limit {WORD_FIELDS_MAX} fields"))
+        .with_help("Quote the expansion or narrow the pattern")
+    }
+
+    /// Divide an expanded word at `"$@"` breaks, then split each segment's
+    /// unquoted expansion results on `IFS`.
+    fn split_expanded_word(
+        expanded: &ExpandedWord,
+        ifs: Option<&str>,
+    ) -> Result<Vec<String>, ShellError> {
+        let marks = &expanded.marks;
+        let value = expanded.value.as_str();
+        if marks.breaks.is_empty() {
+            return crate::field_split::split_fields(
+                &crate::field_split::ExpandedText {
+                    value,
+                    splittable: &marks.splittable,
+                    has_quoted_part: expanded.has_quoted_part,
+                },
+                ifs,
+                WORD_FIELDS_MAX,
+            );
+        }
+        let mut fields = Vec::new();
+        let mut segment_start = 0_usize;
+        let boundaries = marks
+            .breaks
+            .iter()
+            .copied()
+            .chain(std::iter::once(value.len()));
+        for segment_end in boundaries {
+            let segment = value.get(segment_start..segment_end).ok_or_else(|| {
+                expansion_error(
+                    "field break is not on a character boundary",
+                    "Report this expansion as a Quirl defect",
+                )
+            })?;
+            let splittable = marks
+                .splittable
+                .iter()
+                .filter_map(|range| {
+                    let start = range.start.max(segment_start);
+                    let end = range.end.min(segment_end);
+                    (start < end).then(|| {
+                        start.saturating_sub(segment_start)..end.saturating_sub(segment_start)
+                    })
+                })
+                .collect::<Vec<_>>();
+            // Every `"$@"` field exists even when empty, as in `sh`.
+            fields.extend(crate::field_split::split_fields(
+                &crate::field_split::ExpandedText {
+                    value: segment,
+                    splittable: &splittable,
+                    has_quoted_part: true,
+                },
+                ifs,
+                WORD_FIELDS_MAX,
+            )?);
+            if fields.len() > WORD_FIELDS_MAX {
+                return Err(word_fields_error());
+            }
+            segment_start = segment_end;
+        }
+        Ok(fields)
+    }
+
+    /// What a special parameter expands to.
+    enum SpecialExpansion {
+        /// One piece of text.
+        Text(String),
+        /// Separate fields, from a double-quoted `$@`.
+        Fields(Vec<String>),
+    }
+
+    /// Record that `start..end` of an unquoted fragment's output came from an
+    /// expansion and is therefore subject to field splitting.
+    fn record_splittable(marks: Option<&mut FieldMarks>, quoted: bool, start: usize, end: usize) {
+        if let Some(marks) = marks
+            && !quoted
+            && end > start
+        {
+            marks.splittable.push(start..end);
+        }
+    }
+
+    /// Length of the parameter name at the start of `text`: a run of digits
+    /// for a positional parameter, or a shell identifier.
+    fn parameter_name_length(text: &str) -> usize {
+        let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 {
+            return digits;
+        }
+        identifier_length(text)
+    }
+
     fn expansion_error(message: &str, help: &str) -> ShellError {
         ShellError::new(ErrorCode::InvalidCommand, message).with_help(help)
     }
@@ -3424,183 +4510,6 @@ mod platform {
             }
         }
         None
-    }
-
-    fn evaluate_arithmetic(source: &str) -> Result<i64, ShellError> {
-        if source.len() > ARITHMETIC_SOURCE_BYTES_MAX {
-            return Err(ShellError::new(
-                ErrorCode::ResourceLimit,
-                "arithmetic expansion exceeds its source byte limit",
-            )
-            .with_context(format!(
-                "limit {ARITHMETIC_SOURCE_BYTES_MAX} bytes; observed {} bytes",
-                source.len()
-            ))
-            .with_help("Split the calculation into smaller expressions"));
-        }
-        #[derive(Clone, Copy)]
-        struct Parser<'a> {
-            input: &'a [u8],
-            index: usize,
-        }
-        impl<'a> Parser<'a> {
-            fn skip(&mut self) {
-                while self
-                    .input
-                    .get(self.index)
-                    .is_some_and(u8::is_ascii_whitespace)
-                {
-                    self.index = self.index.saturating_add(1);
-                }
-            }
-            fn expression(&mut self, depth: usize) -> Result<i64, ShellError> {
-                let mut value = self.term(depth)?;
-                loop {
-                    self.skip();
-                    match self.input.get(self.index).copied() {
-                        Some(b'+') => {
-                            self.index = self.index.saturating_add(1);
-                            value = value.checked_add(self.term(depth)?).ok_or_else(|| {
-                                expansion_error(
-                                    "arithmetic expansion overflowed",
-                                    "Use a smaller integer expression",
-                                )
-                            })?;
-                        }
-                        Some(b'-') => {
-                            self.index = self.index.saturating_add(1);
-                            value = value.checked_sub(self.term(depth)?).ok_or_else(|| {
-                                expansion_error(
-                                    "arithmetic expansion overflowed",
-                                    "Use a smaller integer expression",
-                                )
-                            })?;
-                        }
-                        _ => return Ok(value),
-                    }
-                }
-            }
-            fn term(&mut self, depth: usize) -> Result<i64, ShellError> {
-                let mut value = self.factor(depth)?;
-                loop {
-                    self.skip();
-                    match self.input.get(self.index).copied() {
-                        Some(b'*') => {
-                            self.index = self.index.saturating_add(1);
-                            value = value.checked_mul(self.factor(depth)?).ok_or_else(|| {
-                                expansion_error(
-                                    "arithmetic expansion overflowed",
-                                    "Use a smaller integer expression",
-                                )
-                            })?;
-                        }
-                        Some(b'/') => {
-                            self.index = self.index.saturating_add(1);
-                            let divisor = self.factor(depth)?;
-                            if divisor == 0 {
-                                return Err(expansion_error(
-                                    "arithmetic expansion divides by zero",
-                                    "Use a non-zero divisor",
-                                ));
-                            }
-                            value = value.checked_div(divisor).ok_or_else(|| {
-                                expansion_error(
-                                    "arithmetic expansion overflowed",
-                                    "Use a smaller integer expression",
-                                )
-                            })?;
-                        }
-                        _ => return Ok(value),
-                    }
-                }
-            }
-            fn nested_depth(depth: usize) -> Result<usize, ShellError> {
-                let observed_depth = depth.saturating_add(1);
-                if observed_depth > ARITHMETIC_DEPTH_MAX {
-                    return Err(ShellError::new(
-                        ErrorCode::ResourceLimit,
-                        "arithmetic expansion exceeds its nesting depth limit",
-                    )
-                    .with_context(format!(
-                        "limit {ARITHMETIC_DEPTH_MAX} levels; observed at least {observed_depth} levels"
-                    ))
-                    .with_help("Flatten the arithmetic expression"));
-                }
-                Ok(observed_depth)
-            }
-
-            fn factor(&mut self, depth: usize) -> Result<i64, ShellError> {
-                self.skip();
-                if self.input.get(self.index) == Some(&b'(') {
-                    self.index = self.index.saturating_add(1);
-                    let value = self.expression(Self::nested_depth(depth)?)?;
-                    self.skip();
-                    if self.input.get(self.index) != Some(&b')') {
-                        return Err(expansion_error(
-                            "unbalanced parentheses in arithmetic expansion",
-                            "Balance parentheses in `$((...))`",
-                        ));
-                    }
-                    self.index = self.index.saturating_add(1);
-                    return Ok(value);
-                }
-                if self.input.get(self.index) == Some(&b'-') {
-                    self.index = self.index.saturating_add(1);
-                    return self
-                        .factor(Self::nested_depth(depth)?)?
-                        .checked_neg()
-                        .ok_or_else(|| {
-                            expansion_error(
-                                "arithmetic expansion overflowed",
-                                "Use a smaller integer expression",
-                            )
-                        });
-                }
-                let start = self.index;
-                while self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
-                    self.index = self.index.saturating_add(1);
-                }
-                if start == self.index {
-                    return Err(expansion_error(
-                        "missing operand in arithmetic expansion",
-                        "Use integer literals and +, -, *, /, or parentheses",
-                    ));
-                }
-                let digits = self.input.get(start..self.index).ok_or_else(|| {
-                    expansion_error(
-                        "arithmetic operand boundary is invalid",
-                        "Use ASCII integer literals",
-                    )
-                })?;
-                let text = std::str::from_utf8(digits).map_err(|_| {
-                    expansion_error(
-                        "non-numeric digits in arithmetic expansion",
-                        "Use ASCII integer literals",
-                    )
-                })?;
-                let value = text.parse::<i64>().map_err(|_| {
-                    expansion_error(
-                        "arithmetic expansion overflowed",
-                        "Use a smaller integer expression",
-                    )
-                })?;
-                Ok(value)
-            }
-        }
-        let mut parser = Parser {
-            input: source.as_bytes(),
-            index: 0,
-        };
-        let value = parser.expression(0)?;
-        parser.skip();
-        if parser.index != parser.input.len() {
-            return Err(expansion_error(
-                "unexpected trailing text in arithmetic expansion",
-                "Use integer literals and +, -, *, /, or parentheses",
-            )
-            .with_context(format!("in `{source}`")));
-        }
-        Ok(value)
     }
 
     fn pathname_expand(
@@ -3828,13 +4737,29 @@ mod platform {
         previous[candidate.len()]
     }
 
+    /// Where a pipeline stage's standard input comes from when it has no
+    /// input redirection.
+    struct InputContext {
+        /// Whether an earlier stage feeds this one through a pipe.
+        has_upstream: bool,
+        /// Whether a stage without other input reads `/dev/null` instead of
+        /// inheriting the terminal.
+        stdin_is_null: bool,
+        /// Bytes an in-process first stage produced for this stage.
+        initial: Option<Vec<u8>>,
+    }
+
     fn input_stdio(
         command: &SimpleCommand,
         previous: Option<PipeReader>,
-        has_upstream: bool,
-        stdin_is_null: bool,
+        context: InputContext,
         request: Option<RequestContext<'_>>,
     ) -> Result<PreparedInput, ShellError> {
+        let InputContext {
+            has_upstream,
+            stdin_is_null,
+            initial,
+        } = context;
         enum InputSource {
             File(File),
             HereString(String),
@@ -3853,6 +4778,19 @@ mod platform {
                 let file = open_redirected_input(&redirect.path, request)?;
                 selected = Some(InputSource::File(file));
             }
+        }
+        if selected.is_none()
+            && let Some(bytes) = initial
+        {
+            let (reader, writer) = crate::spawn_guard_scope(pipe).map_err(|error| {
+                ShellError::new(ErrorCode::Io, "could not create pipeline input")
+                    .with_context(error.to_string())
+                    .with_help("Retry the command")
+            })?;
+            return Ok(PreparedInput {
+                stdio: Stdio::from(reader),
+                writer: Some((writer, bytes)),
+            });
         }
         match selected {
             Some(InputSource::HereString(value)) => {
@@ -3956,6 +4894,101 @@ mod platform {
         })
     }
 
+    /// Whether standard output must follow standard error's target because
+    /// of a `>&2` redirection.
+    ///
+    /// Redirections apply left to right, and inherited ones from an
+    /// enclosing compound command come first. Simulating them gives the final
+    /// targets of descriptors 1 and 2. When both end at standard error's
+    /// target (the terminal's stderr or a `2>` file), the stage needs the
+    /// `>&2` wiring. When `>&2` is overridden by a later `>` file, or both end
+    /// at standard output's target through `2>&1`, the ordinary wiring already
+    /// produces the right result. Any other order is rejected, not
+    /// approximated.
+    fn stdout_duplicates_stderr(command: &SimpleCommand) -> Result<bool, ShellError> {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Target {
+            Stdout,
+            Stderr,
+            File { descriptor: u8, index: usize },
+        }
+        let mut stdout = Target::Stdout;
+        let mut stderr = Target::Stderr;
+        let mut duplicated = false;
+        for (index, redirect) in command.redirects.iter().enumerate() {
+            match (redirect.fd, redirect.kind) {
+                (descriptor @ 1, RedirectKind::Output | RedirectKind::Append) => {
+                    stdout = Target::File { descriptor, index };
+                }
+                (descriptor @ 2, RedirectKind::Output | RedirectKind::Append) => {
+                    stderr = Target::File { descriptor, index };
+                }
+                (2, RedirectKind::DuplicateOutput) => stderr = stdout,
+                (1, RedirectKind::DuplicateOutput) => {
+                    stdout = stderr;
+                    duplicated = true;
+                }
+                _ => {}
+            }
+        }
+        if !duplicated {
+            return Ok(false);
+        }
+        let follows_stderr = matches!(stderr, Target::Stderr | Target::File { descriptor: 2, .. });
+        if stdout == stderr {
+            return Ok(follows_stderr);
+        }
+        let overridden = command
+            .redirects
+            .iter()
+            .rev()
+            .find(|redirect| redirect.fd == 1)
+            .is_some_and(|redirect| redirect.kind != RedirectKind::DuplicateOutput);
+        if overridden {
+            return Ok(false);
+        }
+        Err(ShellError::new(
+            ErrorCode::InvalidCommand,
+            "native C1 cannot route `>&2` before a later standard-error redirection",
+        )
+        .with_help("Put `2>` redirections before `>&2`, or run the command in `bash { ... }`"))
+    }
+
+    /// Standard output and standard error for a stage whose output is `>&2`:
+    /// both go to the standard-error target, which is the redirected file,
+    /// one shared capture pipe, or the shell's own standard error.
+    fn stdout_into_stderr(
+        command: &SimpleCommand,
+        capture: bool,
+        request: Option<RequestContext<'_>>,
+    ) -> Result<(Stdio, Stdio, Option<PipeReader>), ShellError> {
+        let duplicate_error = |error: std::io::Error| {
+            ShellError::new(
+                ErrorCode::Io,
+                "could not duplicate the standard-error descriptor",
+            )
+            .with_context(error.to_string())
+            .with_help("Retry after closing unused processes or file descriptors")
+        };
+        if let Some(redirect) = command.redirects.iter().rev().find(|redirect| {
+            redirect.fd == 2 && matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append)
+        }) {
+            let file = open_redirected_output(redirect, request)?;
+            let duplicate = file.try_clone().map_err(duplicate_error)?;
+            return Ok((Stdio::from(duplicate), Stdio::from(file), None));
+        }
+        if capture {
+            let (reader, writer) = crate::spawn_guard_scope(pipe).map_err(duplicate_error)?;
+            let duplicate = writer.try_clone().map_err(duplicate_error)?;
+            return Ok((Stdio::from(duplicate), Stdio::from(writer), Some(reader)));
+        }
+        let duplicate = std::io::stderr()
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(duplicate_error)?;
+        Ok((Stdio::from(duplicate), Stdio::inherit(), None))
+    }
+
     fn duplicates_stderr_to_stdout(redirect: &quirl_syntax::Redirect) -> bool {
         redirect.fd == 2 && redirect.kind == RedirectKind::DuplicateOutput && redirect.path == "1"
     }
@@ -3981,21 +5014,48 @@ mod platform {
         capture: bool,
         request: Option<RequestContext<'_>>,
     ) -> Result<CommandOutcome, ShellError> {
-        if command
-            .redirects
-            .iter()
-            .any(|redirect| matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append))
-        {
-            write_redirected_output(
-                command,
+        // Route in-process output the way the descriptors would: `>&2` sends
+        // standard output to standard error, `2>&1` the reverse, and file
+        // redirections on either descriptor receive their stream.
+        let stdout_follows_stderr = stdout_duplicates_stderr(command)?;
+        if stdout_follows_stderr {
+            let moved = result.stdout.take().unwrap_or_default();
+            let stderr = result.stderr.get_or_insert_with(String::new);
+            stderr.insert_str(0, &moved);
+            result.stdout = Some(String::new());
+        } else if command.redirects.iter().any(duplicates_stderr_to_stdout) {
+            let moved = result.stderr.take().unwrap_or_default();
+            result
+                .stdout
+                .get_or_insert_with(String::new)
+                .push_str(&moved);
+            result.stderr = Some(String::new());
+        }
+        let stdout_file = command.redirects.iter().rev().find(|redirect| {
+            redirect.fd == 1 && matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append)
+        });
+        if let Some(redirect) = stdout_file.filter(|_| !stdout_follows_stderr) {
+            let file = open_redirected_output(redirect, request)?;
+            io_write_all(
+                file,
                 result.stdout.as_deref().unwrap_or_default().as_bytes(),
-                request,
+                &redirect.path,
             )?;
             result.stdout = capture.then(String::new);
         } else if !capture && let Some(stdout) = result.stdout.take() {
             io_write_all(std::io::stdout(), stdout.as_bytes(), "standard output")?;
         }
-        if !capture && let Some(stderr) = result.stderr.take() {
+        if let Some(redirect) = command.redirects.iter().rev().find(|redirect| {
+            redirect.fd == 2 && matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append)
+        }) {
+            let file = open_redirected_output(redirect, request)?;
+            io_write_all(
+                file,
+                result.stderr.as_deref().unwrap_or_default().as_bytes(),
+                &redirect.path,
+            )?;
+            result.stderr = capture.then(String::new);
+        } else if !capture && let Some(stderr) = result.stderr.take() {
             io_write_all(std::io::stderr(), stderr.as_bytes(), "standard error")?;
         }
         Ok(result)
@@ -4020,26 +5080,6 @@ mod platform {
             open_redirected_output(redirect, request)?;
         }
         Ok(())
-    }
-
-    fn write_redirected_output(
-        command: &SimpleCommand,
-        bytes: &[u8],
-        request: Option<RequestContext<'_>>,
-    ) -> Result<(), ShellError> {
-        let redirect = command
-            .redirects
-            .iter()
-            .rev()
-            .find(|redirect| matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append))
-            .ok_or_else(|| {
-                ShellError::new(ErrorCode::Io, "missing output redirection")
-                    .with_help(
-                        "Add a > or >> redirect to the command, or report this if one was already given",
-                    )
-            })?;
-        let file = open_redirected_output(redirect, request)?;
-        io_write_all(file, bytes, &redirect.path)
     }
 
     fn open_redirected_output(
@@ -5965,34 +7005,45 @@ mod platform {
         }
 
         #[test]
-        fn arithmetic_input_and_nesting_are_bounded() {
-            let source = "1".repeat(ARITHMETIC_SOURCE_BYTES_MAX + 1);
-            let error = evaluate_arithmetic(&source).unwrap_err();
+        fn command_substitution_keeps_large_output_up_to_the_capture_limit() {
+            let result = NativeExecutor::default()
+                .execute_capture("n=0; for i in $(seq 1 20000); do n=$((n + 1)); done; printf $n")
+                .unwrap();
+            assert_eq!(result.stdout.as_deref(), Some("20000"));
+            let error = NativeExecutor::default()
+                .execute_capture("x=$(head -c 1100000 /dev/zero | tr '\\0' a)")
+                .unwrap_err();
             assert_eq!(error.code, ErrorCode::ResourceLimit);
-            assert!(error.details.context.iter().any(|context| {
-                context.contains(&format!("limit {ARITHMETIC_SOURCE_BYTES_MAX} bytes"))
-            }));
-
-            let nested = format!(
-                "{}1{}",
-                "(".repeat(ARITHMETIC_DEPTH_MAX + 1),
-                ")".repeat(ARITHMETIC_DEPTH_MAX + 1)
-            );
-            let error = evaluate_arithmetic(&nested).unwrap_err();
-            assert_eq!(error.code, ErrorCode::ResourceLimit);
-            assert!(error.message.contains("nesting depth"));
         }
 
         #[test]
-        fn arithmetic_minimum_division_and_negation_return_overflow_errors() {
-            for source in [
-                "(-9223372036854775807 - 1) / -1",
-                "-(-9223372036854775807 - 1)",
-            ] {
-                let error = evaluate_arithmetic(source).unwrap_err();
-                assert_eq!(error.code, ErrorCode::InvalidCommand);
-                assert!(error.message.contains("overflowed"));
-            }
+        fn declaration_operands_keep_spaces_from_expansions() {
+            let mut executor = NativeExecutor::default();
+            let result = executor
+                .execute_capture(
+                    "base='/a b/bin'; export QUIRL_SPACED=/x:$base; printf '%s|' \"$QUIRL_SPACED\" $base",
+                )
+                .unwrap();
+            assert_eq!(result.stdout.as_deref(), Some("/x:/a b/bin|/a|b/bin|"));
+        }
+
+        #[test]
+        fn arithmetic_expansion_is_bounded_and_wraps_like_bash() {
+            let nested = format!(
+                "printf $(({}1{}))",
+                "(".repeat(crate::ARITHMETIC_DEPTH_MAX + 1),
+                ")".repeat(crate::ARITHMETIC_DEPTH_MAX + 1)
+            );
+            let error = NativeExecutor::default()
+                .execute_capture(&nested)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            let result = NativeExecutor::default()
+                .execute_capture(
+                    "x=5; printf '%s ' $((x += 2)) $x $(((-9223372036854775807 - 1) / -1))",
+                )
+                .unwrap();
+            assert_eq!(result.stdout.as_deref(), Some("7 7 -9223372036854775808 "));
         }
 
         #[test]
@@ -6010,8 +7061,8 @@ mod platform {
         }
 
         #[test]
-        fn physical_command_lines_preserve_the_existing_pipeline_count_bound() {
-            let command_list = std::iter::repeat_n("true", crate::NATIVE_PIPELINES_MAX + 1)
+        fn physical_command_lines_preserve_the_program_pipeline_count_bound() {
+            let command_list = std::iter::repeat_n("true", crate::NATIVE_PROGRAM_PIPELINES_MAX + 1)
                 .collect::<Vec<_>>()
                 .join("\n");
             let error = NativeExecutor::default()
@@ -6030,7 +7081,7 @@ mod platform {
             assert_eq!(error.code, ErrorCode::ResourceLimit);
             assert!(error.message.contains("source"));
 
-            let command_list = std::iter::repeat_n("true", crate::NATIVE_PIPELINES_MAX + 1)
+            let command_list = std::iter::repeat_n("true", crate::NATIVE_PROGRAM_PIPELINES_MAX + 1)
                 .collect::<Vec<_>>()
                 .join(";");
             let error = NativeExecutor::default()
@@ -6078,7 +7129,10 @@ mod platform {
                     "~/file",
                     "~other/file",
                     "prefix~/file",
-                    "/home/with spaces/$literal",
+                    // Unquoted `$HOME` is field-split like any parameter;
+                    // a tilde prefix is not.
+                    "/home/with",
+                    "spaces/$literal",
                 ]
             );
             executor
@@ -6600,7 +7654,8 @@ mod platform {
                 .execute_capture("printf hello |")
                 .unwrap_err();
             assert_eq!(error.code, ErrorCode::InvalidCommand);
-            assert_eq!(error.details.labels[0].start, 13);
+            assert_eq!(error.details.labels[0].start, 14);
+            assert!(error.message.contains("end of input"));
             assert!(!error.details.help.is_empty());
         }
 
@@ -7995,6 +9050,22 @@ mod platform {
             self.environment.generation
         }
 
+        /// Windows has no native session functions or aliases, so there are no
+        /// names to publish and the generation never moves.
+        pub const fn session_commands_generation(&self) -> u64 {
+            0
+        }
+
+        /// Windows has no native session functions; the list is always empty.
+        pub fn function_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        /// Windows has no native session aliases; the list is always empty.
+        pub fn aliases(&self) -> Vec<(String, String)> {
+            Vec::new()
+        }
+
         /// Clone the complete private environment inherited by future children.
         ///
         /// Capture is already limited to
@@ -8316,8 +9387,12 @@ mod platform {
                     }))
                 }
                 "unset" => {
-                    let names = builtin::unset_operands(&command.words)?;
-                    self.environment.unset_names(&names)?;
+                    // Windows has no session functions, so `unset -f` has
+                    // nothing to remove and leaves variables alone.
+                    let operands = builtin::unset_operands(&command.words)?;
+                    if !operands.functions {
+                        self.environment.unset_names(&operands.names)?;
+                    }
                     Ok(Some(CommandOutcome {
                         status: 0,
                         stdout: None,
@@ -9250,7 +10325,7 @@ mod backend_contract_tests {
             quirl_core::schema_fingerprint(RUNNER_SCHEMA_DESCRIPTOR_V1),
             "fnv1a64:131ea5b3e770b424"
         );
-        assert!(RUNNER_SCHEMA_DESCRIPTOR.contains("quirl.command-grammar@3"));
+        assert!(RUNNER_SCHEMA_DESCRIPTOR.contains("quirl.command-grammar@4"));
         assert!(RUNNER_SCHEMA_DESCRIPTOR.contains("execute(source)"));
         assert!(!RUNNER_SCHEMA_DESCRIPTOR.contains("foreground_job"));
         assert!(!RUNNER_SCHEMA_DESCRIPTOR.contains("execute_interactive"));
@@ -9478,8 +10553,15 @@ mod backend_contract_tests {
             ),
             "[][]\n"
         );
-        let error = executor.execute_capture("unset -f name").unwrap_err();
-        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        executor.execute_capture("greet() { echo hi; }").unwrap();
+        assert_eq!(capture_stdout(&mut executor, "greet"), "hi\n");
+        executor.execute_capture("unset -f greet").unwrap();
+        // Without the function, `greet` is an unknown external command.
+        assert!(
+            executor
+                .execute_capture("greet")
+                .map_or(true, |result| result.status != 0)
+        );
     }
 
     #[cfg(unix)]

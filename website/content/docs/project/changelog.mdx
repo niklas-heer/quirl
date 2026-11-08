@@ -17,6 +17,48 @@ which versions are published.
 
 ## [Unreleased]
 
+### Added
+
+- Loops, conditionals, and `case` run natively in Normal mode: `if`, `for`,
+  `while`, `until`, `case`, `{ ...; }` groups, `!`, and `#` comments no longer
+  fork `/bin/sh`. Loops over builtins are fast, and variables they set persist
+  in the session.
+- Shell functions, `name() { ...; }` and `function name { ...; }`, persist for
+  the session. They take `$1` through `$9`, `${N}`, `$#`, `$@`, `$*`, and
+  support `local`, `return`, `shift`, and `unset -f`.
+- `alias`, and `unalias` expand at command position as POSIX specifies. A
+  value ending in a blank also expands the next word.
+- `echo`, `test`, `[`, `true`, `false`, `:`, `break`, `continue`, and `type`
+  run inside the shell without starting a process.
+- Arithmetic follows POSIX with variables and assignment: `$((i += 1))`,
+  comparisons, `&&`, `||`, `?:`, hex and octal literals, and Bash `**`.
+- `init.qrl` in the configuration directory runs at interactive startup, so
+  aliases, functions, and variables can be defined in shell syntax. A failing
+  statement is reported with its file and line, and the rest still runs.
+- A function or builtin can start a foreground pipeline, as in
+  `myfunc | grep x`.
+- Loops and groups can redirect their output, as in `done > list.txt` or
+  `{ make; make test; } > build.log 2>&1`, and output still streams.
+- `>&2` sends a command's output to standard error, so `echo "error" >&2`
+  works for builtins, functions, and programs.
+- The editor highlights reserved words, **Enter** continues an unfinished
+  construct, and **Ctrl-C** stops a loop even when it never starts a process.
+
+### Changed
+
+- Unquoted parameter and command expansions split into fields on `IFS`, as in
+  `sh` and Bash. `ls $FLAGS` now passes each word separately, unlike Zsh; quote
+  the expansion to keep one field. Empty unquoted expansions disappear.
+- The command grammar and native runner protocols are now version 4.
+- `$(...)` may produce up to 1 MiB of output instead of 16 KiB, so
+  `for f in $(git ls-files)` works in large repositories.
+- Here-documents, `[[`, `((`, `select`, subshells, brace expansion, process
+  substitution, and compound commands used as pipeline stages or with input
+  redirections still run in the `/bin/sh` island. Aliases and functions are
+  not visible inside an island, and a line that defines a function and also
+  needs the island is rejected.
+- `quirl -c`, piped scripts, `eval`, and `source` still run exact POSIX `sh`.
+
 ### Fixed
 
 - Errors a `$(...)` substitution writes to standard error now appear, as in

@@ -39,9 +39,9 @@ In German, a *Quirl* is the humble wooden whisk: a simple tool that folds
 ingredients that do not naturally mix into something smooth. Quirl does that
 for the command line.
 
-- **Your habits keep working.** Quoting, redirects, pipes, jobs, and variables
-  run natively. Pasted loops and `{ ...; }` groups, `source .env`, and
-  `eval "$(ssh-agent -s)"` run through `/bin/sh` and keep their variables.
+- **Your habits keep working.** Quoting, redirects, pipes, jobs, variables,
+  loops, functions, and aliases run natively. Pasted `for` loops, `source .env`,
+  and `eval "$(ssh-agent -s)"` keep the variables they set.
 - **Safe as a login shell.** `ssh host cmd`, `scp`, `rsync`, Git over SSH,
   editors, and coding agents get exact POSIX `sh` behavior from `quirl -c`.
 - **Completion that behaves like Zsh.** Tab inserts a unique match, extends
@@ -105,10 +105,18 @@ becomes `ls Cargo.`, `git checkout f` offers your branches, and `$HO` offers
 `$HOME/`. **F1** explains the command under the cursor, and **Ctrl-R** searches
 history for the current directory first.
 
-Paste a loop straight from a tutorial; it runs through `/bin/sh`:
+Paste a loop straight from a tutorial. It runs in the shell itself:
 
 ```text
 for f in *.md; do echo "doc: $f"; done
+```
+
+Define functions and aliases for the session, or put them in
+`~/.config/quirl/init.qrl` to load them at every start:
+
+```text
+greet() { printf 'hi %s\n' "$1"; }
+alias ll='ls -l'
 ```
 
 Type `mode data`, press Enter, and try typed data on your files:
@@ -169,10 +177,10 @@ A build is an official release only when it comes from an immutable GitHub
 tag and release that name its exact commit; other checkouts are development
 builds. Current limits worth knowing:
 
-- Loops, conditionals, `{ ...; }` groups, and brace expansion run through
-  `/bin/sh` automatically and keep their exports and `cd`. Shell functions do
-  not persist; here-documents and process substitution need an explicit
-  `bash { ... }` or `zsh { ... }` block.
+- Here-documents, `[[`, `((`, `select`, subshells, brace expansion, and process
+  substitution run in a `/bin/sh` island automatically and keep their exports
+  and `cd`. Aliases and functions are not visible inside an island. Use an
+  explicit `bash { ... }` or `zsh { ... }` block for Bash- or Zsh-only syntax.
 - `quirl -c` and piped scripts run in `/bin/sh`, and `eval` and `source` keep
   the variables shell setup code exports, so Quirl is safe as a login shell
   for SSH, `scp`, `rsync`, Git, and editors. Functions and aliases from

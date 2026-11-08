@@ -52,23 +52,26 @@ pub(crate) fn export_operands(words: &[String]) -> Result<ExportOperands, ShellE
     Ok(ExportOperands { assignments, names })
 }
 
-/// Names named by `unset [-v] NAME...`. Functions are not Quirl state.
-pub(crate) fn unset_operands(words: &[String]) -> Result<Vec<String>, ShellError> {
+/// Operands of one `unset [-v | -f] NAME...` command.
+pub(crate) struct UnsetOperands {
+    /// Whether `-f` selected functions instead of variables.
+    pub(crate) functions: bool,
+    /// Names to remove.
+    pub(crate) names: Vec<String>,
+}
+
+/// Parse `unset [-v | -f] NAME...`. The last of `-v` and `-f` wins, as in Bash.
+pub(crate) fn unset_operands(words: &[String]) -> Result<UnsetOperands, ShellError> {
+    let mut functions = false;
     let mut names = Vec::new();
     for operand in words.iter().skip(1) {
         match operand.as_str() {
-            "-v" => {}
-            "-f" => {
-                return Err(ShellError::new(
-                    ErrorCode::InvalidArgument,
-                    "unset -f is not supported because Quirl has no shell functions",
-                )
-                .with_help("Define and remove functions inside a `bash { ... }` island"));
-            }
+            "-v" if names.is_empty() => functions = false,
+            "-f" if names.is_empty() => functions = true,
             _ => names.push(operand.clone()),
         }
     }
-    Ok(names)
+    Ok(UnsetOperands { functions, names })
 }
 
 pub(crate) fn execute_cd(words: &[String]) -> Result<CommandOutcome, ShellError> {

@@ -93,6 +93,7 @@ const documents = [
   ['docs/decisions/2026-09-30_002231168_complete-like-zsh-and-ask-zsh-for-arguments.md', 'architecture/decisions/0040-zsh-reference-completion.mdx'],
   ['docs/decisions/2026-10-04_044214653_non-interactive-invocations-and-shell-setup-code-run-in-posi.md', 'architecture/decisions/0041-posix-shell-invocation.mdx'],
   ['docs/decisions/2026-10-04_162535286_rust-1-99-compatibility-and-selective-adoption.md', 'architecture/decisions/0042-rust-1.99-compatibility.mdx'],
+  ['docs/decisions/2026-11-08_020630501_run-posix-control-flow-functions-and-aliases-natively-in-int.md', 'architecture/decisions/0043-run-posix-control-flow-functions-and-aliases-natively.mdx'],
 ];
 
 const pageBySource = new Map(documents);

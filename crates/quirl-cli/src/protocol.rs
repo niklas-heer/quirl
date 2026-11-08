@@ -73,7 +73,7 @@ fn current_manifest() -> Result<ProtocolFreezeManifest, quirl_core::ShellError> 
             quirl_syntax::GRAMMAR_PROTOCOL_VERSION,
             CompatibilityPolicy::FrozenMajor,
             schema_fingerprint(quirl_syntax::GRAMMAR_SCHEMA_DESCRIPTOR),
-            "c1_core_unix_c2_runner",
+            "posix_native_unix_c2_runner",
         ),
         contract(
             "common_abi",

@@ -16,7 +16,7 @@ use quirl_data::{
 };
 use quirl_lua::{LuaPolicy, LuaRunnerContext, MAX_LUA_SOURCE_BYTES, format_file};
 use quirl_process::{ChildProcessTree, NativeExecutor, sandboxed_process_host};
-use quirl_syntax::{check_script, parse_command_list};
+use quirl_syntax::{ScriptSplit, check_command_statement};
 use quirl_ui::render_error;
 use serde::Serialize;
 use serde_json::json;
@@ -299,9 +299,10 @@ fn format_quirl_file(path: &Path, check: bool) -> Result<bool, ShellError> {
 }
 
 fn format_quirl_source(source: &str, source_name: &str) -> Result<String, ShellError> {
-    let statements = native_script_statements(source, source_name)?;
+    let split = native_script_statements(source, source_name)?;
     let mut replacements = Vec::new();
-    for statement in statements
+    for statement in split
+        .statements
         .iter()
         .filter(|statement| statement.kind == NativeStatementKind::Data)
     {
@@ -791,8 +792,19 @@ fn check_script_file(path: &Path) -> Result<(), ShellError> {
 
 pub(crate) fn check_quirl_source(source: &str, source_name: &str) -> Result<(), ShellError> {
     let diagnostics = quirl_source_diagnostics(source, source_name)?;
+    quirl_diagnostics_error(source_name, diagnostics).map_or(Ok(()), Err)
+}
+
+/// The validation error for `diagnostics`, or `None` when there are none.
+///
+/// The error is `ResourceLimit` when any diagnostic reports a resource limit, and `InvalidCommand`
+/// otherwise.
+fn quirl_diagnostics_error(
+    source_name: &str,
+    diagnostics: Vec<QuirlSyntaxDiagnostic>,
+) -> Option<ShellError> {
     if diagnostics.is_empty() {
-        return Ok(());
+        return None;
     }
     let code = if diagnostics
         .iter()
@@ -813,61 +825,54 @@ pub(crate) fn check_quirl_source(source: &str, source_name: &str) -> Result<(), 
             )
             .with_help(diagnostic.help);
     }
-    Err(error)
+    Some(error)
 }
 
 fn quirl_source_diagnostics(
     source: &str,
     source_name: &str,
 ) -> Result<Vec<QuirlSyntaxDiagnostic>, ShellError> {
-    let statements = native_script_statements(source, source_name)?;
-    let mut diagnostics = check_script(&script_without_explicit_blocks(source, &statements))
-        .into_iter()
-        .map(|diagnostic| QuirlSyntaxDiagnostic {
-            message: diagnostic.message,
-            start: diagnostic.start,
-            end: diagnostic.end,
-            help: diagnostic.help,
-            resource_limit: false,
-            source: "quirl-syntax",
-        })
-        .collect::<Vec<_>>();
-    for statement in &statements {
-        if statement.explicit && statement.kind == NativeStatementKind::Command {
-            diagnostics.extend(
-                command_block_diagnostics(source, statement)
-                    .into_iter()
-                    .map(|diagnostic| QuirlSyntaxDiagnostic {
+    let split = native_script_statements(source, source_name)?;
+    let mut diagnostics = split.diagnostics;
+    for statement in &split.statements {
+        match statement.kind {
+            NativeStatementKind::Command => {
+                for command in &statement.commands {
+                    let text = source.get(command.clone()).unwrap_or_default();
+                    if let Some(error) = check_command_statement(text) {
+                        diagnostics.push(QuirlSyntaxDiagnostic {
+                            message: error.message,
+                            start: command.start.saturating_add(error.start),
+                            end: command.start.saturating_add(error.end),
+                            help: error.help,
+                            resource_limit: false,
+                            source: "quirl-syntax",
+                        });
+                    }
+                }
+            }
+            NativeStatementKind::Data => {
+                let body = source.get(statement.body.clone()).unwrap_or_default();
+                let trimmed = body.trim();
+                let leading_bytes = body.len().saturating_sub(body.trim_start().len());
+                if let Err(diagnostic) = parse_data_expression(trimmed, DataSyntaxLimits::DEFAULT) {
+                    diagnostics.push(QuirlSyntaxDiagnostic {
                         message: diagnostic.message,
-                        start: diagnostic.start,
-                        end: diagnostic.end,
+                        start: statement
+                            .body
+                            .start
+                            .saturating_add(leading_bytes)
+                            .saturating_add(diagnostic.start),
+                        end: statement
+                            .body
+                            .start
+                            .saturating_add(leading_bytes)
+                            .saturating_add(diagnostic.end),
                         help: diagnostic.help,
-                        resource_limit: false,
-                        source: "quirl-syntax",
-                    }),
-            );
-        }
-        if statement.kind == NativeStatementKind::Data {
-            let body = source.get(statement.body.clone()).unwrap_or_default();
-            let trimmed = body.trim();
-            let leading_bytes = body.len().saturating_sub(body.trim_start().len());
-            if let Err(diagnostic) = parse_data_expression(trimmed, DataSyntaxLimits::DEFAULT) {
-                diagnostics.push(QuirlSyntaxDiagnostic {
-                    message: diagnostic.message,
-                    start: statement
-                        .body
-                        .start
-                        .saturating_add(leading_bytes)
-                        .saturating_add(diagnostic.start),
-                    end: statement
-                        .body
-                        .start
-                        .saturating_add(leading_bytes)
-                        .saturating_add(diagnostic.end),
-                    help: diagnostic.help,
-                    resource_limit: diagnostic.kind == DataSyntaxDiagnosticKind::ResourceLimit,
-                    source: "quirl-data",
-                });
+                        resource_limit: diagnostic.kind == DataSyntaxDiagnosticKind::ResourceLimit,
+                        source: "quirl-data",
+                    });
+                }
             }
         }
     }
@@ -1263,6 +1268,12 @@ fn execute_quirl_script_plan(
         .with_command(plan.source().text())
         .with_help("Declare and allow process spawning before executing a Quirl script"));
     }
+    let split = native_script_statements(plan.source().text(), plan.source().name())?;
+    // Refuse a structurally invalid script before running anything, so an unterminated loop never
+    // runs the statements that precede it.
+    if let Some(error) = quirl_diagnostics_error(plan.source().name(), split.diagnostics) {
+        return Err(error);
+    }
     let data = DataRuntime::with_process_host(sandboxed_process_host());
     let cancelled = plan.cancellation().atomic();
     let mut value = StructuredValue::from_json(json!({
@@ -1270,22 +1281,22 @@ fn execute_quirl_script_plan(
         "status": 0,
     }));
     let mut status = 0;
-    for statement in native_script_statements(plan.source().text(), plan.source().name())? {
+    for statement in split.statements {
         plan.ensure_active("between Quirl script statements")?;
-        let statement_source = plan
-            .source()
-            .text()
-            .get(statement.body.clone())
-            .ok_or_else(|| {
-                ShellError::new(
-                    ErrorCode::InvalidCommand,
-                    "script statement span is outside the source",
-                )
-                .with_command(plan.source().text())
-                .with_help("Report this internal script parser contract violation")
-            })?;
         match statement.kind {
             NativeStatementKind::Data => {
+                let statement_source = plan
+                    .source()
+                    .text()
+                    .get(statement.body.clone())
+                    .ok_or_else(|| {
+                        ShellError::new(
+                            ErrorCode::InvalidCommand,
+                            "script statement span is outside the source",
+                        )
+                        .with_command(plan.source().text())
+                        .with_help("Report this internal script parser contract violation")
+                    })?;
                 let envelope = data
                     .eval_output_with_cancellation_handle(
                         statement_source.trim(),
@@ -1317,16 +1328,7 @@ fn execute_quirl_script_plan(
                 };
             }
             NativeStatementKind::Command => {
-                let outcome = if statement.explicit {
-                    execute_command_block(executor, plan, statement.body.clone())?
-                } else {
-                    execute_native_command(
-                        executor,
-                        plan,
-                        statement_source,
-                        statement.body.clone(),
-                    )?
-                };
+                let outcome = execute_command_statements(executor, plan, &statement.commands)?;
                 status = outcome.status;
                 value = StructuredValue::from_json(json!({
                     "status": outcome.status,
@@ -1884,36 +1886,49 @@ enum NativeStatementKind {
 #[derive(Debug, Clone)]
 struct NativeScriptStatement {
     kind: NativeStatementKind,
-    /// The source range that identifies this statement, including explicit delimiters.
-    span: Range<usize>,
-    /// The expression or command text, excluding explicit block delimiters.
+    /// The data expression for a data statement, or the body of an explicit block. For a plain
+    /// command statement it is the statement's own span.
     body: Range<usize>,
+    /// Command spans in execution order. Each span is one executor call, so a compound statement
+    /// spanning several lines is passed whole. A data statement has none.
+    commands: Vec<Range<usize>>,
+    /// Whether the statement came from an explicit `data {` or `command {` block.
     explicit: bool,
+}
+
+/// The statements of a native script and the structural diagnostics found while grouping them.
+#[derive(Debug, Clone, Default)]
+struct NativeScriptSplit {
+    statements: Vec<NativeScriptStatement>,
+    /// Unterminated or oversized statements. Execution refuses a script that has any.
+    diagnostics: Vec<QuirlSyntaxDiagnostic>,
 }
 
 #[derive(Debug)]
 struct OpenNativeBlock {
     kind: NativeStatementKind,
-    span_start: usize,
     opener_span: Range<usize>,
     body_start: usize,
     indentation: String,
 }
 
-/// Parse explicit native script boundaries before handing command text to the shared grammar.
+/// Parse explicit native script boundaries and group the remaining lines into statements.
 ///
 /// Delimiters intentionally occupy complete lines. A closing `}` must have the same indentation
-/// as its opening `data {` or `command {`; this keeps indented JSON/object syntax in a data body
-/// unambiguous without introducing another escaping convention.
+/// as its opening `data {` or `command {` line; this keeps indented JSON/object syntax in a data
+/// body unambiguous without introducing another escaping convention. Lines outside explicit blocks
+/// and the lines of a `command {` block are grouped by `quirl_syntax::split_script_statements`, so
+/// a multi-line compound command is one statement.
 fn native_script_statements(
     source: &str,
     source_name: &str,
-) -> Result<Vec<NativeScriptStatement>, ShellError> {
-    let mut statements = Vec::new();
+) -> Result<NativeScriptSplit, ShellError> {
+    let mut split = NativeScriptSplit::default();
     let mut open: Option<OpenNativeBlock> = None;
+    let mut plain_start: Option<usize> = None;
     let mut offset = 0_usize;
 
-    for (line_index, raw_line) in source.split_inclusive('\n').enumerate() {
+    for raw_line in source.split_inclusive('\n') {
         let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
         let line = line.strip_suffix('\r').unwrap_or(line);
         let leading_len = line.len().saturating_sub(line.trim_start().len());
@@ -1939,8 +1954,9 @@ fn native_script_statements(
                         "Retry the script; report this internal parser state failure",
                     ));
                 };
+                let body = block.body_start..offset;
                 if source
-                    .get(block.body_start..offset)
+                    .get(body.clone())
                     .unwrap_or_default()
                     .trim()
                     .is_empty()
@@ -1952,10 +1968,16 @@ fn native_script_statements(
                         "Put a data expression or command statement between the delimiters",
                     ));
                 }
-                statements.push(NativeScriptStatement {
+                let commands = match block.kind {
+                    NativeStatementKind::Data => Vec::new(),
+                    NativeStatementKind::Command => {
+                        statement_spans(source, body.clone(), &mut split.diagnostics)
+                    }
+                };
+                split.statements.push(NativeScriptStatement {
                     kind: block.kind,
-                    span: block.span_start..offset.saturating_add(raw_line.len()),
-                    body: block.body_start..offset,
+                    body,
+                    commands,
                     explicit: true,
                 });
                 offset = offset.saturating_add(raw_line.len());
@@ -1973,18 +1995,14 @@ fn native_script_statements(
             continue;
         }
 
-        if line_index == 0 && trimmed.starts_with("#!") {
-            offset = offset.saturating_add(raw_line.len());
-            continue;
-        }
         if trimmed.is_empty() || trimmed.starts_with('#') {
             offset = offset.saturating_add(raw_line.len());
             continue;
         }
         if let Some(kind) = is_native_block_opener(trimmed) {
+            flush_plain_statements(&mut split, source, plain_start.take(), offset);
             open = Some(OpenNativeBlock {
                 kind,
-                span_start: trimmed_start,
                 opener_span: trimmed_start..trimmed_end,
                 body_start: offset.saturating_add(raw_line.len()),
                 indentation: line.get(..leading_len).unwrap_or_default().to_owned(),
@@ -2008,26 +2026,7 @@ fn native_script_statements(
                 "Write `command {` on one line, put commands below it, and align a closing `}`",
             ));
         }
-
-        let kind = if quirl_syntax::data_statement_expression(trimmed).is_some() {
-            NativeStatementKind::Data
-        } else {
-            NativeStatementKind::Command
-        };
-        let body_start = match kind {
-            NativeStatementKind::Data => {
-                trimmed_start.saturating_add(trimmed.len()).saturating_sub(
-                    quirl_syntax::data_statement_expression(trimmed).map_or(0, str::len),
-                )
-            }
-            NativeStatementKind::Command => trimmed_start,
-        };
-        statements.push(NativeScriptStatement {
-            kind,
-            span: trimmed_start..trimmed_end,
-            body: body_start..trimmed_end,
-            explicit: false,
-        });
+        plain_start.get_or_insert(offset);
         offset = offset.saturating_add(raw_line.len());
     }
 
@@ -2039,7 +2038,8 @@ fn native_script_statements(
             "Add an aligned closing `}` for this `data {` or `command {` block",
         ));
     }
-    Ok(statements)
+    flush_plain_statements(&mut split, source, plain_start, offset);
+    Ok(split)
 }
 
 fn is_native_block_opener(line: &str) -> Option<NativeStatementKind> {
@@ -2081,103 +2081,121 @@ fn native_block_error(
         .with_help(help)
 }
 
-fn script_without_explicit_blocks(source: &str, statements: &[NativeScriptStatement]) -> String {
-    let mut bytes = source.as_bytes().to_vec();
-    for statement in statements.iter().filter(|statement| statement.explicit) {
-        let Some(statement_bytes) = bytes.get_mut(statement.span.clone()) else {
-            continue;
-        };
-        for byte in statement_bytes {
-            if !matches!(*byte, b'\n' | b'\r') {
-                *byte = b' ';
-            }
-        }
-    }
-    // Replacing valid UTF-8 bytes only with ASCII space preserves UTF-8 validity.
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
-fn command_block_diagnostics(
+/// Group the lines of `source[range]` into complete statements and return their absolute spans.
+///
+/// Each span is one statement. Structural diagnostics are appended with absolute offsets. When
+/// the range has any, the returned spans omit the unterminated or oversized statements, and the
+/// caller must refuse to run the script.
+fn statement_spans(
     source: &str,
-    statement: &NativeScriptStatement,
-) -> Vec<quirl_syntax::CommandSyntaxError> {
-    let mut diagnostics = Vec::new();
-    let mut offset = statement.body.start;
-    for raw_line in source
-        .get(statement.body.clone())
-        .unwrap_or_default()
-        .split_inclusive('\n')
-    {
-        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        let leading = line.len().saturating_sub(line.trim_start().len());
-        let trimmed = line.trim();
-        if !trimmed.is_empty()
-            && !trimmed.starts_with('#')
-            && let Err(mut error) = parse_command_list(trimmed)
-        {
-            let absolute_offset = offset.saturating_add(leading);
-            error.start = error.start.saturating_add(absolute_offset);
-            error.end = error.end.saturating_add(absolute_offset);
-            diagnostics.push(error);
+    range: Range<usize>,
+    diagnostics: &mut Vec<QuirlSyntaxDiagnostic>,
+) -> Vec<Range<usize>> {
+    let base = range.start;
+    let text = source.get(range).unwrap_or_default();
+    let ScriptSplit {
+        statements,
+        diagnostics: found,
+        limit_exceeded,
+    } = quirl_syntax::split_script_statements(text);
+    let last = found.len().saturating_sub(1);
+    diagnostics.extend(found.into_iter().enumerate().map(|(index, diagnostic)| {
+        QuirlSyntaxDiagnostic {
+            message: diagnostic.message,
+            start: base.saturating_add(diagnostic.start),
+            end: base.saturating_add(diagnostic.end),
+            help: diagnostic.help,
+            resource_limit: limit_exceeded && index == last,
+            source: "quirl-syntax",
         }
-        offset = offset.saturating_add(raw_line.len());
-    }
-    diagnostics
+    }));
+    statements
+        .into_iter()
+        .map(|statement| {
+            base.saturating_add(statement.span.start)..base.saturating_add(statement.span.end)
+        })
+        .collect()
 }
 
-fn execute_command_block(
+/// Append the statements of the plain lines in `source[start..end]` to `split`.
+///
+/// Each `data` line becomes a data statement, and every other statement becomes a command
+/// statement whose single command is its own span.
+fn flush_plain_statements(
+    split: &mut NativeScriptSplit,
+    source: &str,
+    start: Option<usize>,
+    end: usize,
+) {
+    let Some(start) = start else {
+        return;
+    };
+    for span in statement_spans(source, start..end, &mut split.diagnostics) {
+        let text = source.get(span.clone()).unwrap_or_default();
+        let statement = match quirl_syntax::data_statement_expression(text) {
+            Some(expression) => NativeScriptStatement {
+                kind: NativeStatementKind::Data,
+                body: span.end.saturating_sub(expression.len())..span.end,
+                commands: Vec::new(),
+                explicit: false,
+            },
+            None => NativeScriptStatement {
+                kind: NativeStatementKind::Command,
+                body: span.clone(),
+                commands: vec![span],
+                explicit: false,
+            },
+        };
+        split.statements.push(statement);
+    }
+}
+
+/// Execute command spans in order, stopping at the first nonzero status.
+///
+/// The captured stdout and stderr of the executed commands are aggregated and bounded by
+/// `EXECUTION_CAPTURE_BYTES_MAX`.
+fn execute_command_statements(
     executor: &mut NativeExecutor,
     plan: &ExecutionPlan,
-    body: Range<usize>,
+    commands: &[Range<usize>],
 ) -> Result<quirl_core::CommandOutcome, ShellError> {
     let mut outcome = quirl_core::CommandOutcome {
         status: 0,
         stdout: Some(String::new()),
         stderr: Some(String::new()),
     };
-    let mut offset = body.start;
-    let block_source = plan.source().text().get(body).ok_or_else(|| {
-        ShellError::new(
-            ErrorCode::InvalidCommand,
-            "command block span is outside the script source",
-        )
-        .with_command(plan.source().text())
-        .with_help("Report this internal script parser contract violation")
-    })?;
-    for raw_line in block_source.split_inclusive('\n') {
-        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        let leading = line.len().saturating_sub(line.trim_start().len());
-        let trimmed = line.trim();
-        if !trimmed.is_empty() && !trimmed.starts_with('#') {
-            let line_outcome = execute_native_command(
-                executor,
-                plan,
-                trimmed,
-                offset.saturating_add(leading)
-                    ..offset.saturating_add(leading).saturating_add(trimmed.len()),
+    for command_span in commands {
+        let command = plan
+            .source()
+            .text()
+            .get(command_span.clone())
+            .ok_or_else(|| {
+                ShellError::new(
+                    ErrorCode::InvalidCommand,
+                    "command statement span is outside the script source",
+                )
+                .with_command(plan.source().text())
+                .with_help("Report this internal script parser contract violation")
+            })?;
+        let line_outcome = execute_native_command(executor, plan, command, command_span.clone())?;
+        outcome.status = line_outcome.status;
+        if let Some(stdout) = line_outcome.stdout {
+            append_script_capture(
+                outcome.stdout.get_or_insert_with(String::new),
+                &stdout,
+                "stdout",
             )?;
-            outcome.status = line_outcome.status;
-            if let Some(stdout) = line_outcome.stdout {
-                append_script_capture(
-                    outcome.stdout.get_or_insert_with(String::new),
-                    &stdout,
-                    "stdout",
-                )?;
-            }
-            if let Some(stderr) = line_outcome.stderr {
-                append_script_capture(
-                    outcome.stderr.get_or_insert_with(String::new),
-                    &stderr,
-                    "stderr",
-                )?;
-            }
-            if outcome.status != 0 {
-                return Ok(outcome);
-            }
         }
-        offset = offset.saturating_add(raw_line.len());
+        if let Some(stderr) = line_outcome.stderr {
+            append_script_capture(
+                outcome.stderr.get_or_insert_with(String::new),
+                &stderr,
+                "stderr",
+            )?;
+        }
+        if outcome.status != 0 {
+            break;
+        }
     }
     Ok(outcome)
 }
@@ -2862,6 +2880,75 @@ mod tests {
         assert!(error.details.labels[0].start < error.details.labels[1].start);
         assert_eq!(error.details.labels[0].start, source.find("|\n}").unwrap());
         assert_eq!(error.details.labels[1].start, source.rfind('|').unwrap());
+    }
+
+    fn executed_command_texts(source: &str, statements: &[NativeScriptStatement]) -> Vec<String> {
+        statements
+            .iter()
+            .flat_map(|statement| statement.commands.iter())
+            .map(|command| source.get(command.clone()).unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn plain_statements_pass_each_compound_program_to_the_executor_once() {
+        let source = "echo first\nfor x in a b; do\n  printf \"$x\"\ndone\n";
+        let split = native_script_statements(source, "plain.qrl").unwrap();
+        assert!(split.diagnostics.is_empty());
+        assert_eq!(
+            executed_command_texts(source, &split.statements),
+            ["echo first", "for x in a b; do\n  printf \"$x\"\ndone"]
+        );
+    }
+
+    #[test]
+    fn command_blocks_pass_each_compound_statement_to_the_executor_once() {
+        let source = "command {\n  printf one\n  # deliberately ignored\n  for x in a; do\n    printf \"$x\"\n  done\n}\n";
+        let split = native_script_statements(source, "block.qrl").unwrap();
+        assert!(split.diagnostics.is_empty());
+        assert_eq!(split.statements.len(), 1);
+        assert_eq!(
+            executed_command_texts(source, &split.statements),
+            ["printf one", "for x in a; do\n    printf \"$x\"\n  done"]
+        );
+    }
+
+    #[test]
+    fn unterminated_statement_is_a_structural_diagnostic_at_the_end_of_the_script() {
+        let source = "echo ran\nfor x in a; do\n  echo $x\n";
+        let split = native_script_statements(source, "loop.qrl").unwrap();
+        assert_eq!(
+            executed_command_texts(source, &split.statements),
+            ["echo ran"]
+        );
+        let [diagnostic] = split.diagnostics.as_slice() else {
+            panic!("expected one unterminated diagnostic");
+        };
+        assert!(diagnostic.message.contains("before the end of input"));
+        assert_eq!(diagnostic.end, source.trim_end().len());
+    }
+
+    #[test]
+    fn unterminated_loop_is_refused_before_any_statement_runs() {
+        let root = test_directory("unterminated-loop-refused");
+        let marker = root.join("must-not-exist");
+        let source = format!("touch {}\nfor x in a; do\n  echo $x\n", marker.display());
+        let error = run_source(
+            &source,
+            "unterminated.qrl",
+            Some(Path::new("unterminated.qrl")),
+            None,
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        assert!(
+            error.details.labels[0]
+                .message
+                .contains("before the end of input")
+        );
+        assert!(!marker.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
