@@ -3081,8 +3081,10 @@ mod platform {
             }
             let mut expanded = pipeline.clone();
             let mut budget = ExpansionBudget::new();
-            for command in &mut expanded.commands {
-                let forms = command.word_ir.clone();
+            // Read word forms from the borrowed input; only the expanded copy
+            // is written, so the forms need no second clone.
+            for (command, original) in expanded.commands.iter_mut().zip(&pipeline.commands) {
+                let forms = &original.word_ir;
                 if forms.is_empty() {
                     for word in &command.words {
                         budget.claim(word)?;
