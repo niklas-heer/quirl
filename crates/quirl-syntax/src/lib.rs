@@ -25,7 +25,7 @@ pub use program::{
 /// the frozen 1.0 C1/C2 disposition.
 pub const COMPATIBILITY_MATRIX_JSON: &str = include_str!("../compatibility-v0.1.json");
 /// Current serialized version of the native command grammar.
-pub const GRAMMAR_PROTOCOL_VERSION: u32 = 3;
+pub const GRAMMAR_PROTOCOL_VERSION: u32 = 4;
 /// Schema version of the JSON evidence embedded in [`COMPATIBILITY_MATRIX_JSON`].
 pub const COMPATIBILITY_MATRIX_SCHEMA_VERSION: u32 = 3;
 /// Canonical structural description used to fingerprint the command grammar.
@@ -33,7 +33,7 @@ pub const COMPATIBILITY_MATRIX_SCHEMA_VERSION: u32 = 3;
 /// Any change to serialized shapes, token semantics, supported expansions, or
 /// the referenced compatibility matrix must update this descriptor and the
 /// corresponding protocol version.
-pub const GRAMMAR_SCHEMA_DESCRIPTOR: &str = "quirl.command-grammar@3{CommandList{deny_unknown;pipelines:array<Pipeline>;connectors:array<and|or|sequence>;invariant:connectors.len+1=pipelines.len};Pipeline{deny_unknown;commands:array<SimpleCommand>;background:bool};SimpleCommand{deny_unknown;words:nonempty-array<string>;word_ir:array<Word>;redirects:array<Redirect>};Word{deny_unknown;parts:nonempty-array<WordPart>};WordPart{deny_unknown;text:string;quoting:unquoted|single|double|escaped};Redirect{deny_unknown;fd:u8;kind:input|output|append|here_string|duplicate_input|duplicate_output;path:string;target:Word};tokens:word|pipe|and|or|semicolon|newline|input|output|append|here_string|fd_duplicate|background;lines:unquoted-LF-sequences|leading-blank-trailing-LF-ignored|LF-after-pipe-and-or-continues|backslash-LF-removed|quoted-LF-literal|unquoted-CR-whitespace|backslash-CRLF-keeps-escaped-CR-then-separates;expansion:parameter|special|arithmetic|command|pathname;compatibility_matrix:quirl-syntax/compatibility-v0.1.json@schema3}";
+pub const GRAMMAR_SCHEMA_DESCRIPTOR: &str = "quirl.command-grammar@4{CommandList{deny_unknown;pipelines:array<Pipeline>;connectors:array<and|or|sequence>;invariant:connectors.len+1=pipelines.len};Pipeline{deny_unknown;commands:array<SimpleCommand>;background:bool};SimpleCommand{deny_unknown;words:nonempty-array<string>;word_ir:array<Word>;redirects:array<Redirect>};Word{deny_unknown;parts:nonempty-array<WordPart>};WordPart{deny_unknown;text:string;quoting:unquoted|single|double|escaped};Redirect{deny_unknown;fd:u8;kind:input|output|append|here_string|duplicate_input|duplicate_output;path:string;target:Word};Program{deny_unknown;body:CompoundList};CompoundList{deny_unknown;items:array<ListItem>};ListItem{deny_unknown;and_or:AndOrList;background:bool};AndOrList{deny_unknown;first:PipelineNode;rest:array<ConnectedPipeline>};ConnectedPipeline{deny_unknown;connector:and|or;pipeline:PipelineNode};PipelineNode{deny_unknown;negated:bool;commands:nonempty-array<CommandNode>};CommandNode:simple(SimpleCommand)|compound(CompoundCommand)|function_definition(FunctionDefinition);CompoundCommand:brace_group(CompoundList)|if(IfClause)|for(ForClause)|while(LoopClause)|until(LoopClause)|case(CaseClause);IfClause{deny_unknown;branches:array<ConditionalBranch>;else_body:null|CompoundList};ConditionalBranch{deny_unknown;condition:CompoundList;body:CompoundList};ForClause{deny_unknown;variable:string;words:null|array<Word>;body:CompoundList};LoopClause{deny_unknown;condition:CompoundList;body:CompoundList};CaseClause{deny_unknown;subject:Word;arms:array<CaseArm>};CaseArm{deny_unknown;patterns:nonempty-array<Word>;body:CompoundList};FunctionDefinition{deny_unknown;name:string;body:CompoundCommand;source:string};tokens:word|pipe|and|or|semicolon|double_semicolon|newline|input|output|append|here_string|fd_duplicate|background;comments:hash-at-word-start-to-LF;lines:unquoted-LF-sequences|leading-blank-trailing-LF-ignored|LF-after-pipe-and-or-continues|backslash-LF-removed|quoted-LF-literal|unquoted-CR-whitespace|backslash-CRLF-keeps-escaped-CR-then-separates;expansion:parameter|positional|special|arithmetic|command|pathname|field-splitting;aliases:posix-command-position;compatibility_matrix:quirl-syntax/compatibility-v0.1.json@schema3}";
 
 const MAX_COMMAND_SUBSTITUTION_DEPTH: usize = 64;
 
@@ -2477,9 +2477,9 @@ mod tests {
     fn compatibility_matrix_is_versioned_complete_and_schema_checked() {
         let matrix: CompatibilityMatrix = serde_json::from_str(COMPATIBILITY_MATRIX_JSON).unwrap();
         assert_eq!(matrix.schema_version, 3);
-        assert_eq!(matrix.matrix_version, "0.1");
+        assert_eq!(matrix.matrix_version, "0.2");
         assert_eq!(matrix.target_contract_version, "1.0");
-        assert_eq!(matrix.compatibility_level, "C1-core-unix+C2-runner");
+        assert_eq!(matrix.compatibility_level, "C1-posix-native-unix+C2-runner");
         assert_eq!(matrix.contract_status, "frozen_disposition");
         assert!(!matrix.scope.is_empty());
         assert!(!matrix.differential_fixtures.is_empty());
@@ -2510,6 +2510,8 @@ mod tests {
                 "export_assignment",
                 "expansions",
                 "conditionals_and_control",
+                "functions",
+                "aliases",
                 "interactive_dialect_islands",
                 "bash_script_runner",
                 "zsh_script_runner",
@@ -2799,7 +2801,7 @@ mod tests {
                 continue;
             }
             for fixture in &matrix.differential_fixtures {
-                parse_command_list(&fixture.source).unwrap();
+                parse_program(&fixture.source, &NoAliases).unwrap();
                 let mut command = Command::new(shell);
                 if shell == "bash" {
                     command.args(["--noprofile", "--norc", "-c", &fixture.source]);

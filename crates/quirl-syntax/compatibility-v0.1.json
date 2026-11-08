@@ -1,9 +1,9 @@
 {
   "schema_version": 3,
-  "matrix_version": "0.1",
+  "matrix_version": "0.2",
   "target_contract_version": "1.0",
-  "compatibility_level": "C1-core-unix+C2-runner",
-  "scope": "Unix native C1-core command parser/execution graph and cross-platform explicit reference-runner boundary",
+  "compatibility_level": "C1-posix-native-unix+C2-runner",
+  "scope": "Unix native POSIX sh program subset (commands, lists, control flow, functions, aliases) and cross-platform explicit reference-runner boundary",
   "contract_status": "frozen_disposition",
   "differential_fixtures": [
     {
@@ -55,6 +55,36 @@
       "id": "export_assignment",
       "source": "export QUIRL_C1=value && printenv QUIRL_C1",
       "stdout": "value\n"
+    },
+    {
+      "id": "for_loop",
+      "source": "for word in a 'b c'; do printf '[%s]' \"$word\"; done",
+      "stdout": "[a][b c]"
+    },
+    {
+      "id": "while_loop_with_arithmetic",
+      "source": "i=0; while [ $i -lt 3 ]; do printf $i; i=$((i + 1)); done",
+      "stdout": "012"
+    },
+    {
+      "id": "if_elif_else",
+      "source": "if false; then printf a; elif true; then printf b; else printf c; fi",
+      "stdout": "b"
+    },
+    {
+      "id": "case_patterns",
+      "source": "case main.rs in *.md) printf doc;; *.rs|*.toml) printf rust;; esac",
+      "stdout": "rust"
+    },
+    {
+      "id": "function_with_arguments",
+      "source": "greet() { printf '%s:%s' \"$#\" \"$1\"; }; greet world",
+      "stdout": "1:world"
+    },
+    {
+      "id": "loop_control",
+      "source": "for i in 1 2 3 4; do [ $i = 2 ] && continue; [ $i = 4 ] && break; printf $i; done",
+      "stdout": "13"
     }
   ],
   "supported": [
@@ -81,7 +111,7 @@
     {
       "id": "lists_and_boolean_connectors", "level": "C1", "implementation": "native",
       "forms": ["left && right", "left || right", "first; second", "first\nsecond", "producer |\nconsumer", "command continued\\\nargument"],
-      "limitations": "Unquoted LF separates command lists; leading, blank, and trailing LF are ignored. LF after |, &&, or || continues the operator, and backslash-LF is removed. Quoted LF stays literal. CR outside quotes is whitespace; backslash-CRLF retains an escaped CR and separates at LF. Explicit trailing connectors remain recoverable syntax errors; # comments are not part of this native lexer."
+      "limitations": "Unquoted LF separates command lists; leading, blank, and trailing LF are ignored. LF after |, &&, or || continues the operator, and backslash-LF is removed. Quoted LF stays literal. CR outside quotes is whitespace; backslash-CRLF retains an escaped CR and separates at LF. Explicit trailing connectors remain recoverable syntax errors. A # that begins a word starts a comment to the end of the line."
     },
     {
       "id": "export_assignment", "level": "C1", "implementation": "native",
@@ -90,13 +120,23 @@
     },
     {
       "id": "expansions", "level": "C1", "implementation": "native",
-      "forms": ["$NAME", "${NAME}", "$?", "$((1 + 2))", "$(printf value)", "*.qrl"],
-      "limitations": "Unix native executor: command substitution has a 16 KiB source/output budget; glob no-match behavior is literal and process substitution is an explicit island."
+      "forms": ["$NAME", "${NAME}", "$?", "$1", "$#", "\"$@\"", "$((i + 1))", "$(printf value)", "*.qrl"],
+      "limitations": "Unix native executor: unquoted parameter and command expansions are field-split on IFS as in sh and Bash; command substitution has a 16 KiB source/output budget; glob no-match behavior is literal and process substitution is an explicit island."
     },
     {
-      "id": "conditionals_and_control", "level": "C2", "implementation": "reference_runner",
-      "forms": ["bash { if true; then echo yes; fi }", "zsh { for x in a; do print $x; done }"],
-      "limitations": "Compound control syntax is intentionally delegated to the selected dialect so its observable semantics remain exact."
+      "id": "conditionals_and_control", "level": "C1", "implementation": "native",
+      "forms": ["if test -f x; then echo yes; elif true; then :; else echo no; fi", "for f in *.md; do echo \"$f\"; done", "while [ $i -lt 3 ]; do i=$((i + 1)); done", "until false; do break; done", "case $x in a|b) echo ab;; *) echo other;; esac", "{ echo a; echo b; }", "! grep -q x file"],
+      "limitations": "POSIX sh semantics in the session process. Compound commands used as pipeline stages or with redirections, subshells, [[, ((, select, and read loops run in the /bin/sh island at the interactive prompt."
+    },
+    {
+      "id": "functions", "level": "C1", "implementation": "native",
+      "forms": ["greet() { echo \"hi $1\"; }", "function greet { echo hi; }", "local name=value", "return 1", "shift", "unset -f greet"],
+      "limitations": "Functions persist for the session and nest at most 100 calls deep; input redirections on a call and functions as later pipeline stages need the /bin/sh island."
+    },
+    {
+      "id": "aliases", "level": "C1", "implementation": "native",
+      "forms": ["alias ll='ls -l'", "alias", "unalias ll", "alias sudo='sudo '"],
+      "limitations": "POSIX alias substitution at command position, recursion-safe and bounded to 64 substitutions per line; aliases are not visible inside /bin/sh islands."
     },
     {
       "id": "interactive_dialect_islands", "level": "C2", "implementation": "reference_runner",

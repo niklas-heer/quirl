@@ -16,6 +16,7 @@
     )
 )]
 
+mod arithmetic;
 mod builtin;
 mod developer_context;
 mod echo_builtin;
@@ -866,6 +867,23 @@ mod session_environment_tests {
     }
 }
 
+/// Shell variables as seen by `$(( ))`: reads use the session's value, and
+/// assignment operators set the variable as a bare `NAME=value` would.
+struct SessionArithmetic<'a>(&'a mut SessionEnvironment);
+
+impl arithmetic::ArithmeticVariables for SessionArithmetic<'_> {
+    fn get(&self, name: &str) -> Option<String> {
+        self.0
+            .lookup(name)
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    fn set(&mut self, name: &str, value: i64) -> Result<(), quirl_core::ShellError> {
+        self.0
+            .assign_variables(&[(name.to_owned(), value.to_string())])
+    }
+}
+
 fn environment_variable_limit_error(limit: usize, observed: usize) -> quirl_core::ShellError {
     quirl_core::ShellError::new(
         quirl_core::ErrorCode::ResourceLimit,
@@ -942,7 +960,7 @@ fn noninteractive_process_error(source: &str, message: &str) -> quirl_core::Shel
 }
 
 /// Version of the serialized native runner contract.
-pub const RUNNER_PROTOCOL_VERSION: u32 = 3;
+pub const RUNNER_PROTOCOL_VERSION: u32 = 4;
 /// Historical runner version retained as fail-closed compatibility evidence.
 pub const RUNNER_PROTOCOL_VERSION_V1: u32 = 1;
 /// Default bytes retained for final stdout and, separately, aggregate stderr
@@ -973,7 +991,7 @@ pub const RETAINED_JOBS_MAX: usize = 1024;
 /// Historical runner-v1 descriptor retained verbatim for compatibility review.
 pub const RUNNER_SCHEMA_DESCRIPTOR_V1: &str = "quirl.runner@1{input:quirl.command-grammar@1,native-source-bytes<=1048576,native-pipelines<=256,native-stages-per-pipeline<=64,here-string-bytes-including-newline<=262144,arithmetic-source-bytes<=16384,arithmetic-depth<=64;ProcessBackend{execute_capture(source)->CommandOutcome;execute_interactive(source)->CommandOutcome;jobs()->array<JobState>;foreground_job(id)->JobState;cancel_job(id)->JobState;suspend_job(id)->JobState};JobState{deny_unknown;id:u32;command:string;status:running|stopped|done;process_group:null|i32;exit_status:null|i32};CommandOutcome{status:i32;stdout:null|string;stderr:null|string};capture:default-retained-per-stream=1048576|caller-tighter,drain-excess-then-ResourceLimit-with-retained-and-discarded-byte-context;interactive:inherit-streams-without-retention-limit;byte-pipeline:ordered;redirection:input|output|append|here-string;background:terminal-ampersand;cancel-status:130;errors:ShellError;platform:suspend-unavailable-on-windows}";
 /// Canonical descriptor hashed to identify the native runner contract.
-pub const RUNNER_SCHEMA_DESCRIPTOR: &str = "quirl.runner@3{input:quirl.command-grammar@3,native-source-bytes<=1048576,native-pipelines<=256,native-stages-per-pipeline<=64,retained-jobs<=1024,job-id:u32-nonzero-wrap-skip-visible,here-string-bytes-including-newline<=262144,arithmetic-source-bytes<=16384,arithmetic-depth<=64;ProcessBackend{execute(source)->CommandOutcome;execute_capture(source)->CommandOutcome;jobs()->array<JobState>;cancel_job(id)->JobState;suspend_job(id)->JobState};JobState{deny_unknown;id:u32-nonzero;command:string;status:running|stopped|done;process_group:null|i32;exit_status:null|i32};CommandOutcome{status:i32;stdout:null|string;stderr:null|string};capture:default-retained-per-stream=1048576|caller-tighter,drain-excess-then-ResourceLimit-with-retained-and-discarded-byte-context;interactive:inherit-streams-without-retention-limit;byte-pipeline:ordered;redirection:input-source-order-last-wins|output|append|here-string;background:terminal-ampersand;cancel-status:130;errors:ShellError;platform:suspend-unavailable-on-windows;compatibility:frozen-major-v1-fails-closed}";
+pub const RUNNER_SCHEMA_DESCRIPTOR: &str = "quirl.runner@4{input:quirl.command-grammar@4,native-source-bytes<=1048576,native-program-pipelines<=4096,function-call-depth<=100,session-functions<=1024,session-aliases<=1024,definition-bytes<=65536,word-fields<=65536,native-stages-per-pipeline<=64,retained-jobs<=1024,job-id:u32-nonzero-wrap-skip-visible,here-string-bytes-including-newline<=262144,arithmetic-source-bytes<=16384,arithmetic-depth<=64;ProcessBackend{execute(source)->CommandOutcome;execute_capture(source)->CommandOutcome;jobs()->array<JobState>;cancel_job(id)->JobState;suspend_job(id)->JobState};JobState{deny_unknown;id:u32-nonzero;command:string;status:running|stopped|done;process_group:null|i32;exit_status:null|i32};CommandOutcome{status:i32;stdout:null|string;stderr:null|string};capture:default-retained-per-stream=1048576|caller-tighter,drain-excess-then-ResourceLimit-with-retained-and-discarded-byte-context;interactive:inherit-streams-without-retention-limit;byte-pipeline:ordered;redirection:input-source-order-last-wins|output|append|here-string;background:simple-pipeline-list-items;cancel-status:130;errors:ShellError;platform:suspend-unavailable-on-windows;compatibility:frozen-major-v1-fails-closed}";
 
 /// Historical encoded runner-v1 job fixture retained for compatibility evidence.
 pub const RUNNER_JOB_STATE_FIXTURE_V1: &str =
@@ -1009,7 +1027,9 @@ pub fn validate_runner_protocol_version(version: u32) -> Result<(), quirl_core::
     .with_context(format!(
         "supported runner protocol version: {RUNNER_PROTOCOL_VERSION}"
     ))
-    .with_help("Use a client and Quirl build that both implement runner protocol v2"))
+    .with_help(format!(
+        "Use a client and Quirl build that both implement runner protocol v{RUNNER_PROTOCOL_VERSION}"
+    )))
 }
 
 fn allocate_job_id(next_job_id: &mut u32, visible_ids: &[u32]) -> Option<u32> {
@@ -1319,10 +1339,9 @@ mod platform {
     mod interpreter;
 
     use super::{
-        ARITHMETIC_DEPTH_MAX, ARITHMETIC_SOURCE_BYTES_MAX, DEFAULT_CAPTURE_BYTES,
-        EXPANSION_BYTES_MAX, HERE_STRING_BYTES_MAX, ObservedActivity, OutputObserver,
-        PARAMETER_PATTERN_BYTES_MAX, RETAINED_JOBS_MAX, SessionEnvironment, allocate_job_id,
-        builtin, program_error, validate_native_program, validate_native_source,
+        DEFAULT_CAPTURE_BYTES, EXPANSION_BYTES_MAX, HERE_STRING_BYTES_MAX, ObservedActivity,
+        OutputObserver, PARAMETER_PATTERN_BYTES_MAX, RETAINED_JOBS_MAX, SessionEnvironment,
+        allocate_job_id, builtin, program_error, validate_native_program, validate_native_source,
     };
 
     use nix::{
@@ -3213,7 +3232,31 @@ mod platform {
                             "Re-enter the arithmetic expansion",
                         )
                     })?;
-                    let value = evaluate_arithmetic(expression)?.to_string();
+                    // POSIX expands parameters, command substitutions, and
+                    // nested arithmetic inside `$(( ))` before evaluating it.
+                    let expanded_expression;
+                    let expression = if expression.contains('$') {
+                        let mut expanded = String::new();
+                        self.expand_fragment(
+                            expression,
+                            limit,
+                            request,
+                            previous_status,
+                            &mut expanded,
+                            budget,
+                            None,
+                            true,
+                        )?;
+                        expanded_expression = expanded;
+                        expanded_expression.as_str()
+                    } else {
+                        expression
+                    };
+                    let value = crate::arithmetic::evaluate_arithmetic(
+                        expression,
+                        &mut crate::SessionArithmetic(&mut self.environment),
+                    )?
+                    .to_string();
                     budget.append(output, &value)?;
                     record_splittable(marks.as_deref_mut(), quoted, expansion_start, output.len());
                     index = index
@@ -4339,183 +4382,6 @@ mod platform {
             }
         }
         None
-    }
-
-    fn evaluate_arithmetic(source: &str) -> Result<i64, ShellError> {
-        if source.len() > ARITHMETIC_SOURCE_BYTES_MAX {
-            return Err(ShellError::new(
-                ErrorCode::ResourceLimit,
-                "arithmetic expansion exceeds its source byte limit",
-            )
-            .with_context(format!(
-                "limit {ARITHMETIC_SOURCE_BYTES_MAX} bytes; observed {} bytes",
-                source.len()
-            ))
-            .with_help("Split the calculation into smaller expressions"));
-        }
-        #[derive(Clone, Copy)]
-        struct Parser<'a> {
-            input: &'a [u8],
-            index: usize,
-        }
-        impl<'a> Parser<'a> {
-            fn skip(&mut self) {
-                while self
-                    .input
-                    .get(self.index)
-                    .is_some_and(u8::is_ascii_whitespace)
-                {
-                    self.index = self.index.saturating_add(1);
-                }
-            }
-            fn expression(&mut self, depth: usize) -> Result<i64, ShellError> {
-                let mut value = self.term(depth)?;
-                loop {
-                    self.skip();
-                    match self.input.get(self.index).copied() {
-                        Some(b'+') => {
-                            self.index = self.index.saturating_add(1);
-                            value = value.checked_add(self.term(depth)?).ok_or_else(|| {
-                                expansion_error(
-                                    "arithmetic expansion overflowed",
-                                    "Use a smaller integer expression",
-                                )
-                            })?;
-                        }
-                        Some(b'-') => {
-                            self.index = self.index.saturating_add(1);
-                            value = value.checked_sub(self.term(depth)?).ok_or_else(|| {
-                                expansion_error(
-                                    "arithmetic expansion overflowed",
-                                    "Use a smaller integer expression",
-                                )
-                            })?;
-                        }
-                        _ => return Ok(value),
-                    }
-                }
-            }
-            fn term(&mut self, depth: usize) -> Result<i64, ShellError> {
-                let mut value = self.factor(depth)?;
-                loop {
-                    self.skip();
-                    match self.input.get(self.index).copied() {
-                        Some(b'*') => {
-                            self.index = self.index.saturating_add(1);
-                            value = value.checked_mul(self.factor(depth)?).ok_or_else(|| {
-                                expansion_error(
-                                    "arithmetic expansion overflowed",
-                                    "Use a smaller integer expression",
-                                )
-                            })?;
-                        }
-                        Some(b'/') => {
-                            self.index = self.index.saturating_add(1);
-                            let divisor = self.factor(depth)?;
-                            if divisor == 0 {
-                                return Err(expansion_error(
-                                    "arithmetic expansion divides by zero",
-                                    "Use a non-zero divisor",
-                                ));
-                            }
-                            value = value.checked_div(divisor).ok_or_else(|| {
-                                expansion_error(
-                                    "arithmetic expansion overflowed",
-                                    "Use a smaller integer expression",
-                                )
-                            })?;
-                        }
-                        _ => return Ok(value),
-                    }
-                }
-            }
-            fn nested_depth(depth: usize) -> Result<usize, ShellError> {
-                let observed_depth = depth.saturating_add(1);
-                if observed_depth > ARITHMETIC_DEPTH_MAX {
-                    return Err(ShellError::new(
-                        ErrorCode::ResourceLimit,
-                        "arithmetic expansion exceeds its nesting depth limit",
-                    )
-                    .with_context(format!(
-                        "limit {ARITHMETIC_DEPTH_MAX} levels; observed at least {observed_depth} levels"
-                    ))
-                    .with_help("Flatten the arithmetic expression"));
-                }
-                Ok(observed_depth)
-            }
-
-            fn factor(&mut self, depth: usize) -> Result<i64, ShellError> {
-                self.skip();
-                if self.input.get(self.index) == Some(&b'(') {
-                    self.index = self.index.saturating_add(1);
-                    let value = self.expression(Self::nested_depth(depth)?)?;
-                    self.skip();
-                    if self.input.get(self.index) != Some(&b')') {
-                        return Err(expansion_error(
-                            "unbalanced parentheses in arithmetic expansion",
-                            "Balance parentheses in `$((...))`",
-                        ));
-                    }
-                    self.index = self.index.saturating_add(1);
-                    return Ok(value);
-                }
-                if self.input.get(self.index) == Some(&b'-') {
-                    self.index = self.index.saturating_add(1);
-                    return self
-                        .factor(Self::nested_depth(depth)?)?
-                        .checked_neg()
-                        .ok_or_else(|| {
-                            expansion_error(
-                                "arithmetic expansion overflowed",
-                                "Use a smaller integer expression",
-                            )
-                        });
-                }
-                let start = self.index;
-                while self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
-                    self.index = self.index.saturating_add(1);
-                }
-                if start == self.index {
-                    return Err(expansion_error(
-                        "missing operand in arithmetic expansion",
-                        "Use integer literals and +, -, *, /, or parentheses",
-                    ));
-                }
-                let digits = self.input.get(start..self.index).ok_or_else(|| {
-                    expansion_error(
-                        "arithmetic operand boundary is invalid",
-                        "Use ASCII integer literals",
-                    )
-                })?;
-                let text = std::str::from_utf8(digits).map_err(|_| {
-                    expansion_error(
-                        "non-numeric digits in arithmetic expansion",
-                        "Use ASCII integer literals",
-                    )
-                })?;
-                let value = text.parse::<i64>().map_err(|_| {
-                    expansion_error(
-                        "arithmetic expansion overflowed",
-                        "Use a smaller integer expression",
-                    )
-                })?;
-                Ok(value)
-            }
-        }
-        let mut parser = Parser {
-            input: source.as_bytes(),
-            index: 0,
-        };
-        let value = parser.expression(0)?;
-        parser.skip();
-        if parser.index != parser.input.len() {
-            return Err(expansion_error(
-                "unexpected trailing text in arithmetic expansion",
-                "Use integer literals and +, -, *, /, or parentheses",
-            )
-            .with_context(format!("in `{source}`")));
-        }
-        Ok(value)
     }
 
     fn pathname_expand(
@@ -6880,34 +6746,22 @@ mod platform {
         }
 
         #[test]
-        fn arithmetic_input_and_nesting_are_bounded() {
-            let source = "1".repeat(ARITHMETIC_SOURCE_BYTES_MAX + 1);
-            let error = evaluate_arithmetic(&source).unwrap_err();
-            assert_eq!(error.code, ErrorCode::ResourceLimit);
-            assert!(error.details.context.iter().any(|context| {
-                context.contains(&format!("limit {ARITHMETIC_SOURCE_BYTES_MAX} bytes"))
-            }));
-
+        fn arithmetic_expansion_is_bounded_and_wraps_like_bash() {
             let nested = format!(
-                "{}1{}",
-                "(".repeat(ARITHMETIC_DEPTH_MAX + 1),
-                ")".repeat(ARITHMETIC_DEPTH_MAX + 1)
+                "printf $(({}1{}))",
+                "(".repeat(crate::ARITHMETIC_DEPTH_MAX + 1),
+                ")".repeat(crate::ARITHMETIC_DEPTH_MAX + 1)
             );
-            let error = evaluate_arithmetic(&nested).unwrap_err();
+            let error = NativeExecutor::default()
+                .execute_capture(&nested)
+                .unwrap_err();
             assert_eq!(error.code, ErrorCode::ResourceLimit);
-            assert!(error.message.contains("nesting depth"));
-        }
-
-        #[test]
-        fn arithmetic_minimum_division_and_negation_return_overflow_errors() {
-            for source in [
-                "(-9223372036854775807 - 1) / -1",
-                "-(-9223372036854775807 - 1)",
-            ] {
-                let error = evaluate_arithmetic(source).unwrap_err();
-                assert_eq!(error.code, ErrorCode::InvalidCommand);
-                assert!(error.message.contains("overflowed"));
-            }
+            let result = NativeExecutor::default()
+                .execute_capture(
+                    "x=5; printf '%s ' $((x += 2)) $x $(((-9223372036854775807 - 1) / -1))",
+                )
+                .unwrap();
+            assert_eq!(result.stdout.as_deref(), Some("7 7 -9223372036854775808 "));
         }
 
         #[test]
@@ -10169,7 +10023,7 @@ mod backend_contract_tests {
             quirl_core::schema_fingerprint(RUNNER_SCHEMA_DESCRIPTOR_V1),
             "fnv1a64:131ea5b3e770b424"
         );
-        assert!(RUNNER_SCHEMA_DESCRIPTOR.contains("quirl.command-grammar@3"));
+        assert!(RUNNER_SCHEMA_DESCRIPTOR.contains("quirl.command-grammar@4"));
         assert!(RUNNER_SCHEMA_DESCRIPTOR.contains("execute(source)"));
         assert!(!RUNNER_SCHEMA_DESCRIPTOR.contains("foreground_job"));
         assert!(!RUNNER_SCHEMA_DESCRIPTOR.contains("execute_interactive"));
