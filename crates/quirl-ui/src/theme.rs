@@ -209,6 +209,9 @@ impl Theme {
             HighlightKind::Command => self
                 .ratatui_foreground(self.palette.accent_command)
                 .add_modifier(Modifier::BOLD),
+            HighlightKind::Keyword => self
+                .ratatui_foreground(self.palette.accent_data)
+                .add_modifier(Modifier::BOLD),
             HighlightKind::Flag => self
                 .ratatui_foreground(self.palette.context_primary)
                 .add_modifier(Modifier::BOLD),
@@ -256,6 +259,7 @@ impl Theme {
     pub(crate) fn ansi_highlight(self, kind: HighlightKind) -> AnsiStyle {
         match kind {
             HighlightKind::Command => self.ansi_foreground(self.palette.accent_command).bold(),
+            HighlightKind::Keyword => self.ansi_foreground(self.palette.accent_data).bold(),
             HighlightKind::Flag => self.ansi_foreground(self.palette.context_primary).bold(),
             HighlightKind::StringSingle | HighlightKind::StringDouble => {
                 self.ansi_foreground(self.palette.string)
@@ -368,6 +372,9 @@ mod tests {
         let command = theme.highlight(HighlightKind::Command);
         assert_eq!(command.fg, None);
         assert!(command.add_modifier.contains(Modifier::BOLD));
+        let keyword = theme.highlight(HighlightKind::Keyword);
+        assert_eq!(keyword.fg, None);
+        assert!(keyword.add_modifier.contains(Modifier::BOLD));
         assert_eq!(theme.status().bg, None);
         assert_eq!(
             theme.prompt_accent_color(Mode::Command),

@@ -241,6 +241,9 @@ pub struct HighlightSpan {
 pub enum HighlightKind {
     /// First word of a command or pipeline stage.
     Command,
+    /// Unquoted reserved word at command position, such as `if`, `done`, `{`, or
+    /// `function`. The `in` of a `for` or `case` clause is also a keyword.
+    Keyword,
     /// Non-command word whose raw source starts with `-`.
     Flag,
     /// Ordinary argument text, including whitespace and neutral data-mode text.
@@ -314,10 +317,127 @@ pub fn highlight(line: &str, mode: Mode) -> Vec<HighlightSpan> {
     }
 }
 
+/// The word a compound-command keyword is still waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingWord {
+    /// No reserved-word construct is waiting for its next word.
+    None,
+    /// The loop variable of `for` or the subject of `case` comes next; `in` may follow it.
+    Subject,
+    /// The word after a `for` variable or `case` subject: `in` is a keyword here only.
+    AwaitIn,
+    /// The name of a `function NAME` definition comes next.
+    FunctionName,
+}
+
+/// Command-position state threaded through the lexer tokens of one line.
+///
+/// Keeping this state in one place makes the rules visible: an operator starts a
+/// new command, leading keywords such as `if` keep the next word in command
+/// position, and trailing keywords such as `done` end the command they close.
+#[derive(Debug)]
+struct HighlightState {
+    command_position: bool,
+    redirect_target: bool,
+    pending: PendingWord,
+}
+
+impl HighlightState {
+    const fn new() -> Self {
+        Self {
+            command_position: true,
+            redirect_target: false,
+            pending: PendingWord::None,
+        }
+    }
+
+    fn operator(&mut self) -> HighlightKind {
+        self.command_position = true;
+        self.pending = PendingWord::None;
+        HighlightKind::Operator
+    }
+
+    fn redirect(&mut self) -> HighlightKind {
+        self.redirect_target = true;
+        HighlightKind::Redirect
+    }
+
+    fn word(&mut self, raw: &str, word: &Word) -> HighlightKind {
+        let plain = plain_unquoted(raw, word);
+        match (self.pending, plain) {
+            (PendingWord::FunctionName, _) => {
+                // The body of `function NAME` starts at command position.
+                self.pending = PendingWord::None;
+                self.command_position = true;
+                return HighlightKind::Command;
+            }
+            (PendingWord::Subject, _) => {
+                self.pending = PendingWord::AwaitIn;
+                self.command_position = false;
+                return classify_word(raw, word);
+            }
+            (PendingWord::AwaitIn, Some("in")) => {
+                self.pending = PendingWord::None;
+                self.command_position = false;
+                return HighlightKind::Keyword;
+            }
+            (PendingWord::AwaitIn, _) => self.pending = PendingWord::None,
+            (PendingWord::None, _) => {}
+        }
+        if self.redirect_target {
+            self.redirect_target = false;
+            return HighlightKind::PathLike;
+        }
+        if self.command_position {
+            return self.command_word(raw, plain);
+        }
+        classify_word(raw, word)
+    }
+
+    fn command_word(&mut self, raw: &str, plain: Option<&str>) -> HighlightKind {
+        match plain {
+            Some("if" | "then" | "elif" | "else" | "do" | "while" | "until" | "!" | "{") => {
+                // The next word is still a command, as in `if git status`.
+                HighlightKind::Keyword
+            }
+            Some("fi" | "done" | "esac" | "}") => {
+                self.command_position = false;
+                HighlightKind::Keyword
+            }
+            Some("for" | "case") => {
+                self.command_position = false;
+                self.pending = PendingWord::Subject;
+                HighlightKind::Keyword
+            }
+            Some("function") => {
+                self.command_position = false;
+                self.pending = PendingWord::FunctionName;
+                HighlightKind::Keyword
+            }
+            _ => {
+                self.command_position = false;
+                // `name()` opens a function body, which starts at command position.
+                if raw.strip_suffix("()").is_some_and(|name| !name.is_empty()) {
+                    self.command_position = true;
+                }
+                HighlightKind::Command
+            }
+        }
+    }
+}
+
+/// Returns the raw text when `word` is one unquoted fragment, which is the only form
+/// that can be a reserved word.
+fn plain_unquoted<'a>(raw: &'a str, word: &Word) -> Option<&'a str> {
+    match word.parts.as_slice() {
+        [part] if part.quoting == Quoting::Unquoted => Some(raw),
+        _ => None,
+    }
+}
+
 fn highlight_tokens(line: &str, tokens: &[Token]) -> Vec<HighlightSpan> {
     let mut classified = Vec::with_capacity(tokens.len());
-    let mut command_position = true;
-    let mut redirect_target = false;
+    let mut state = HighlightState::new();
     for token in tokens {
         let raw = line.get(token.start..token.end).unwrap_or_default();
         let kind = match &token.kind {
@@ -327,25 +447,9 @@ fn highlight_tokens(line: &str, tokens: &[Token]) -> Vec<HighlightSpan> {
             | TokenKind::Semicolon
             | TokenKind::DoubleSemicolon
             | TokenKind::Newline
-            | TokenKind::Background => {
-                command_position = true;
-                HighlightKind::Operator
-            }
-            TokenKind::Redirect { .. } => {
-                redirect_target = true;
-                HighlightKind::Redirect
-            }
-            TokenKind::Word(word) => {
-                if command_position {
-                    command_position = false;
-                    HighlightKind::Command
-                } else if redirect_target {
-                    redirect_target = false;
-                    HighlightKind::PathLike
-                } else {
-                    classify_word(raw, word)
-                }
-            }
+            | TokenKind::Background => state.operator(),
+            TokenKind::Redirect { .. } => state.redirect(),
+            TokenKind::Word(word) => state.word(raw, word),
         };
         classified.push((token.start..token.end, kind));
     }
@@ -1500,6 +1604,11 @@ mod tests {
             "unterminated 'quote",
             "echo 👨‍👩‍👧‍👦 > ./out",
             "a && b || c; d &",
+            "for x in a b; do echo $x; done",
+            "if git status; then\necho ok\nelif false; then echo no\nelse echo else; fi",
+            "case $x in a) echo a;; *) echo b;; esac",
+            "function greet { echo hi; }",
+            "greet() {\n  echo hi\n}",
             "\0\u{1b}\u{85}",
             long.as_str(),
         ];
@@ -1530,6 +1639,97 @@ mod tests {
         assert!(spans.iter().any(|span| {
             span.kind == HighlightKind::Command && source.get(span.range.clone()) == Some("tr")
         }));
+    }
+
+    /// Returns each non-blank span's text with its kind, in source order.
+    fn word_kinds(source: &str) -> Vec<(&str, HighlightKind)> {
+        highlight(source, Mode::Command)
+            .into_iter()
+            .filter_map(|span| {
+                let text = source.get(span.range.clone())?;
+                (!text.trim().is_empty()).then_some((text, span.kind))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reserved_words_at_command_position_are_keywords() {
+        use HighlightKind::{Argument, Command, Keyword, Operator};
+        assert_eq!(
+            word_kinds("if git status; then echo ok; fi"),
+            vec![
+                ("if", Keyword),
+                ("git", Command),
+                ("status", Argument),
+                (";", Operator),
+                ("then", Keyword),
+                ("echo", Command),
+                ("ok", Argument),
+                (";", Operator),
+                ("fi", Keyword),
+            ]
+        );
+    }
+
+    #[test]
+    fn loop_variable_and_in_are_not_commands() {
+        use HighlightKind::{Argument, Command, Keyword, Operator};
+        assert_eq!(
+            word_kinds("for x in a b; do echo $x; done"),
+            vec![
+                ("for", Keyword),
+                ("x", Argument),
+                ("in", Keyword),
+                ("a", Argument),
+                ("b", Argument),
+                (";", Operator),
+                ("do", Keyword),
+                ("echo", Command),
+                ("$x", HighlightKind::Expansion),
+                (";", Operator),
+                ("done", Keyword),
+            ]
+        );
+    }
+
+    #[test]
+    fn case_subject_is_followed_by_an_in_keyword() {
+        let kinds = word_kinds("case $x in");
+        assert_eq!(kinds[0], ("case", HighlightKind::Keyword));
+        assert_eq!(kinds[2], ("in", HighlightKind::Keyword));
+    }
+
+    #[test]
+    fn function_names_and_name_parens_are_commands_before_a_body_keyword() {
+        use HighlightKind::{Argument, Command, Keyword, Operator};
+        assert_eq!(
+            word_kinds("function greet { echo hi; }"),
+            vec![
+                ("function", Keyword),
+                ("greet", Command),
+                ("{", Keyword),
+                ("echo", Command),
+                ("hi", Argument),
+                (";", Operator),
+                ("}", Keyword),
+            ]
+        );
+        let kinds = word_kinds("greet() { echo hi; }");
+        assert_eq!(kinds[0], ("greet()", Command));
+        assert_eq!(kinds[1], ("{", Keyword));
+    }
+
+    #[test]
+    fn reserved_words_outside_command_position_or_quoted_are_plain_text() {
+        use HighlightKind::{Argument, Command, StringSingle};
+        assert_eq!(
+            word_kinds("echo if 'done'"),
+            vec![
+                ("echo", Command),
+                ("if", Argument),
+                ("'done'", StringSingle),
+            ]
+        );
     }
     use serde::Deserialize;
     use std::{collections::HashSet, process::Command};

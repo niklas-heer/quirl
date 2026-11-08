@@ -1,7 +1,7 @@
 use quirl_catalog::{ArgumentKind, Catalog, CommandSpec, Confidence, Provenance};
 use quirl_syntax::{
-    CommandList, HighlightKind, HighlightSpan, Mode, Quoting, SimpleCommand, Word, highlight,
-    parse_command_list,
+    CommandList, DialectControlForm, HighlightKind, HighlightSpan, Mode, ProgramError, Quoting,
+    SimpleCommand, Word, highlight, parse_command_list,
 };
 use std::{
     collections::{HashSet, VecDeque},
@@ -414,6 +414,31 @@ fn is_executable_file(path: &Path) -> std::io::Result<bool> {
     fs::metadata(path).map(|metadata| metadata.is_file())
 }
 
+/// Explains a form the native grammar leaves to `/bin/sh`.
+///
+/// The form itself is only a hint, because it still runs. A function defined next
+/// to it is an error, because the function would be lost when the reference shell
+/// exits.
+fn unsupported_form_diagnostic(form: &DialectControlForm) -> SurfaceDiagnostic {
+    let range = Some(form.start..form.end.max(form.start.saturating_add(1)));
+    if form.defines_function {
+        SurfaceDiagnostic {
+            message: format!(
+                "a function defined next to `{}` cannot persist: {}; define it in a native form such as `name() {{ ... }}` without the unsupported syntax",
+                form.text, form.reason
+            ),
+            severity: DiagnosticSeverity::Error,
+            range,
+        }
+    } else {
+        SurfaceDiagnostic {
+            message: format!("`{}` runs through /bin/sh: {}", form.text, form.reason),
+            severity: DiagnosticSeverity::Hint,
+            range,
+        }
+    }
+}
+
 #[allow(
     clippy::string_slice,
     reason = "diagnostic spans originate from the syntax parser and are UTF-8 byte boundaries"
@@ -428,38 +453,28 @@ fn diagnostic_for(
     if buffer.trim().is_empty() || mode != Mode::Command {
         return None;
     }
-    let parsed = match parse_command_list(buffer) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            if super::input_is_incomplete(buffer, mode) {
-                return None;
-            }
-            // Loops, groups, and other control forms run through /bin/sh;
-            // only a function definition cannot work, since it would not
-            // outlive the shell that runs it.
-            if let Some(form) = quirl_syntax::dialect_control_form(buffer) {
-                let range = Some(form.start..form.end.max(form.start.saturating_add(1)));
-                return Some(if form.defines_function {
-                    SurfaceDiagnostic {
-                        message: "shell functions do not persist in Quirl".to_owned(),
-                        severity: DiagnosticSeverity::Error,
-                        range,
-                    }
-                } else {
-                    SurfaceDiagnostic {
-                        message: format!("`{}` runs through /bin/sh", form.text),
-                        severity: DiagnosticSeverity::Hint,
-                        range,
-                    }
-                });
-            }
+    match quirl_syntax::parse_program(buffer, &quirl_syntax::NoAliases) {
+        // Unfinished input is still being typed, so it gets no diagnostic yet.
+        Err(ProgramError::Incomplete(_)) => return None,
+        Err(ProgramError::Unsupported(first_form)) => {
+            // The parser reports only the first unsupported form. A function
+            // defined anywhere in the input is the error case, so ask the
+            // whole-input query for that flag.
+            let form = quirl_syntax::dialect_control_form(buffer).unwrap_or(first_form);
+            return Some(unsupported_form_diagnostic(&form));
+        }
+        Err(ProgramError::Syntax(error)) => {
             return Some(SurfaceDiagnostic {
                 message: error.message,
                 severity: DiagnosticSeverity::Error,
                 range: Some(error.start..error.end.max(error.start.saturating_add(1))),
             });
         }
-    };
+        Ok(_) => {}
+    }
+    // Command-level checks below only cover simple pipelines; a valid native
+    // compound program is accepted without further diagnostics.
+    let parsed = parse_command_list(buffer).ok()?;
 
     let command_span = spans
         .iter()
@@ -1099,31 +1114,51 @@ mod tests {
     }
 
     #[test]
-    fn pasted_control_forms_get_a_hint_and_functions_an_error() {
+    fn native_control_flow_is_silent_while_unsupported_forms_get_hints_and_function_errors() {
         let catalog = Catalog::builtin();
         let path_commands = PathCommandCache::new(None);
-        for (input, severity, message) in [
-            (
-                "for f in a b; do echo $f; done",
-                DiagnosticSeverity::Hint,
-                "`for` runs through /bin/sh",
-            ),
+        // Native loops, conditionals, and function definitions need no diagnostic,
+        // and neither does input that is still being typed.
+        for input in [
+            "for f in a b; do echo $f; done",
+            "if true; then echo yes; fi",
+            "greet() { echo hi; }",
+            "for x in a; do echo",
+        ] {
+            let spans = highlight(input, Mode::Command);
+            assert!(
+                diagnostic_for(&catalog, &path_commands, input, Mode::Command, &spans).is_none(),
+                "{input}"
+            );
+        }
+        // A form outside the native subset runs through /bin/sh: a hint, or an
+        // error when a function is defined beside it, since it would not persist.
+        for (input, severity, prefix) in [
             (
                 "{ echo a; } > out",
                 DiagnosticSeverity::Hint,
-                "`{` runs through /bin/sh",
+                "`>` runs through /bin/sh: ",
             ),
             (
-                "greet() { echo hi; }",
+                "[[ -f x ]] && echo yes",
+                DiagnosticSeverity::Hint,
+                "`[[` runs through /bin/sh: ",
+            ),
+            (
+                "greet() { echo hi; }; [[ -f x ]]",
                 DiagnosticSeverity::Error,
-                "shell functions do not persist in Quirl",
+                "a function defined next to `[[` cannot persist: ",
             ),
         ] {
             let spans = highlight(input, Mode::Command);
             let diagnostic =
                 diagnostic_for(&catalog, &path_commands, input, Mode::Command, &spans).unwrap();
             assert_eq!(diagnostic.severity, severity, "{input}");
-            assert_eq!(diagnostic.message, message, "{input}");
+            assert!(
+                diagnostic.message.starts_with(prefix),
+                "{input}: {}",
+                diagnostic.message
+            );
         }
     }
 
