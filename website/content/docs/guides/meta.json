@@ -1,5 +1,5 @@
 {
   "title": "Using Quirl",
   "icon": "SquareTerminal",
-  "pages": ["index", "completion", "typed-data-runtime"]
+  "pages": ["index", "shell-language", "completion", "typed-data-runtime"]
 }

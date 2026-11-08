@@ -1,0 +1,186 @@
+---
+title: Shell language
+description: Loops, conditionals, functions, aliases, arithmetic, field splitting, init.qrl, and where the /bin/sh island begins in Normal mode.
+---
+
+Normal mode runs a bounded POSIX `sh` subset in Quirl's own process. Paste a
+loop from a tutorial, define a helper function, or alias a long command, and it
+keeps working for the rest of the session. This guide shows the native forms
+with examples you can copy, then marks the boundary where a line falls back to
+the [`/bin/sh` island](#the-bin-sh-island).
+
+The examples assume you are in Normal mode. Enter a multi-line construct
+directly; Enter continues it until it is complete.
+
+## Control flow
+
+`if`, `for`, `while`, `until`, `case`, and `{ ...; }` groups run natively.
+Loops over builtins start no processes, so they are fast, and variables they set
+stay in the session.
+
+```sh
+for name in api web; do
+  printf '%s\n' "$name"
+done
+```
+
+```sh
+i=0
+while [ $i -lt 3 ]; do i=$((i + 1)); done
+echo "i=$i"
+```
+
+```sh
+case "$1" in
+  start|up) echo starting ;;
+  stop)     echo stopping ;;
+  *)        echo "unknown: $1" ;;
+esac
+```
+
+`break N` and `continue N` leave or resume enclosing loops. `test`, `[`,
+`true`, `false`, and `:` run inside the shell.
+
+## Functions
+
+Define a function with `name() { ...; }` or `function name { ...; }`. It persists
+for the session, and each call gets its own positional parameters: `$1` through
+`$9`, `${N}`, `$#`, `$@`, and `$*`.
+
+```sh
+greet() { echo "hi $1 ($# argument)"; }
+greet Ada
+```
+
+Inside a function, `local` creates a variable that disappears on return, `return
+N` sets the status, and `shift` drops the first parameter.
+
+```sh
+shout() { local msg="$*"; echo "$msg!"; }
+shout quiet please
+```
+
+```sh
+drop_first() { shift; echo "$@"; }
+drop_first a b c
+```
+
+Remove a function with `unset -f greet`. A function can also be the first stage
+of a pipeline; its output is bounded by the same capture limit as any command:
+
+```sh
+list() { echo alpha; echo beta; }
+list | grep beta
+```
+
+Functions nest at most 100 calls deep.
+
+## Aliases
+
+`alias` and `unalias` manage session aliases, expanded at command position before
+the line is parsed, as POSIX specifies:
+
+```sh
+alias ll='ls -l'
+alias
+unalias ll
+```
+
+A value that ends in a blank also expands the word after it, so
+`alias sudo='sudo '` lets an alias be used in the next command position. An
+alias is never re-expanded inside its own expansion, and one line may expand at
+most 64 aliases.
+
+## Arithmetic
+
+`$((...))` follows POSIX, with variables and assignment:
+
+```sh
+count=0
+count=$((count + 1))
+echo $((count += 4))
+echo $(( (7 > 3) && (2 ** 3 == 8) ? 1 : 0 ))
+echo $((0x10 + 010))
+```
+
+This prints `5`, `1`, and `24`. Hex (`0x`) and octal (leading `0`) literals work,
+and `**` is exponentiation as in Bash.
+
+## Field splitting
+
+Unquoted parameter and command substitutions split into fields on `IFS`, which
+defaults to space, tab, and newline. This matches `sh` and Bash, and it differs
+from Zsh's default:
+
+```sh
+FLAGS="-l -a"
+ls $FLAGS          # two arguments: -l and -a
+ls "$FLAGS"        # one argument, as Zsh's default would pass it
+```
+
+Empty unquoted expansions disappear. Quote an expansion when you need exactly
+one field.
+
+## Startup with init.qrl
+
+Put aliases, functions, and variables you want in every interactive session in
+`init.qrl`. Quirl reads it from `QUIRL_CONFIG_DIR`, or from
+`$XDG_CONFIG_HOME/quirl`, or from `~/.config/quirl` by default:
+
+```sh
+# ~/.config/quirl/init.qrl
+alias ll='ls -l'
+export EDITOR=zed
+
+proj() { cd "$HOME/Projects/github.com/$1"; }
+```
+
+Each statement runs in order at interactive startup. A failing statement is
+reported with its file and line, and the rest still runs. The file must be a
+regular UTF-8 file under 256 KiB.
+
+## The `/bin/sh` island
+
+Forms outside the native subset run in an implicit `/bin/sh` island. The island
+keeps the exports and working directory it leaves, so `cd` and `export` still
+carry over. These forms use it automatically:
+
+- here-documents
+- `[[ ... ]]` and `(( ... ))`
+- `select`
+- subshells, `( ... )`
+- brace expansion, such as `{a,b}`
+- process substitution
+- compound commands used as a pipeline stage or with a redirection
+
+When a line needs the island, the native rules change in three ways:
+
+- Aliases and functions are not visible inside the island.
+- A line that defines a function and also needs the island is rejected, because
+  the function could not outlive the island. Define the function on its own line.
+- Bash- or Zsh-only syntax belongs in an explicit block, such as
+  `bash { ... }`, which runs in that dialect.
+
+`quirl -c`, scripts piped on standard input, `eval`, and `source` are unchanged.
+They always run exact POSIX `sh`, so tools that start Quirl as a login shell see
+the same behavior as before.
+
+## Limits
+
+These bounds are enforced where the work enters the executor, and exceeding one
+fails with a resource-limit error:
+
+| Limit | Value |
+| --- | --- |
+| Nesting depth of compound commands | 64 |
+| Nested function calls | 100 |
+| Functions per session | 1,024 |
+| Aliases per session | 1,024 |
+| Size of one function definition or alias value | 64 KiB |
+| Alias substitutions per line | 64 |
+
+Loops have no iteration limit. Every iteration checks for Ctrl-C, so a loop that
+never starts a process still stops.
+
+For the exact contract, see the [native control-flow decision](/docs/architecture/decisions/0043-run-posix-control-flow-functions-and-aliases-natively)
+and the [product and language design](/docs/architecture/product-and-language-design).

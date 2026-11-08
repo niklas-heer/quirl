@@ -49,9 +49,11 @@ lossy migration.
 
 The freeze manifest names limitations rather than hiding them. Native command
 grammar v3 records the quote-aware Linux/macOS C1-core executor and explicit C2
-dialect islands. Here-documents, process substitution, loops, functions,
-conditionals, and dialect control forms remain reference islands for 1.0,
-rather than an implied future native compatibility promise. Picker and
+dialect islands. Here-documents, process substitution, `[[`, `((`, `select`,
+subshells, and dialect control forms remain reference islands for 1.0, rather
+than an implied future native compatibility promise. Interactive POSIX control
+flow, functions, and aliases run natively under grammar and runner protocol
+version 4. Picker and
 completion use separately frozen asynchronous request/cancellation/response
 envelopes with bounded workers, deadlines, and stale-result suppression. The
 runner result remains

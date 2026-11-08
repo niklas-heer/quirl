@@ -148,8 +148,9 @@ The automated real-PTY harness is supporting evidence, not a human signoff.
 - [ ] The reviewed config descriptor is schema v5, its golden fingerprint
   matches the candidate, and v0/v1/v2/v3/v4-to-v5 migration tests pass.
 - [ ] The supported compatibility boundary is unchanged: C0/C1-core is native
-  on Linux/macOS; here-documents, process substitution, loops, functions,
-  conditionals, and dialect control forms are explicit Bash/Zsh islands.
+  on Linux/macOS, including interactive POSIX control flow, functions, and
+  aliases; here-documents, process substitution, `[[`, `((`, `select`, and
+  dialect control forms are explicit islands.
 - [ ] Deferred and best-effort work is visible in the README and release notes.
   In particular, do not present native Windows terminal behavior or Wasm
   execution as supported.
@@ -466,8 +467,8 @@ current Unix release gate:
 
 - native Windows terminal handoff, suspension semantics, and Windows hardware
   validation;
-- native implementation of here-documents, process substitution, loops,
-  functions, conditionals, or other Bash/Zsh dialect control forms;
+- native implementation of here-documents, process substitution, `[[`, `((`,
+  `select`, or other Bash/Zsh dialect control forms;
 - a Wasm execution engine, remote plugin registry, publisher identity, or
   signed transparency log;
 - exact emulation of Bash/Zsh option state or framework-sized startup files;

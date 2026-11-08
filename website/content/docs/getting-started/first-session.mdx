@@ -125,9 +125,11 @@ model.
 
 ## When familiar shell syntax needs Bash or Zsh
 
-Quirl's native grammar supports a focused set of quoting, redirects, byte
-pipelines, and command lists. For loops, functions, here-documents, and other
-shell-specific syntax, use an [explicit Bash or Zsh island](/docs/architecture/product-and-language-design).
+Quirl's native grammar supports quoting, redirects, byte pipelines, command
+lists, loops, conditionals, functions, and aliases; the [shell language guide](/docs/guides/shell-language)
+lists them. Here-documents, `[[`, subshells, and other forms outside that subset
+run in an implicit `/bin/sh` island. For Bash- or Zsh-only syntax, use an
+[explicit Bash or Zsh island](/docs/architecture/product-and-language-design).
 For example, in Normal mode:
 
 ```text

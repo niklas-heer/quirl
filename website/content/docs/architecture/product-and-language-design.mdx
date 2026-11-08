@@ -22,8 +22,11 @@ artifact is the immutable
 untagged source remains candidate or development work:
 
 - On Linux and macOS, the native C1-core includes byte pipelines, redirects,
-  boolean lists, shell variables, bounded expansion/substitution, and jobs.
-  Unsupported control syntax runs in an implicit `/bin/sh` island or an
+  boolean lists, shell variables, POSIX arithmetic, bounded expansion/substitution,
+  jobs, and, in interactive Normal mode, POSIX `sh` control flow, persistent
+  functions, and aliases, as the
+  [native control-flow decision](/docs/architecture/decisions/0043-run-posix-control-flow-functions-and-aliases-natively)
+  records. Syntax outside that subset runs in an implicit `/bin/sh` island or an
   explicit Bash/Zsh island, and `quirl -c`, piped scripts, `eval`, and
   `source` follow POSIX `sh`. Windows remains best-effort process
   portability rather than a supported interactive target.
@@ -336,7 +339,7 @@ Quirl targets the copy-and-paste surface first. Full Bash and Zsh are separate e
 | Level | Promise | Examples | Implementation |
 | --- | --- | --- | --- |
 | C0 · Commands | Required for preview | `git status`, quoting, redirects, byte pipes, jobs | Native process engine and POSIX-like lexer |
-| C1 · Common interactive | Required for 1.0 | `&&`, `||`, globs, bounded substitutions, here-strings, `export NAME=value` | Native compatibility AST on Linux/macOS; corpus against Bash and Zsh |
+| C1 · Common interactive | Required for 1.0 | `&&`, `||`, globs, bounded substitutions, here-strings, `export NAME=value`, `for`/`case`/`if`, functions, aliases | Native compatibility AST and session executor on Linux/macOS; differential tests against reference `sh` and Bash |
 | C2 · Dialect islands | Required for 1.0 | `bash { ... }`, `zsh { ... }`, shebangs | Reference-interpreter subprocess with structured capture |
 | C3 · Source state | Deliberately partial | Import cwd, exported env, aliases when representable | State-diff protocol; reject traps and opaque functions |
 | C4 · Exact emulation | No promise | Every option, trap, framework, obscure expansion | Run the requested `bash` or `zsh` |
@@ -348,10 +351,11 @@ backslash followed by a line feed continues a word without adding a character.
 Quoted line feeds stay literal. Outside quotes, CR is whitespace, so ordinary
 CRLF also separates commands; backslash-CRLF retains the escaped CR and still
 separates at LF. Explicit trailing semicolons and unfinished operators remain
-errors, and `&` must still end the complete list. Native `#` comments are not
-part of this lexer; use a Bash/Zsh island for comment-bearing shell snippets.
-The command grammar and native runner advertise protocol version 3 for these
-line semantics; this does not change the immutable `v0.1.0` release.
+errors, and `&` must still end the complete list. A `#` that begins a word
+starts a comment to the end of the line.
+The command grammar and native runner advertise protocol version 4 for these
+line semantics and the native control-flow subset; this does not change the
+immutable `v0.1.0` release.
 
 ```sh
 # Ordinary input: native, fast, familiar
@@ -371,13 +375,18 @@ bash ./legacy-deploy.sh   # explicit always wins
 
 - Valid C1 input executes natively.
 - Bash- or Zsh-only constructs produce a mismatch diagnostic and the exact dialect form; Quirl never silently reinterprets them.
-- Here-documents, process substitution, loops, functions, conditionals, and
+- Here-documents, process substitution, `[[`, `((`, `select`, subshells, and
   dialect control syntax are intentionally C2 islands for 1.0, not an unfinished
   native-syntax promise. See [ADR 0010](/docs/architecture/decisions/0010-unix-first-release-scope).
-  In interactive Normal mode, loops, conditionals, `{ ...; }` groups, and brace
-  expansion run as an implicit `/bin/sh` island that keeps exports and the
-  working directory; function definitions are rejected because they cannot
-  persist. See the [POSIX invocation decision](/docs/architecture/decisions/0041-posix-shell-invocation).
+  Interactive Normal mode runs `if`, `for`, `while`, `until`, `case`, `{ ...; }`
+  groups, persistent functions, and aliases natively, as the
+  [native control-flow decision](/docs/architecture/decisions/0043-run-posix-control-flow-functions-and-aliases-natively)
+  records; that decision amends ADR 0010's boundary. Compound commands used as
+  pipeline stages or with redirections, and brace expansion, still run in an
+  implicit `/bin/sh` island that keeps exports and the working directory. Aliases
+  and functions are not visible inside that island, and a line that defines a
+  function and also needs the island is rejected. See the
+  [POSIX invocation decision](/docs/architecture/decisions/0041-posix-shell-invocation).
 - `source`, `.`, and `eval` run POSIX setup code in `/bin/sh` and import its
   exported variables and working directory.
 - Behavior is versioned in a machine-readable matrix and backed by differential tests.
