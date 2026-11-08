@@ -41,6 +41,20 @@ esac
 `break N` and `continue N` leave or resume enclosing loops. `test`, `[`,
 `true`, `false`, and `:` run inside the shell.
 
+A loop or group can redirect its output. The target opens once and every
+command inside writes to it, so output still streams:
+
+```sh
+for f in *.md; do echo "$f"; done > docs.txt
+{ cargo build; cargo test; } > build.log 2>&1
+```
+
+`>&2` sends output to standard error, which is how scripts report problems:
+
+```sh
+die() { echo "error: $*" >&2; return 1; }
+```
+
 ## Functions
 
 Define a function with `name() { ...; }` or `function name { ...; }`. It persists
@@ -151,7 +165,8 @@ carry over. These forms use it automatically:
 - subshells, `( ... )`
 - brace expansion, such as `{a,b}`
 - process substitution
-- compound commands used as a pipeline stage or with a redirection
+- compound commands used as a pipeline stage or with an input redirection,
+  such as `while read line; do ...; done < file`
 
 When a line needs the island, the native rules change in three ways:
 

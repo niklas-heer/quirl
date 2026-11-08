@@ -32,6 +32,10 @@ which versions are published.
   statement is reported with its file and line, and the rest still runs.
 - A function or builtin can start a foreground pipeline, as in
   `myfunc | grep x`.
+- Loops and groups can redirect their output, as in `done > list.txt` or
+  `{ make; make test; } > build.log 2>&1`, and output still streams.
+- `>&2` sends a command's output to standard error, so `echo "error" >&2`
+  works for builtins, functions, and programs.
 - The editor highlights reserved words, **Enter** continues an unfinished
   construct, and **Ctrl-C** stops a loop even when it never starts a process.
 
@@ -41,8 +45,10 @@ which versions are published.
   `sh` and Bash. `ls $FLAGS` now passes each word separately, unlike Zsh; quote
   the expansion to keep one field. Empty unquoted expansions disappear.
 - The command grammar and native runner protocols are now version 4.
+- `$(...)` may produce up to 1 MiB of output instead of 16 KiB, so
+  `for f in $(git ls-files)` works in large repositories.
 - Here-documents, `[[`, `((`, `select`, subshells, brace expansion, process
-  substitution, and compound commands used as pipeline stages or with
+  substitution, and compound commands used as pipeline stages or with input
   redirections still run in the `/bin/sh` island. Aliases and functions are
   not visible inside an island, and a line that defines a function and also
   needs the island is rejected.

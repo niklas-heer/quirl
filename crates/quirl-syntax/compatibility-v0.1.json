@@ -100,7 +100,7 @@
     },
     {
       "id": "redirects_and_here_strings", "level": "C1", "implementation": "native",
-      "forms": ["command < input", "command > output", "command >> output", "command 2> errors", "command 2>&1", "command <<< value"],
+      "forms": ["command < input", "command > output", "command >> output", "command 2> errors", "command 2>&1", "echo message >&2", "command <<< value", "for f in *; do echo \"$f\"; done > list.txt", "{ make; make test; } > build.log 2>&1"],
       "limitations": "Unix native executor: here-documents remain multiline source constructs and descriptor duplication is limited to standard descriptors; Windows retains the C0 redirect graph."
     },
     {
@@ -126,7 +126,7 @@
     {
       "id": "conditionals_and_control", "level": "C1", "implementation": "native",
       "forms": ["if test -f x; then echo yes; elif true; then :; else echo no; fi", "for f in *.md; do echo \"$f\"; done", "while [ $i -lt 3 ]; do i=$((i + 1)); done", "until false; do break; done", "case $x in a|b) echo ab;; *) echo other;; esac", "{ echo a; echo b; }", "! grep -q x file"],
-      "limitations": "POSIX sh semantics in the session process. Compound commands used as pipeline stages or with redirections, subshells, [[, ((, select, and read loops run in the /bin/sh island at the interactive prompt."
+      "limitations": "POSIX sh semantics in the session process. Output redirections on a compound command open each target once and stream every inner command to it; targets must be files or devices. Compound commands used as pipeline stages or with input redirections, subshells, [[, ((, select, and read loops run in the /bin/sh island at the interactive prompt."
     },
     {
       "id": "functions", "level": "C1", "implementation": "native",

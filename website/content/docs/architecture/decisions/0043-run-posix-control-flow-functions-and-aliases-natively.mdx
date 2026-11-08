@@ -50,7 +50,7 @@ session, and functions persist.
 
 Bounds, enforced where work enters the executor and failing with
 `ResourceLimit`: compound nesting depth 64 at parse time; function call depth
-256; 1,024 functions and 1,024 aliases per session, each definition at most
+100; 1,024 functions and 1,024 aliases per session, each definition at most
 64 KiB; alias expansion of at most 64 substitutions per line and the existing
 source-byte limit after expansion. Loops have no iteration limit, but every
 iteration checks for an interrupt so Ctrl-C stops a loop that never spawns a
