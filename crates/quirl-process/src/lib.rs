@@ -8588,6 +8588,39 @@ mod platform {
         }
 
         #[test]
+        fn anchor_shell_must_be_a_root_owned_executable_others_cannot_write() {
+            assert!(is_trusted_system_executable(Path::new("/bin/sh")));
+            assert!(PROCESS_GROUP_SHELL_CANDIDATES.contains(&process_group_shell()));
+            let directory =
+                std::env::temp_dir().join(format!("quirl-anchor-trust-{}", std::process::id()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let user_owned = directory.join("sh");
+            std::fs::write(&user_owned, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(
+                &user_owned,
+                std::os::unix::fs::PermissionsExt::from_mode(0o755),
+            )
+            .unwrap();
+            assert!(!is_trusted_system_executable(&user_owned));
+            assert!(!is_trusted_system_executable(&directory.join("missing")));
+            assert!(!is_trusted_system_executable(Path::new("/bin")));
+            std::fs::remove_dir_all(&directory).unwrap();
+        }
+
+        #[test]
+        fn a_missing_first_executable_is_reported_after_the_parallel_anchor_start() {
+            let error = NativeExecutor::default()
+                .execute_capture("quirl-definitely-missing-command-xyz | cat")
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ProcessSpawn);
+            assert!(
+                error
+                    .message
+                    .contains("quirl-definitely-missing-command-xyz")
+            );
+        }
+
+        #[test]
         fn anchor_ignores_interrupt_and_reports_terminal_stop() {
             let mut anchor = ProcessGroupAnchor::spawn().unwrap();
             let process_group = Pid::from_raw(anchor.process_group());
