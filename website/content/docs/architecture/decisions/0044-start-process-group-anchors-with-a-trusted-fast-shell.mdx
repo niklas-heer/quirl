@@ -31,7 +31,7 @@ and changes three implementation details:
 Every native pipeline paid for two shell startups and up to two millisecond
 sleeps before and after the guest ran. On macOS `/bin/sh` is a shim that execs
 another shell, so each startup cost twice as much. Running 200 trivial external
-commands took 3.1 s against about 0.25 s in Bash, dash, and Zsh, which made
+commands took about 1.5 s against about 0.25 s in Bash, dash, and Zsh, which made
 scripts and loops that call programs feel sluggish.
 
 The original decision fixed absolute `/bin/sh` because the anchor must be a
@@ -58,9 +58,11 @@ Alternatives considered:
 
 ## Consequences
 
-- External commands start about six times faster on macOS: 200 trivial
-  commands take about 0.45 s instead of 3.1 s. Linux gains less, since its
-  `/bin/sh` is usually dash already.
+- External commands start about three times faster on macOS: with the
+  shipped release profile, 200 trivial commands in a loop take about 0.48 s
+  instead of 1.5 s, and a single command about 6.5 ms instead of 12.7 ms. See
+  the [shell workload benchmarks](/docs/research/benchmarks/shell-workloads). Linux
+  gains less, since its `/bin/sh` is usually dash already.
 - Fast commands no longer wait out a millisecond sleep; long-running commands
   settle at the previous poll interval and use no more wakeups.
 - The anchor's trust now rests on file ownership and permissions checked at

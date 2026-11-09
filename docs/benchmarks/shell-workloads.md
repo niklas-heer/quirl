@@ -60,3 +60,50 @@ Each external command still costs about 2.4 ms against 1.3 ms in the
 reference shells, because every pipeline starts two small trusted shells to
 own its process group. Removing the staging shell would need a separate
 decision about which process leads the group.
+
+## 2026-11-09: shipped release profile against 0.5.1
+
+The table above uses opt-level 3 without LTO. Released binaries use the
+workspace release profile, opt-level `z` with fat LTO and one codegen unit,
+which runs the native executor more slowly. This run rebuilt `main` at
+`ac09361` and the candidate at `81bff90` with that profile, and compares
+them with the published v0.5.1 macOS ARM64 archive (SHA-256
+`c10017d5…7d85`). Same Apple M4 and reference shells, with other work
+running on the machine (load average about 10 on 10 cores). To spread that
+load evenly, a variant of the script ran every shell once per round, in
+rotating order, for 15 rounds.
+
+Median milliseconds over 15 runs:
+
+| Workload | v0.5.1 | `ac09361` | candidate | dash | Bash |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| startup (`true`) | 14.0 | 5.0 | 4.0 | 1.9 | 2.2 |
+| arithmetic `while`, 10k iterations | 67.4 | 91.3 | 71.2 | 22.3 | 39.8 |
+| `for` with `echo`, 10k iterations | 50.8 | 14.6 | 9.1 | 18.5 | 26.0 |
+| function calls, 5k | fails | 46.2 | 38.7 | 14.4 | 24.9 |
+| `case`, 10k iterations | 61.8 | 77.6 | 62.6 | 18.8 | 38.4 |
+| 200 external commands | 303.6 | 1,485.0 | 477.3 | 269.0 | 279.1 |
+
+Single commands, median over 31 runs in the same rotation:
+
+| Workload | v0.5.1 | `ac09361` | candidate | dash | Bash |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `/usr/bin/true` | 12.5 | 12.7 | 6.5 | 2.7 | 3.1 |
+| `/bin/echo hi \| /usr/bin/tr a-z A-Z` | 12.7 | 13.0 | 6.6 | 4.0 | 4.2 |
+
+What this shows for users of the release:
+
+- A single external command or pipeline starts about twice as fast as in
+  0.5.1.
+- Loops over builtins run natively. `for` with `echo` is about five times
+  faster than 0.5.1 and faster than Bash. Arithmetic and `case` loops run
+  about as fast as they did through `/bin/sh` in 0.5.1, and slower than Bash
+  with this profile. Function calls fail in 0.5.1 because functions did not
+  persist.
+- 0.5.1 handed a whole loop to `/bin/sh`, so a loop that starts 200 external
+  programs took 0.30 s. Native loops start each program through Quirl's
+  process-group protocol: about 1.5 s before this candidate, 0.48 s with it.
+- Process start to `--version` exit, from `quirl-bench preview`, fell from a
+  P50 of 5.36 ms to 4.03 ms. Interactive prompt percentiles were too noisy
+  under this load to compare; the release workflow's gate measures them on
+  idle runners.
