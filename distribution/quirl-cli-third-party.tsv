@@ -36,7 +36,6 @@ colorchoice	1.0.5	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust
 compact_str	0.9.1	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/ParkMyCar/compact_str
 console	0.15.11	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/console-rs/console
 convert_case	0.10.0	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rutrum/convert-case
-core-foundation-sys	0.8.7	macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/servo/core-foundation-rs
 cpufeatures	0.2.17	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/RustCrypto/utils
 crc32fast	1.5.1	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/srijs/rust-crc32fast
 crossbeam-deque	0.8.7	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/crossbeam-rs/crossbeam
@@ -84,7 +83,6 @@ hashlink	0.12.1	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-l
 heck	0.5.0	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/withoutboats/heck
 http	1.5.0	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/hyperium/http
 httparse	1.10.1	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/seanmonstar/httparse
-iana-time-zone	0.1.65	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/strawlab/iana-time-zone
 ident_case	1.0.1	linux,macos	MIT/Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/TedDriggs/ident_case
 image	0.25.10	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/image-rs/image
 image-webp	0.2.4	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/image-rs/image-webp
