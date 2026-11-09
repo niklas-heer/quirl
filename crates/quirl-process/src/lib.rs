@@ -1726,7 +1726,41 @@ mod platform {
     const FOREGROUND_TERMINAL_LEASE_WAIT_MAX: Duration = Duration::from_secs(30);
     const PROCESS_GROUP_ANCHOR_STARTUP_WAIT_MAX: Duration = Duration::from_secs(2);
     const PROCESS_GROUP_ANCHOR_STATUS_EVENTS_PER_TURN_MAX: usize = 16;
-    const PROCESS_GROUP_ANCHOR_PATH: &str = "/bin/sh";
+    /// Trusted POSIX shells for the fixed staging and anchor scripts, in
+    /// order of preference.
+    ///
+    /// Each pipeline starts two of these shells, so their startup time is
+    /// part of every external command. On macOS `/bin/sh` is a shim that
+    /// execs another shell, doubling that cost, while `/bin/dash` starts
+    /// directly. Both run the same argument-free POSIX scripts.
+    const PROCESS_GROUP_SHELL_CANDIDATES: [&str; 2] = ["/bin/dash", "/bin/sh"];
+
+    /// The shell that runs the process-group staging and anchor scripts.
+    ///
+    /// A candidate qualifies only as a root-owned regular executable that
+    /// neither its group nor others can write, so a user-writable file can
+    /// never become the trusted anchor. `/bin/sh` is the fallback, as before.
+    /// The choice is made once per process.
+    fn process_group_shell() -> &'static str {
+        static SHELL: OnceLock<&'static str> = OnceLock::new();
+        SHELL.get_or_init(|| {
+            PROCESS_GROUP_SHELL_CANDIDATES
+                .iter()
+                .copied()
+                .find(|path| is_trusted_system_executable(Path::new(path)))
+                .unwrap_or("/bin/sh")
+        })
+    }
+
+    fn is_trusted_system_executable(path: &Path) -> bool {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // Follow the link deliberately: distributions install `/bin/dash` or
+        // `/bin/sh` as symlinks, and the trust check applies to the target.
+        std::fs::metadata(path).is_ok_and(|metadata| {
+            let mode = metadata.permissions().mode();
+            metadata.is_file() && metadata.uid() == 0 && mode & 0o022 == 0 && mode & 0o111 != 0
+        })
+    }
     const PROCESS_GROUP_ANCHOR_READY: u8 = b'R';
     // An owner can die without running Drop while its children occupy a
     // different process group. EOF on the private keepalive then makes the
@@ -1945,7 +1979,7 @@ mod platform {
     impl ProcessGroupAnchor {
         fn spawn() -> Result<Self, ShellError> {
             Self::spawn_with_group(
-                PROCESS_GROUP_ANCHOR_PATH,
+                process_group_shell(),
                 PROCESS_GROUP_ANCHOR_SCRIPT,
                 None,
                 None,
@@ -1957,12 +1991,13 @@ mod platform {
             Self::spawn_with_group(path, script, None, None)
         }
 
+        #[cfg(test)]
         fn join(
             process_group: i32,
             request: Option<RequestContext<'_>>,
         ) -> Result<Self, ShellError> {
             Self::spawn_with_group(
-                PROCESS_GROUP_ANCHOR_PATH,
+                process_group_shell(),
                 PROCESS_GROUP_ANCHOR_SCRIPT,
                 Some(process_group),
                 request,
@@ -1975,18 +2010,32 @@ mod platform {
             process_group: Option<i32>,
             request: Option<RequestContext<'_>>,
         ) -> Result<Self, ShellError> {
-            let (child, keepalive, readiness, process_group) =
-                spawn_anchor_process(path, script, process_group)?;
-            let mut anchor = Self {
-                child,
-                keepalive: Some(keepalive),
-                process_group,
-                termination_signaled: false,
-                stopped: false,
-                released: false,
-            };
+            let (mut anchor, readiness) = Self::start(path, script, process_group)?;
             anchor.await_readiness(readiness, request)?;
             Ok(anchor)
+        }
+
+        /// Start an anchor without waiting for its readiness byte, so the
+        /// caller can overlap its shell startup with other work. The anchor
+        /// must still pass [`Self::await_readiness`] before any guest runs.
+        fn start(
+            path: &str,
+            script: &str,
+            process_group: Option<i32>,
+        ) -> Result<(Self, ChildStdout), ShellError> {
+            let (child, keepalive, readiness, process_group) =
+                spawn_anchor_process(path, script, process_group)?;
+            Ok((
+                Self {
+                    child,
+                    keepalive: Some(keepalive),
+                    process_group,
+                    termination_signaled: false,
+                    stopped: false,
+                    released: false,
+                },
+                readiness,
+            ))
         }
 
         fn await_readiness(
@@ -3032,8 +3081,10 @@ mod platform {
             }
             let mut expanded = pipeline.clone();
             let mut budget = ExpansionBudget::new();
-            for command in &mut expanded.commands {
-                let forms = command.word_ir.clone();
+            // Read word forms from the borrowed input; only the expanded copy
+            // is written, so the forms need no second clone.
+            for (command, original) in expanded.commands.iter_mut().zip(&pipeline.commands) {
+                let forms = &original.word_ir;
                 if forms.is_empty() {
                     for word in &command.words {
                         budget.claim(word)?;
@@ -3838,7 +3889,7 @@ mod platform {
                     })?;
                 let staged_group_leader = spawned.process_group.is_none();
                 let mut process = if staged_group_leader {
-                    let mut process = Command::new(PROCESS_GROUP_ANCHOR_PATH);
+                    let mut process = Command::new(process_group_shell());
                     process
                         .arg("-c")
                         .arg(PROCESS_GROUP_LEADER_STAGE_SCRIPT)
@@ -5382,9 +5433,46 @@ mod platform {
                 .with_context(error.to_string())
                 .with_help("Report this platform-specific process error")
             })?;
-            wait_for_staged_group_leader(&mut child, process_group, executable, source, request)?;
+            // Start the anchor in the leader's group right away, overlapping
+            // both shells' startup. The leader stays unreaped until the anchor
+            // exists, even if it already exited, so its group identity cannot
+            // be reused, and no guest instruction runs before the SIGCONT
+            // below, which follows the leader's stop, the group check, and the
+            // anchor's readiness.
+            let started = ProcessGroupAnchor::start(
+                process_group_shell(),
+                PROCESS_GROUP_ANCHOR_SCRIPT,
+                Some(process_group),
+            );
+            let (mut anchor, readiness) = match started {
+                Ok(started) => started,
+                Err(error) => {
+                    // A leader that exits first, for example because the
+                    // executable is missing, leaves no group to join. Report
+                    // its outcome in preference to the anchor's.
+                    let staged = wait_for_staged_group_leader(
+                        &mut child,
+                        process_group,
+                        executable,
+                        source,
+                        request,
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(staged.err().unwrap_or_else(|| error.with_command(source)));
+                }
+            };
+            if let Err(error) =
+                wait_for_staged_group_leader(&mut child, process_group, executable, source, request)
+            {
+                let _ = anchor.terminate();
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
             let observed_group = getpgid(Some(Pid::from_raw(process_group)));
             if observed_group != Ok(Pid::from_raw(process_group)) {
+                let _ = anchor.terminate();
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(ShellError::new(
@@ -5398,14 +5486,11 @@ mod platform {
                 ))
                 .with_help("Retry the command; report repeated process-group staging failures"));
             }
-            let mut anchor = match ProcessGroupAnchor::join(process_group, request) {
-                Ok(anchor) => anchor,
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error.with_command(source));
-                }
-            };
+            if let Err(error) = anchor.await_readiness(readiness, request) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.with_command(source));
+            }
             if let Err(error) = anchor.signal(Signal::SIGCONT) {
                 let _ = anchor.terminate();
                 let _ = child.kill();
@@ -5506,6 +5591,7 @@ mod platform {
     ) -> Result<(), ShellError> {
         let started = Instant::now();
         let process_id = Pid::from_raw(process_group);
+        let mut backoff = PollBackoff::new(Duration::from_micros(200));
         loop {
             if let Some(request) = request
                 && let Err(error) = request.ensure_active()
@@ -5534,7 +5620,9 @@ mod platform {
                         ))
                         .with_help("Retry after reducing system process pressure"));
                     }
-                    thread::sleep(Duration::from_millis(1));
+                    // The stop normally arrives within a shell startup; short
+                    // intervals keep that latency off every command.
+                    backoff.sleep();
                 }
                 Ok(WaitStatus::Exited(_, 127)) => {
                     return Err(ShellError::new(
@@ -6105,6 +6193,7 @@ mod platform {
         // its now-stopped child resumes. Waiting for that parent would deadlock
         // the shell and prevent the user's bg/fg/cancel operation from doing so.
         let mut stop_propagated = false;
+        let mut backoff = PollBackoff::new(Duration::from_millis(1));
         loop {
             drain_output_events(observer, output, 64)?;
             if let Some(observer) = observer {
@@ -6143,7 +6232,32 @@ mod platform {
             if let Some(request) = request {
                 request.ensure_active()?;
             }
-            thread::sleep(Duration::from_millis(1));
+            backoff.sleep();
+        }
+    }
+
+    /// Sleep between polls of child state, starting short and doubling to a
+    /// cap. Most commands finish within a few milliseconds, so the first
+    /// polls notice that quickly; a long-running command settles at the cap
+    /// and costs no more wakeups than a fixed interval would.
+    struct PollBackoff {
+        next: Duration,
+        cap: Duration,
+    }
+
+    impl PollBackoff {
+        const FIRST: Duration = Duration::from_micros(25);
+
+        fn new(cap: Duration) -> Self {
+            Self {
+                next: Self::FIRST.min(cap),
+                cap,
+            }
+        }
+
+        fn sleep(&mut self) {
+            thread::sleep(self.next);
+            self.next = self.next.saturating_mul(2).min(self.cap);
         }
     }
 
@@ -6569,7 +6683,7 @@ mod platform {
         fn spawn_test_pipeline_stage(guard: &mut PipelineConstructionGuard, script: &str) -> Pid {
             let first_stage = guard.process_group.is_none();
             let mut command = if first_stage {
-                let mut command = Command::new(PROCESS_GROUP_ANCHOR_PATH);
+                let mut command = Command::new(process_group_shell());
                 command.args([
                     "-c",
                     PROCESS_GROUP_LEADER_STAGE_SCRIPT,
@@ -8471,6 +8585,39 @@ mod platform {
                     .unwrap_err();
             assert_eq!(cancelled.code, ErrorCode::ResourceLimit);
             assert!(cancelled.message.contains("cancelled"));
+        }
+
+        #[test]
+        fn anchor_shell_must_be_a_root_owned_executable_others_cannot_write() {
+            assert!(is_trusted_system_executable(Path::new("/bin/sh")));
+            assert!(PROCESS_GROUP_SHELL_CANDIDATES.contains(&process_group_shell()));
+            let directory =
+                std::env::temp_dir().join(format!("quirl-anchor-trust-{}", std::process::id()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let user_owned = directory.join("sh");
+            std::fs::write(&user_owned, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(
+                &user_owned,
+                std::os::unix::fs::PermissionsExt::from_mode(0o755),
+            )
+            .unwrap();
+            assert!(!is_trusted_system_executable(&user_owned));
+            assert!(!is_trusted_system_executable(&directory.join("missing")));
+            assert!(!is_trusted_system_executable(Path::new("/bin")));
+            std::fs::remove_dir_all(&directory).unwrap();
+        }
+
+        #[test]
+        fn a_missing_first_executable_is_reported_after_the_parallel_anchor_start() {
+            let error = NativeExecutor::default()
+                .execute_capture("quirl-definitely-missing-command-xyz | cat")
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ProcessSpawn);
+            assert!(
+                error
+                    .message
+                    .contains("quirl-definitely-missing-command-xyz")
+            );
         }
 
         #[test]

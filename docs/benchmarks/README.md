@@ -8,6 +8,7 @@ Release measurements apply to one exact executable, source revision, harness, an
 - [Quirl 0.3.0 native release evidence](release-v0.3.0.md): all four published native executables, unchanged reports, preserved failed candidates, and exact release identities.
 - [Quirl 0.2.0 native release evidence](release-v0.2.0.md): historical measurements of the published 0.2.0 executables.
 - [Earlier release performance research](release-v1.0.md): historical candidate measurements; see the recorded artifact scope.
+- [Shell workload benchmarks](shell-workloads.md): loops, arithmetic, function calls, `case`, and external-command startup against dash, Bash, and Zsh.
 - [Preview benchmarks](preview-v0.1.md) and [project discovery](project-discovery.md): scoped engineering experiments.
 - [Embedded-language selection](embedded-language-selection.md) and [Steel/Lua/Fennel comparison](steel-lua-fennel.md): runtime research, separate from product release gates.
 

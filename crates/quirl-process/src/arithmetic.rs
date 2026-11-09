@@ -195,10 +195,12 @@ const OPERATORS: &[&str] = &[
 /// Return the longest operator token that starts at `index`, if any. The caller
 /// must already have skipped whitespace.
 fn operator_at(input: &[u8], index: usize) -> Option<&'static str> {
+    let rest = input.get(index..)?;
+    let first = rest.first()?;
+    // Every precedence level peeks here, so compare the first byte before
+    // the whole token; most candidates are rejected without a memcmp.
     OPERATORS.iter().copied().find(|operator| {
-        input
-            .get(index..)
-            .is_some_and(|rest| rest.starts_with(operator.as_bytes()))
+        operator.as_bytes().first() == Some(first) && rest.starts_with(operator.as_bytes())
     })
 }
 

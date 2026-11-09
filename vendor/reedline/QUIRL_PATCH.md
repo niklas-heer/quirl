@@ -14,6 +14,10 @@ Quirl owns these terminal/editor changes:
 - Apply parsed events in sequence so later mode changes cannot corrupt earlier
   insertions from the same batch.
 - Return typed input-limit errors through the edit-mode and engine boundaries.
+- Build chrono with `now` instead of `clock`. The local time-zone lookup behind
+  `clock` links CoreFoundation on macOS, which adds about 0.7 ms to every
+  process launch, and only `DefaultPrompt`'s time segment used it; that
+  segment now shows UTC, labelled as such. Quirl renders its own prompt.
 
 See [ADR 0033](../../docs/decisions/0033-bounded-simple-editor.md) for the failure
 model, limits, cleanup contract, and upstream removal criteria. No new runtime

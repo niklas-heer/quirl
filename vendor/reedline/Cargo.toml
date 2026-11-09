@@ -156,7 +156,7 @@ default-features = false
 [dependencies.chrono]
 version = "0.4.19"
 features = [
-    "clock",
+    "now",
     "serde",
 ]
 default-features = false
