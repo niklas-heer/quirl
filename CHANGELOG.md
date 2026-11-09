@@ -12,6 +12,39 @@ which versions are published.
 
 ## [Unreleased]
 
+Quirl now runs the shell code you already carry around. Loops,
+conditionals, `case`, functions, and aliases run in Quirl's own executor
+instead of being handed to `/bin/sh`, so a pasted loop keeps the variables it
+sets, functions and aliases last for the whole session, and
+`~/.config/quirl/init.qrl` can define them at startup in plain shell syntax.
+
+### Highlights
+
+- **Functions and aliases work.** In 0.5.1, defining a function was an error.
+  Now `greet() { printf 'hi %s\n' "$1"; }` and `alias ll='ls -l'` behave as in
+  `sh`, with `local`, `return`, `shift`, and `$@`.
+- **Loops over builtins run in the shell itself.** `echo`, `test`, `[`, and
+  arithmetic no longer start a process. A 10,000-iteration `for` loop that
+  echoes each number takes 9 ms, against 51 ms in 0.5.1 and 26 ms in Bash.
+- **Programs start about twice as fast.** Running `/usr/bin/true` drops from
+  12.5 ms to 6.5 ms, and a two-stage pipe from 12.7 ms to 6.6 ms.
+- **Errors from `$(...)` are no longer swallowed**, and `$(...)` can return up
+  to 1 MiB, so `for f in $(git ls-files)` works in large repositories.
+
+These timings come from the repository's
+[shell workload benchmark](https://github.com/niklas-heer/quirl/blob/main/docs/benchmarks/shell-workloads.md):
+one program per run through `quirl exec`, median of 15 to 31 runs, startup
+included, on an Apple M4, comparing the published 0.5.1 binary with a
+release-profile build of this version. Bash is the system Bash 3.2.
+
+**Check before upgrading:** unquoted expansions now split on `IFS`, as in
+`sh` and Bash, so `ls $FLAGS` passes each word separately. Quote the expansion
+to keep it whole. A loop that starts many external programs is slower than it
+was in 0.5.1, which handed the whole loop to `/bin/sh`: 200 trivial commands
+take about 0.48 s, against 0.30 s. Here-documents, `[[`, subshells, and other
+forms listed below still run in `/bin/sh` and cannot see your functions or
+aliases.
+
 ### Added
 
 - Loops, conditionals, and `case` run natively in Normal mode: `if`, `for`,
@@ -21,7 +54,7 @@ which versions are published.
 - Shell functions, `name() { ...; }` and `function name { ...; }`, persist for
   the session. They take `$1` through `$9`, `${N}`, `$#`, `$@`, `$*`, and
   support `local`, `return`, `shift`, and `unset -f`.
-- `alias`, and `unalias` expand at command position as POSIX specifies. A
+- `alias` and `unalias` expand at command position as POSIX specifies. A
   value ending in a blank also expands the next word.
 - `echo`, `test`, `[`, `true`, `false`, `:`, `break`, `continue`, and `type`
   run inside the shell without starting a process.
