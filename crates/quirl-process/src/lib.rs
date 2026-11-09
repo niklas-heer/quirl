@@ -7850,6 +7850,39 @@ mod platform {
         }
 
         #[test]
+        fn inherited_echo_is_not_held_to_the_one_byte_retention_limit() {
+            // Inherited requests retain nothing, so hosts pass a one-byte
+            // retention limit. The fallback editor runs every line this way,
+            // and native echo must still write its whole output.
+            let path =
+                std::env::temp_dir().join(format!("quirl-inherited-echo-{}", std::process::id()));
+            let outcome = NativeExecutor::default()
+                .execute_interactive_request(ProcessRequest {
+                    command: format!("echo hello world > '{}'", path.display()),
+                    deadline: Duration::from_secs(5),
+                    cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    max_output_bytes: 1,
+                })
+                .unwrap();
+            assert_eq!(outcome.status, 0);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world\n");
+            std::fs::remove_file(&path).unwrap();
+        }
+
+        #[test]
+        fn captured_echo_still_trips_the_request_retention_limit() {
+            let error = NativeExecutor::default()
+                .execute_capture_request(ProcessRequest {
+                    command: "echo hello".to_owned(),
+                    deadline: Duration::from_secs(5),
+                    cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    max_output_bytes: 1,
+                })
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+        }
+
+        #[test]
         fn exited_leader_cannot_leave_a_descendant_holding_capture_open() {
             let started = Instant::now();
             let outcome = NativeExecutor::default()
