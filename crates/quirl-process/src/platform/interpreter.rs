@@ -676,10 +676,16 @@ impl NativeExecutor {
             "true" | ":" => status_only(0),
             "false" => status_only(1),
             "echo" => {
-                let bytes = crate::echo_builtin::render_echo(
-                    &command.words,
-                    retained_output_limit(request.map(|request| request.request)),
-                )?;
+                // Only captured output is retained against the request's
+                // limit. Inherited requests carry a one-byte retention limit
+                // because their output goes straight to the terminal or a
+                // redirect, so uncaptured echo keeps the default bound.
+                let output_bytes_max = if capture {
+                    retained_output_limit(request.map(|request| request.request))
+                } else {
+                    retained_output_limit(None)
+                };
+                let bytes = crate::echo_builtin::render_echo(&command.words, output_bytes_max)?;
                 match String::from_utf8(bytes) {
                     Ok(text) => outcome(0, Some(text), Some(String::new())),
                     Err(error) => {
