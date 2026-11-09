@@ -7,7 +7,7 @@ are not release evidence and say nothing about other hardware.
 
 ## Method
 
-[`scripts/bench-shell-workloads.py`](../../scripts/bench-shell-workloads.py)
+[`scripts/bench-shell-workloads.py`](https://github.com/niklas-heer/quirl/blob/main/scripts/bench-shell-workloads.py)
 runs each workload as one program, through `quirl exec` for Quirl and `-c` for
 the reference shells, and reports the median wall time over fresh processes,
 including startup. Interactive latency comes from `quirl-bench preview`, which

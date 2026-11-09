@@ -146,7 +146,7 @@ fn get_now() -> String {
     // Quirl patch: UTC avoids chrono's `clock` feature, whose time-zone
     // lookup links CoreFoundation and slows every macOS process launch.
     let now = Utc::now();
-    format!("{:>}", now.format("%m/%d/%Y %I:%M:%S %p"))
+    format!("{:>}", now.format("%m/%d/%Y %I:%M:%S %p UTC"))
 }
 
 #[cfg(test)]

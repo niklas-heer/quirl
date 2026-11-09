@@ -18,6 +18,11 @@ import time
 
 QUIRL = sys.argv[1]
 RUNS = int(sys.argv[2]) if len(sys.argv) > 2 else 7
+RUNS_MAX = 1000
+# A hung workload must not stall the whole comparison.
+RUN_TIMEOUT_SECONDS = 60
+if not 1 <= RUNS <= RUNS_MAX:
+    sys.exit(f"RUNS must be between 1 and {RUNS_MAX}, got {RUNS}")
 
 WORKLOADS = {
     "startup": "true",
@@ -42,7 +47,12 @@ def measure(argv):
     output = None
     for _ in range(RUNS):
         start = time.perf_counter()
-        result = subprocess.run(argv, capture_output=True, text=True, env=os.environ)
+        try:
+            result = subprocess.run(
+                argv, capture_output=True, text=True, env=os.environ, timeout=RUN_TIMEOUT_SECONDS
+            )
+        except subprocess.TimeoutExpired:
+            return None, f"timed out after {RUN_TIMEOUT_SECONDS} s"
         samples.append((time.perf_counter() - start) * 1000)
         if result.returncode != 0:
             return None, result.stderr.strip()[:200]
