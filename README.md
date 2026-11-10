@@ -23,7 +23,7 @@
 
 <div align="center">
   <a href="https://quirl.vercel.app/">
-    <img src="assets/quirl-demo.gif?raw=1" width="1200" alt="Quirl v0.5.1 demo: familiar commands with project-aware completion, pasted Bash loops and setup scripts, typed data tables with sort-by, group-by, and math, and sandboxed Lua">
+    <img src="assets/quirl-demo.gif?raw=1" width="1200" alt="Quirl v0.6.1 demo: familiar commands with project-aware completion, pasted Bash loops and setup scripts, typed data tables with sort-by, group-by, and math, and sandboxed Lua">
   </a>
   <br>
   <a href="https://quirl.vercel.app/quirl-demo.mp4">Watch the MP4</a>
