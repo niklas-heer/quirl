@@ -170,7 +170,7 @@ rusqlite	0.40.2	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-
 rustc-hash	2.1.3	linux,macos	Apache-2.0 OR MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rust-lang/rustc-hash
 rustc_version	0.4.1	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/djc/rustc-version-rs
 rustix	1.1.4	linux,macos	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/bytecodealliance/rustix
-rustls	0.23.43	linux,macos	Apache-2.0 OR ISC OR MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rustls/rustls
+rustls	0.23.46	linux,macos	Apache-2.0 OR ISC OR MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rustls/rustls
 rustls-pki-types	1.15.1	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rustls/pki-types
 rustls-webpki	0.103.14	linux,macos	ISC	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rustls/webpki
 rustversion	1.0.23	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/dtolnay/rustversion
