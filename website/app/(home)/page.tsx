@@ -26,7 +26,7 @@ export default function HomePage() {
       <section className="hero">
         <div className="pill">
           <span className="dot" />
-          v0.5.1 · Linux and macOS
+          v0.6.0 · Linux and macOS
         </div>
         <p className="kicker">A well-stirred shell</p>
         <h1 className="glitch-h1">
@@ -103,9 +103,10 @@ export default function HomePage() {
             <div className="cassette-body">
               <h3>Your habits, intact</h3>
               <p>
-                Pipes, redirects, jobs, and variables run natively. Pasted
-                loops, <code>source</code>, and <code>eval</code> run through{' '}
-                <code>/bin/sh</code> and keep their variables.
+                Pipes, redirects, jobs, variables, pasted loops, functions,
+                and aliases run natively. <code>source</code> and{' '}
+                <code>eval</code> run through <code>/bin/sh</code> and keep
+                their variables.
               </p>
             </div>
           </article>
@@ -158,8 +159,8 @@ export default function HomePage() {
         <div className="section-heading">
           <h2 id="gallery-title">Real sessions, real output.</h2>
           <p>
-            Every image comes from the published release binary running an
-            isolated demo workspace.
+            Every image comes from the published v0.5.1 release binary running
+            an isolated demo workspace.
           </p>
         </div>
         <div className="gallery-grid">
@@ -323,14 +324,14 @@ export default function HomePage() {
             <CassetteReels />
           </div>
           <div className="cassette-body">
-            <h2>The 0.5 release is here.</h2>
+            <h2>The 0.6 release is here.</h2>
             <p>
-              Quirl 0.5 is safe as your login shell: <code>ssh</code>,{' '}
-              <code>scp</code>, <code>rsync</code>, and editors get exact POSIX
-              behavior, and pasted loops, <code>source</code>, and{' '}
-              <code>eval</code> just work. Data mode gains Nushell&apos;s verbs
-              and tables that fit, and Tab asks <code>docker</code>,{' '}
-              <code>kubectl</code>, and <code>gh</code> for completions.
+              Quirl 0.6 runs the shell code you already carry around. Loops,
+              conditionals, functions, and aliases run in the shell itself, so
+              they keep their variables, last for the session, and can live in{' '}
+              <code>init.qrl</code>. Builtins such as <code>echo</code> and{' '}
+              <code>test</code> no longer start a process, and programs start
+              about twice as fast as in 0.5.
             </p>
             <Link href="/docs" className="text-link">
               Explore everything →
