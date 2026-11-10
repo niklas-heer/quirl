@@ -1,5 +1,3 @@
-#[cfg(feature = "gluon")]
-use gluon::ThreadExt;
 #[cfg(any(feature = "lua", feature = "luau", feature = "fennel"))]
 use mlua::Lua;
 #[cfg(feature = "fennel")]
@@ -56,25 +54,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(feature = "gluon")]
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let vm = gluon::new_vm();
-    let source = std::env::args()
-        .nth(1)
-        .map(std::fs::read_to_string)
-        .transpose()?
-        .unwrap_or_else(|| "20 + 22".to_owned());
-    let (value, _) = vm.run_expr::<i64>("footprint", &source)?;
-    println!("gluon:{value}");
-    Ok(())
-}
-
 #[cfg(not(any(
     feature = "lua",
     feature = "luau",
     feature = "fennel",
     feature = "rhai",
-    feature = "quickjs",
-    feature = "gluon"
+    feature = "quickjs"
 )))]
 compile_error!("enable exactly one runtime feature");

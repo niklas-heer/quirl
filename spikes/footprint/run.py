@@ -12,7 +12,7 @@ import re
 import subprocess
 import time
 
-RUNTIMES = ("lua", "luau", "rhai", "quickjs", "gluon")
+RUNTIMES = ("lua", "luau", "rhai", "quickjs")
 MAX_RSS = re.compile(r"^\s*(\d+)\s+maximum resident set size$", re.MULTILINE)
 
 

@@ -157,7 +157,7 @@ The durable record is [ADR 0001: Lua is Quirl’s extension language](decisions/
 
 ## 10. Method and sources
 
-Footprint probes live in `spikes/footprint`. PocketPy’s official 2.1.8 amalgamated sources are checksum-verified by its runner. The Luau analyzer was built from official tag 0.734, stripped, and measured separately. TypeScript 7.0.2 was installed from its official npm package; the native arm64 checker and complete installed package were measured separately from the QuickJS-NG runtime.
+Footprint probes live in `spikes/footprint`. Its Gluon probe was removed on 2026-11-10 after the measurements above were recorded: Gluon 0.18.4, the latest release, requires the `crossbeam-utils` 0.7 series, which has no patched release for a high-severity security advisory, and Gluon is not a candidate. Commit `aef891e` contains the probe for anyone repeating the measurement. PocketPy’s official 2.1.8 amalgamated sources are checksum-verified by its runner. The Luau analyzer was built from official tag 0.734, stripped, and measured separately. TypeScript 7.0.2 was installed from its official npm package; the native arm64 checker and complete installed package were measured separately from the QuickJS-NG runtime.
 
 - [Luau overview](https://luau.org/) and [Lua compatibility](https://luau.org/compatibility/)
 - [Luau releases](https://github.com/luau-lang/luau/releases) and [`mlua`](https://github.com/mlua-rs/mlua)
