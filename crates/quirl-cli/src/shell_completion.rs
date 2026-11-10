@@ -326,7 +326,18 @@ fn segment_words(before: &str) -> Option<(Vec<Word>, Option<Word>)> {
         if escaped {
             escaped = false;
             if let Some(word) = current.as_mut() {
-                word.decoded.push(character);
+                // Inside double quotes a backslash escapes only `$`, a
+                // backtick, `"`, `\`, and a line feed, which it removes.
+                let in_double_quotes = quote == Quote::Double;
+                let literal_backslash =
+                    in_double_quotes && !matches!(character, '$' | '`' | '"' | '\\' | '\n');
+                let line_continuation = in_double_quotes && character == '\n';
+                if literal_backslash {
+                    word.decoded.push('\\');
+                }
+                if !line_continuation {
+                    word.decoded.push(character);
+                }
             }
             continue;
         }
@@ -623,6 +634,16 @@ mod tests {
         let query = ArgumentQuery::parse(r"cat my\ fi", 10).unwrap();
         assert_eq!(query.arguments, ["my fi"]);
         assert_eq!(query.replace_start, 4);
+    }
+
+    #[test]
+    fn double_quoted_arguments_decode_backslashes_like_the_shell() {
+        let line = "git log \"a\\nb\" \"c\\\"d\" \"e\\$f\" \"g\\\\h\" \"i\\\nj\" fe";
+        let query = ArgumentQuery::parse(line, line.len()).unwrap();
+        assert_eq!(
+            query.arguments,
+            ["log", r"a\nb", r#"c"d"#, "e$f", r"g\h", "ij", "fe"]
+        );
     }
 
     #[test]

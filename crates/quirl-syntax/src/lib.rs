@@ -1361,6 +1361,24 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
             );
             continue;
         }
+        // Inside double quotes POSIX gives a backslash meaning only before
+        // `$`, a backtick, `"`, `\`, or a line feed. Before anything else it
+        // is literal text, and the next character is lexed normally.
+        if character == '\\'
+            && quote == Some('"')
+            && !characters
+                .peek()
+                .is_some_and(|&(_, next)| matches!(next, '$' | '`' | '"' | '\\' | '\n'))
+        {
+            append_fragment(
+                &mut parts,
+                &mut fragment,
+                &mut fragment_quoting,
+                character,
+                Quoting::Double,
+            );
+            continue;
+        }
         if character == '\\' && quote != Some('\'') {
             let Some((_, escaped)) = characters.next() else {
                 return Err(CommandSyntaxError {
@@ -2576,6 +2594,51 @@ mod tests {
             graph.pipelines[0].commands[0].word_ir[2].parts[0].quoting,
             Quoting::Double
         );
+    }
+
+    #[test]
+    fn double_quoted_backslash_escapes_only_posix_special_characters() {
+        // POSIX keeps a backslash inside double quotes unless it precedes
+        // `$`, a backtick, `"`, `\`, or a line feed; printf then sees `\n`.
+        for (source, expected) in [
+            (r#"printf "a\n""#, r"a\n"),
+            (r#"printf "a\tb""#, r"a\tb"),
+            (r#"printf "a\qb""#, r"a\qb"),
+            (r#"printf "a\\b""#, r"a\b"),
+            (r#"printf "a\"b""#, r#"a"b"#),
+            (r#"printf "a\$b""#, "a$b"),
+            (r#"printf "a\`b""#, "a`b"),
+            ("printf \"a\\\nb\"", "ab"),
+            (r#"printf "a\\\nb""#, r"a\\nb"),
+        ] {
+            let graph = parse_command_list(source).unwrap();
+            let word = &graph.pipelines[0].commands[0].word_ir[1];
+            assert_eq!(word.text(), expected, "{source}");
+        }
+
+        let graph = parse_command_list(r#"printf "\n$HOME""#).unwrap();
+        let parts = &graph.pipelines[0].commands[0].word_ir[1].parts;
+        assert!(
+            parts.iter().all(|part| part.quoting == Quoting::Double),
+            "a kept backslash stays double-quoted text: {parts:?}"
+        );
+        let graph = parse_command_list(r#"printf "\$HOME""#).unwrap();
+        let parts = &graph.pipelines[0].commands[0].word_ir[1].parts;
+        assert_eq!(parts[0].text, "$");
+        assert_eq!(parts[0].quoting, Quoting::Escaped);
+    }
+
+    #[test]
+    fn unquoted_and_single_quoted_backslashes_keep_their_rules() {
+        for (source, expected) in [
+            (r"printf a\nb", "anb"),
+            (r"printf 'a\nb'", r"a\nb"),
+            ("printf a\\\nb", "ab"),
+        ] {
+            let graph = parse_command_list(source).unwrap();
+            let word = &graph.pipelines[0].commands[0].word_ir[1];
+            assert_eq!(word.text(), expected, "{source}");
+        }
     }
 
     #[test]
