@@ -12,10 +12,8 @@ luau = ["dep:mlua", "mlua/luau", "mlua/vendored"]
 fennel = ["dep:mlua", "mlua/lua54", "mlua/vendored"]
 rhai = ["dep:rhai"]
 quickjs = ["dep:rquickjs"]
-gluon = ["dep:gluon"]
 
 [dependencies]
-gluon = { version = "0.18.4", optional = true }
 mlua = { version = "0.12.0", default-features = false, optional = true }
 rhai = { version = "1.25.1", optional = true }
 rquickjs = { version = "0.12.2", optional = true }
