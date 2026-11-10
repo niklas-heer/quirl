@@ -1,0 +1,67 @@
+# Quirl 0.6.0 native release evidence
+
+Recorded 2026-11-10 for the published [v0.6.0 release](https://github.com/niklas-heer/quirl/releases/tag/v0.6.0). All four native artifacts passed the enforcing release benchmark on their first attempt, with 101 successful PTY samples each. These results measure the exact published executables on the hosted runners below; they do not establish universal latency guarantees.
+
+## Release identity
+
+- Candidate and resolved tag commit: `0ae837f3f047aab78c1622a0bf08ac365b93fe8f`.
+- Native build and performance run: [42725373162](https://github.com/niklas-heer/quirl/actions/runs/42725373162).
+- GitHub release ID: `439802648`; published at `2026-11-10T00:26:20Z` as a nondraft, non-prerelease, immutable release.
+- [Release manifest](https://github.com/niklas-heer/quirl/releases/download/v0.6.0/release-manifest-v1.json) SHA-256: `570cc5df05b6393dfb887bf1975ebd53e133355511073e62d5db284ec840f573`. Release notes SHA-256: `64d64582e058315cbd8598d505510d08b423381a8fee4c7d56bee2b4c8ff1c93`.
+- Every entry in the bundle's `SHA256SUMS` verified before publication was approved. All 15 published assets were downloaded afterwards and matched the reviewed bundle byte for byte, and the four formula hashes in [tap PR 44](https://github.com/niklas-heer/homebrew-tap/pull/44) matched the archives.
+
+Each report records the candidate as its clean source revision, with artifact digest, profile, source, and harness identity checks passing.
+
+## Native results
+
+All values below are milliseconds except executable bytes. Limits were startup P50 ≤25 ms, first-prompt paint P95 ≤21 ms, and keystroke-to-frame P95 ≤8 ms. Each row completed 101 of 101 requested PTY samples with no recorded sample failure.
+
+| Target | Executable bytes | Startup P50 | First-prompt P95 | Keystroke P95 | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Linux ARM64 | 12,820,968 | 6.220173 | 4.479435 | 0.544313 | Pass |
+| Linux x86_64 | 14,967,224 | 5.841960 | 4.538058 | 0.453123 | Pass |
+| macOS ARM64 | 10,894,704 | 14.615958 | 19.771375 | 1.239125 | Pass |
+| macOS x86_64 | 13,142,368 | 16.370574 | 18.653203 | 1.508983 | Pass |
+
+Size follows [ADR 0036](../decisions/2026-09-05_192326199_track-release-binary-size-without-a-project-hard-ceiling.md): there is no default executable-size ceiling, and every size above the advisory 8 MiB threshold retained its warning.
+
+The macOS ARM64 first-prompt P95 sits 1.2 ms under its budget, closer than in 0.5.1 (17.67 ms). The hosted runner also changed between the two releases, from macOS 15.7.9 to 15.8.2, so the reports alone do not attribute the difference to Quirl.
+
+## Runners and toolchain
+
+| Target | GitHub runner label | CPU reported by harness | Logical CPUs | Operating system |
+| --- | --- | --- | ---: | --- |
+| Linux ARM64 | `ubuntu-24.04-arm` | unknown | 4 | Ubuntu 24.04.5 LTS |
+| Linux x86_64 | `ubuntu-24.04` | AMD EPYC 9V74 80-Core Processor | 4 | Ubuntu 24.04.5 LTS |
+| macOS ARM64 | `macos-15` | Apple M1 (Virtual) | 3 | macOS 15.8.2 (24H232) |
+| macOS x86_64 | `macos-15-intel` | Intel(R) Core(TM) i7-8700B CPU @ 3.20GHz | 4 | macOS 15.7.9 (24G830) |
+
+All builds used Rust 1.99.0 (b940084d7 2026-09-28) and LLVM 23.1.1 with the official release profile: optimization `z`, fat LTO, one codegen unit, stripped symbols, and `panic = "unwind"`.
+
+## Exact report files
+
+These are byte-for-byte copies of the reports uploaded by the passing native jobs.
+
+| Target and exact report | JSON SHA-256 | Native job |
+| --- | --- | --- |
+| [aarch64-unknown-linux-gnu](https://quirl.vercel.app/release-evidence/v0.6.0/aarch64-unknown-linux-gnu.json) | `d760e31bca8b607e9fc9225840b282f871d993b4ab2dc373f6083a8716f115a3` | [129532919096](https://github.com/niklas-heer/quirl/actions/runs/42725373162/job/129532919096) |
+| [x86_64-unknown-linux-gnu](https://quirl.vercel.app/release-evidence/v0.6.0/x86_64-unknown-linux-gnu.json) | `c41ece367ad0a8e3b77bf1c9a460c856236f30a229294b92525da18438e07f9f` | [129532919072](https://github.com/niklas-heer/quirl/actions/runs/42725373162/job/129532919072) |
+| [aarch64-apple-darwin](https://quirl.vercel.app/release-evidence/v0.6.0/aarch64-apple-darwin.json) | `f4284829ab179f5b27e5b4d8dcc115a125c1097dbfdd939738cd16bf777398e1` | [129532919298](https://github.com/niklas-heer/quirl/actions/runs/42725373162/job/129532919298) |
+| [x86_64-apple-darwin](https://quirl.vercel.app/release-evidence/v0.6.0/x86_64-apple-darwin.json) | `0b2b3ed89841190b93f55cf09baf1a75f61778f62ae14df8b9d6a925939a4043` | [129532919498](https://github.com/niklas-heer/quirl/actions/runs/42725373162/job/129532919498) |
+
+## Published executable hashes
+
+Each digest below is the `bin/quirl` executable inside the published archive. It equals the digest the passing report measured.
+
+| Target | Executable SHA-256 |
+| --- | --- |
+| aarch64-unknown-linux-gnu | `a598a0eb85ccfa391b630bdcd999c38b18db1cc31a8f1121819526e499ae9d77` |
+| x86_64-unknown-linux-gnu | `9bc87824333fe25cd23a7121528b696b4523eddf1600463ab3a2e8bc53c85249` |
+| aarch64-apple-darwin | `63266bb271415a2205da79c7edbfedb12e0aadc48e0d3b0db173b16913b606cc` |
+| x86_64-apple-darwin | `4395c120b983e245cfa0c3ff3019cbb6c6b6530c92a7ce6f7f8bb3f868764279` |
+
+## Method and limitations
+
+The PTY harness uses a private, initially empty home, configuration, history, catalog, project database, and XDG directories shared across its samples. Each sample starts a fresh native process in a 120×40 terminal, answers cursor-position queries, reconstructs the screen, checks the prompt and exact binary identity, then proves editability. Percentiles use nearest-rank selection. Hosted scheduling, virtualization, CPU frequency, other machine load, and filesystem caches are not controlled beyond the documented indexing and settling steps. The reconstructed PTY frame does not measure physical terminal-emulator scheduling or display. This automated evidence does not cover every terminal, visual accessibility scenario, clipboard, IME, or sustained human session, and no human checklist item is inferred from it.
+
+The shell workload timings quoted in the 0.6.0 release notes come from the separate [shell workload benchmarks](shell-workloads.md), measured on an Apple M4 rather than these runners. The website recording and screenshots were not re-recorded for this release; they remain the [0.5.1 recording](release-v0.5.1.md) and say so.
