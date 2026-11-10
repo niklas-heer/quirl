@@ -12,6 +12,13 @@ which versions are published.
 
 ## [Unreleased]
 
+### Fixed
+
+- A backslash inside double quotes is kept unless it precedes `$`, a backtick,
+  `"`, `\`, or a line feed, as in Bash and Zsh. Quirl dropped it before any
+  character, so `printf "a\n"` printed `an` instead of `a` and a line feed.
+  Arguments passed to Cobra completion are decoded the same way.
+
 ## [0.6.0] - 2026-11-10
 
 Quirl now runs the shell code you already carry around. Loops,

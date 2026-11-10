@@ -6190,6 +6190,20 @@ mod tests {
     }
 
     #[test]
+    fn double_quoted_backslashes_match_bash_and_zsh() {
+        // Each argument is bracketed so a dropped or doubled backslash shows
+        // in the output; the trailing `printf "a\n"` lets printf decode `\n`.
+        assert_native_and_reference_case(
+            "double-quoted-backslashes",
+            |_| {
+                "printf '[%s]' \"a\\n\" \"a\\tb\" \"a\\qb\" \"a\\\\b\" \"a\\\"b\" \"a\\$HOME\" \"a\\`b\" \"a\\\nb\" \"a\\\\\\nb\"; printf \"a\\n\""
+                    .to_owned()
+            },
+            None,
+        );
+    }
+
+    #[test]
     fn native_executor_matches_bash_and_zsh_for_frozen_c1_composition_fixtures() {
         assert_native_and_reference_case(
             "quoting-and-byte-pipe",
