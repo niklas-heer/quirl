@@ -12,6 +12,8 @@ which versions are published.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-10
+
 Quirl now runs the shell code you already carry around. Loops,
 conditionals, `case`, functions, and aliases run in Quirl's own executor
 instead of being handed to `/bin/sh`, so a pasted loop keeps the variables it
