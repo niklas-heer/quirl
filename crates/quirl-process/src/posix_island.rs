@@ -717,7 +717,9 @@ mod tests {
     }
 
     /// Run the island wrapper in `shell` instead of `/bin/sh`, so the dump
-    /// code is checked against every reference shell on the machine.
+    /// code is checked against every reference shell on the machine. The
+    /// child gets no inherited `LC_ALL`, as some CI runners export one, so
+    /// tests control it through `locals` alone.
     fn run_island_in(
         shell: &str,
         kind: IslandKind,
@@ -731,6 +733,7 @@ mod tests {
             .unwrap();
         let status = std::process::Command::new(shell)
             .args(&words[1..])
+            .env_remove("LC_ALL")
             .status()
             .unwrap();
         (state, status)
@@ -809,10 +812,7 @@ mod tests {
             run_island(IslandKind::Eval, &[":".to_owned()], &BTreeMap::new(), false);
         assert!(status.success());
         let outcome = state.outcome().unwrap().unwrap();
-        assert_eq!(
-            outcome.exported.get(OsStr::new("LC_ALL")),
-            std::env::var_os("LC_ALL").as_ref()
-        );
+        assert!(!outcome.exported.contains_key(OsStr::new("LC_ALL")));
         assert_eq!(
             outcome.local_changes(&BTreeMap::new(), &BTreeMap::new()),
             LocalChanges::default()
