@@ -2679,7 +2679,10 @@ impl Catalog {
             index.saturating_add(whitespace_width_at(query, index))
         });
         let token = query.get(token_start..)?;
-        if !token.starts_with('-') {
+        // `+` turns a shell option off, as in `set +a`; it starts an option
+        // only for commands that declare such a flag.
+        let plus_option = token.starts_with('+');
+        if !token.starts_with('-') && !plus_option {
             return None;
         }
         let command_text = query.get(..token_start)?.trim_end();
@@ -2691,6 +2694,15 @@ impl Catalog {
                     || command_text.starts_with(&format!("{} ", command.path))
             })
             .max_by_key(|command| command.path.len())?;
+        let declares_plus_option = || {
+            command
+                .options
+                .iter()
+                .any(|option| option.names.iter().any(|name| name.starts_with('+')))
+        };
+        if plus_option && !declares_plus_option() {
+            return None;
+        }
         Some((
             command,
             leading_whitespace.saturating_add(token_start),
@@ -3469,6 +3481,20 @@ mod tests {
         let completions = Catalog::builtin().complete("git commit --am", 15);
         assert_eq!(completions[0].value, "--amend");
         assert_eq!(completions[0].replace_start, 11);
+    }
+
+    #[test]
+    fn plus_option_completion_offers_declared_plus_flags_only() {
+        let completions = Catalog::builtin().complete("set +", 5);
+        assert_eq!(completions[0].value, "+a");
+        assert_eq!(completions[0].replace_start, 4);
+        assert_eq!(completions[0].replace_end, 5);
+        assert!(
+            Catalog::builtin()
+                .complete("git commit +", 12)
+                .iter()
+                .all(|completion| !completion.value.starts_with('+'))
+        );
     }
 
     fn bundle_test_catalog() -> Catalog {

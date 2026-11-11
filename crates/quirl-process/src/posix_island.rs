@@ -132,7 +132,8 @@ const DUMP_TRAILER: &[u8] = b"quirl-island-end";
 /// `LC_ALL`, then turns off options that would stop the dump (`-e`, `-u`) or
 /// export its own scratch variables (`-a`). The code's functions and options
 /// cannot outlive the shell, so changing them at exit is invisible. Both dumps
-/// run with `LC_ALL=C`, set after `env -0` has reported the real value, which
+/// run with a newline `IFS` and `LC_ALL=C`, set only after `env -0` has
+/// reported the code's exported values, which
 /// makes Bash's pattern matching byte-wise and roughly 40% faster; the
 /// baseline puts the session's `IFS` and `LC_ALL` back before the code runs.
 const ISLAND_SCRIPT: &str = r#"__quirl_dump=$1
@@ -146,11 +147,11 @@ __quirl_lc_set=${LC_ALL+x}
 __quirl_lc=${LC_ALL-}
 set +a +e +u
 __quirl_set=$(set)
+{ printf "%s\0" quirl-island-v1 "$PWD"
+/usr/bin/env -0
 IFS="
 "
 set -f
-{ printf "%s\0" quirl-island-v1 "$PWD"
-/usr/bin/env -0
 LC_ALL=C
 @VARIABLES@
 } >"$__quirl_dump"
@@ -440,7 +441,9 @@ fn local_assignments<'a>(locals: impl Iterator<Item = (&'a OsString, &'a OsStrin
         let (Some(name), Some(value)) = (name.to_str(), value.to_str()) else {
             continue;
         };
-        if !is_shell_name(name) || SHELL_READONLY_VARIABLES.contains(&name) {
+        // A reserved name would overwrite the wrapper's own dump paths.
+        let reserved = name.starts_with(RESERVED_PREFIX);
+        if !is_shell_name(name) || reserved || SHELL_READONLY_VARIABLES.contains(&name) {
             continue;
         }
         rendered.push_str(name);
@@ -689,8 +692,15 @@ mod tests {
         let value = OsString::from("it's $(rm -rf /)");
         let invalid = OsString::from("not-a-name");
         let readonly = OsString::from("PPID");
+        let reserved = OsString::from("__quirl_baseline");
         let rendered = local_assignments(
-            [(&name, &value), (&invalid, &value), (&readonly, &value)].into_iter(),
+            [
+                (&name, &value),
+                (&invalid, &value),
+                (&readonly, &value),
+                (&reserved, &value),
+            ]
+            .into_iter(),
         );
         assert_eq!(rendered, "GREETING='it'\\''s $(rm -rf /)'\n");
     }
@@ -816,6 +826,22 @@ mod tests {
         assert_eq!(
             outcome.local_changes(&BTreeMap::new(), &BTreeMap::new()),
             LocalChanges::default()
+        );
+    }
+
+    #[test]
+    fn exported_ifs_and_lc_all_keep_the_values_the_code_exported() {
+        let code = "export IFS=: LC_ALL=POSIX".to_owned();
+        let (state, status) = run_island(IslandKind::Eval, &[code], &BTreeMap::new(), false);
+        assert!(status.success());
+        let outcome = state.outcome().unwrap().unwrap();
+        assert_eq!(
+            outcome.exported.get(OsStr::new("IFS")),
+            Some(&OsString::from(":"))
+        );
+        assert_eq!(
+            outcome.exported.get(OsStr::new("LC_ALL")),
+            Some(&OsString::from("POSIX"))
         );
     }
 
