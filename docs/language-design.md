@@ -380,15 +380,21 @@ bash ./legacy-deploy.sh   # explicit always wins
   those compounds (`> file`, `>> file`, `2> file`, `2>&1`, `>&2`) run natively.
   Compound commands used as pipeline stages or with input redirections
   (`done < file`), and brace expansion, still run in an implicit `/bin/sh`
-  island that keeps exports and the working directory. Aliases and functions are
+  island that keeps the variables it sets and the working directory. Aliases and functions are
   not visible inside that island, and a line that defines a function and also
   needs the island is rejected. A top-level program that is not a plain
-  simple-command list and uses `read`, `set`, `trap`, `getopts`, `readonly`,
-  `exec`, `wait`, `umask`, `ulimit`, `declare`, `typeset`, or `let` anywhere runs
-  in the island as a whole. See the
+  simple-command list and uses `read`, `set` (other than `set -a` and
+  `set +a`), `trap`, `getopts`, `readonly`, `exec`, `wait`, `umask`, `ulimit`,
+  `declare`, `typeset`, or `let` anywhere runs in the island as a whole. See the
   [POSIX invocation decision](decisions/2026-10-04_044214653_non-interactive-invocations-and-shell-setup-code-run-in-posi.md).
 - `source`, `.`, and `eval` run POSIX setup code in `/bin/sh` and import its
-  exported variables and working directory.
+  exported variables, the unexported variables it assigned or unset, and its
+  working directory, so a plain `source .env` sets session variables as in
+  Bash or Zsh. `set -a` and `set +a` are native: while allexport is on,
+  assignments, including those of sourced code, are exported, so
+  `set -a; source .env; set +a` exports a dotenv file. Other `set` options
+  are refused with an explanation in a plain command list. See the
+  [unexported island variables decision](decisions/2026-11-11_233501614_import-unexported-variables-from-posix-islands-and-support-s.md).
 - Behavior is versioned in a machine-readable matrix and backed by differential tests.
 
 ## 6. Command and data surface

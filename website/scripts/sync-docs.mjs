@@ -98,6 +98,7 @@ const documents = [
   ['docs/decisions/2026-10-04_162535286_rust-1-99-compatibility-and-selective-adoption.md', 'architecture/decisions/0042-rust-1.99-compatibility.mdx'],
   ['docs/decisions/2026-11-08_020630501_run-posix-control-flow-functions-and-aliases-natively-in-int.md', 'architecture/decisions/0043-run-posix-control-flow-functions-and-aliases-natively.mdx'],
   ['docs/decisions/2026-11-08_041414983_start-process-group-anchors-with-a-trusted-fast-shell-in-par.md', 'architecture/decisions/0044-start-process-group-anchors-with-a-trusted-fast-shell.mdx'],
+  ['docs/decisions/2026-11-11_233501614_import-unexported-variables-from-posix-islands-and-support-s.md', 'architecture/decisions/0045-import-unexported-variables-from-posix-islands.mdx'],
 ];
 
 const pageBySource = new Map(documents);

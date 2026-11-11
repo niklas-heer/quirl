@@ -178,13 +178,16 @@ tag and release that name its exact commit; other checkouts are development
 builds. Current limits worth knowing:
 
 - Here-documents, `[[`, `((`, `select`, subshells, brace expansion, and process
-  substitution run in a `/bin/sh` island automatically and keep their exports
-  and `cd`. Aliases and functions are not visible inside an island. Use an
+  substitution run in a `/bin/sh` island automatically and keep the variables
+  they set and their `cd`. Aliases and functions are not visible inside an island. Use an
   explicit `bash { ... }` or `zsh { ... }` block for Bash- or Zsh-only syntax.
-- `quirl -c` and piped scripts run in `/bin/sh`, and `eval` and `source` keep
-  the variables shell setup code exports, so Quirl is safe as a login shell
-  for SSH, `scp`, `rsync`, Git, and editors. Functions and aliases from
-  sourced code stay inside it.
+- `quirl -c` and piped scripts run in `/bin/sh`, so Quirl is safe as a login
+  shell for SSH, `scp`, `rsync`, Git, and editors. `eval` and `source` run in
+  `/bin/sh` too and keep the variables the code sets: exported ones reach
+  child processes, and unexported ones, such as the lines of a plain `.env`
+  file, stay session variables as in Bash. `set -a; source .env; set +a`
+  exports a dotenv file. Functions and aliases from sourced code stay inside
+  it.
 - Wasm packages validate but do not execute, and package publishing is a local
   dry run.
 - Windows interactive terminal behavior is outside the supported targets.

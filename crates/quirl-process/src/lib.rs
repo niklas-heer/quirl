@@ -132,6 +132,9 @@ pub(crate) struct SessionEnvironment {
     bytes_max: usize,
     initialization_error: Option<quirl_core::ShellError>,
     generation: u64,
+    /// Whether bare assignments export, as after `set -a`. Turning it off
+    /// keeps the export attribute of variables it already exported.
+    allexport: bool,
 }
 
 /// The binding one name holds after a single-name mutation.
@@ -212,6 +215,7 @@ impl SessionEnvironment {
                 bytes_max,
                 initialization_error: None,
                 generation: 0,
+                allexport: false,
             },
             Err(error) => Self {
                 variables: BTreeMap::new(),
@@ -221,6 +225,7 @@ impl SessionEnvironment {
                 bytes_max,
                 initialization_error: Some(error),
                 generation: 0,
+                allexport: false,
             },
         }
     }
@@ -331,8 +336,23 @@ impl SessionEnvironment {
         if exported {
             self.set_variables(&assignment)
         } else {
-            self.assign_variables(&assignment)
+            // A restored value regains exactly its old attribute, even while
+            // allexport would export a fresh assignment.
+            self.assign_keeping_attributes(&assignment)
         }
+    }
+
+    /// Whether bare assignments currently export, as after `set -a`.
+    #[cfg(unix)]
+    fn allexport(&self) -> bool {
+        self.allexport
+    }
+
+    /// Turn automatic export of assignments on or off, as `set -a` and
+    /// `set +a` do. Variables already exported stay exported.
+    #[cfg(unix)]
+    fn set_allexport(&mut self, enabled: bool) {
+        self.allexport = enabled;
     }
 
     /// Set and export variables, as `export NAME=value` does.
@@ -355,9 +375,22 @@ impl SessionEnvironment {
         self.commit(exported, locals)
     }
 
-    /// Assign variables as a bare `NAME=value` does: an exported variable
-    /// keeps its export attribute, and any other becomes an unexported local.
+    /// Assign variables as a bare `NAME=value` does: with allexport on, each
+    /// one is set and exported; otherwise an exported variable keeps its
+    /// export attribute, and any other becomes an unexported local.
     fn assign_variables(
+        &mut self,
+        assignments: &[(String, String)],
+    ) -> Result<(), quirl_core::ShellError> {
+        if self.allexport {
+            return self.set_variables(assignments);
+        }
+        self.assign_keeping_attributes(assignments)
+    }
+
+    /// Assign variables without changing any export attribute: an exported
+    /// variable stays exported, and any other becomes an unexported local.
+    fn assign_keeping_attributes(
         &mut self,
         assignments: &[(String, String)],
     ) -> Result<(), quirl_core::ShellError> {
@@ -425,16 +458,25 @@ impl SessionEnvironment {
         self.commit(exported, locals)
     }
 
-    /// Replace the exported variables with the environment a POSIX shell
-    /// ended with, keeping locals the shell did not export.
-    fn import_exported(
+    /// Adopt the state a POSIX shell ended with, in one all-or-nothing
+    /// commit: `exported` replaces the exported variables, `assigned` become
+    /// or update locals, and `removed` locals are dropped. Locals the shell
+    /// exported move to the exports; other locals are kept.
+    fn import_shell_state(
         &mut self,
-        imported: BTreeMap<OsString, OsString>,
+        exported: BTreeMap<OsString, OsString>,
+        assigned: BTreeMap<OsString, OsString>,
+        removed: &std::collections::BTreeSet<OsString>,
     ) -> Result<(), quirl_core::ShellError> {
         self.ensure_valid()?;
         let mut locals = self.locals.clone();
-        locals.retain(|name, _| !imported.contains_key(name));
-        self.commit(imported, locals)
+        locals.retain(|name, _| !exported.contains_key(name) && !removed.contains(name));
+        for (name, value) in assigned {
+            if !exported.contains_key(&name) {
+                locals.insert(name, value);
+            }
+        }
+        self.commit(exported, locals)
     }
 
     /// Number of names across both maps, which the variable limit bounds.
@@ -571,6 +613,7 @@ fn retained_bytes_of(
 mod session_environment_tests {
     use super::{BTreeMap, OsStr, OsString, SessionEnvironment, retained_bytes_of};
     use quirl_core::ErrorCode;
+    use std::collections::BTreeSet;
 
     fn exported_fixture(pairs: &[(&str, &str)]) -> SessionEnvironment {
         SessionEnvironment::capture(
@@ -824,19 +867,113 @@ mod session_environment_tests {
     }
 
     #[test]
-    fn import_exported_recounts_bytes_and_keeps_unexported_locals() {
-        let mut environment = exported_fixture(&[("OLD", "1")]);
+    fn shell_state_import_replaces_exports_and_applies_local_changes() {
+        let mut environment = exported_fixture(&[("OLD", "1"), ("DEMOTED", "d")]);
         environment
-            .assign_variables(&[("KEEP".to_owned(), "22".to_owned())])
+            .assign_variables(&[
+                ("KEEP".to_owned(), "22".to_owned()),
+                ("GONE".to_owned(), "x".to_owned()),
+                ("PROMOTED".to_owned(), "p".to_owned()),
+            ])
             .unwrap();
-        let imported = BTreeMap::from([(OsString::from("NEW"), OsString::from("333"))]);
+        let exported = BTreeMap::from([
+            (OsString::from("NEW"), OsString::from("333")),
+            (OsString::from("PROMOTED"), OsString::from("p")),
+        ]);
+        let assigned = BTreeMap::from([
+            (OsString::from("DEMOTED"), OsString::from("d")),
+            (OsString::from("ADDED"), OsString::from("")),
+        ]);
 
-        environment.import_exported(imported).unwrap();
+        environment
+            .import_shell_state(
+                exported,
+                assigned,
+                &BTreeSet::from([OsString::from("GONE")]),
+            )
+            .unwrap();
 
         assert_eq!(exported_of(&environment, "OLD"), None);
         assert_eq!(exported_of(&environment, "NEW"), Some("333".into()));
+        assert_eq!(exported_of(&environment, "PROMOTED"), Some("p".into()));
+        assert_eq!(local_of(&environment, "PROMOTED"), None);
+        assert_eq!(exported_of(&environment, "DEMOTED"), None);
+        assert_eq!(local_of(&environment, "DEMOTED"), Some("d".into()));
+        assert_eq!(local_of(&environment, "ADDED"), Some("".into()));
         assert_eq!(local_of(&environment, "KEEP"), Some("22".into()));
+        assert_eq!(local_of(&environment, "GONE"), None);
         assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn shell_state_import_over_the_variable_limit_changes_nothing() {
+        let mut environment = limited_fixture(&[("A", "1")], 3, 1024);
+        environment
+            .assign_variables(&[("L".to_owned(), "2".to_owned())])
+            .unwrap();
+        let before = environment.clone();
+        let assigned = BTreeMap::from([
+            (OsString::from("X"), OsString::from("1")),
+            (OsString::from("Y"), OsString::from("2")),
+        ]);
+
+        let error = environment
+            .import_shell_state(
+                BTreeMap::from([(OsString::from("B"), OsString::from("1"))]),
+                assigned,
+                &BTreeSet::new(),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert_same_state(&before, &environment);
+    }
+
+    #[test]
+    fn allexport_exports_assignments_and_off_keeps_export_attributes() {
+        let mut environment = exported_fixture(&[]);
+        environment
+            .assign_variables(&[("UNTOUCHED".to_owned(), "u".to_owned())])
+            .unwrap();
+        environment.set_allexport(true);
+        environment
+            .assign_variables(&[("FIRST".to_owned(), "1".to_owned())])
+            .unwrap();
+        environment
+            .assign_variables(&[
+                ("SECOND".to_owned(), "2".to_owned()),
+                ("THIRD".to_owned(), "3".to_owned()),
+            ])
+            .unwrap();
+        environment.set_allexport(false);
+        environment
+            .assign_variables(&[("AFTER".to_owned(), "a".to_owned())])
+            .unwrap();
+
+        assert_eq!(local_of(&environment, "UNTOUCHED"), Some("u".into()));
+        for (name, value) in [("FIRST", "1"), ("SECOND", "2"), ("THIRD", "3")] {
+            assert_eq!(exported_of(&environment, name), Some(value.into()));
+        }
+        assert_eq!(local_of(&environment, "AFTER"), Some("a".into()));
+        assert_cached_totals(&environment);
+    }
+
+    #[test]
+    fn restoring_a_saved_local_under_allexport_keeps_it_unexported() {
+        let mut environment = exported_fixture(&[]);
+        environment
+            .assign_variables(&[("SAVED".to_owned(), "old".to_owned())])
+            .unwrap();
+        let saved = environment.saved_variable("SAVED");
+        environment.set_allexport(true);
+        environment
+            .assign_variables(&[("SAVED".to_owned(), "new".to_owned())])
+            .unwrap();
+
+        environment.restore_variable("SAVED", saved).unwrap();
+
+        assert_eq!(local_of(&environment, "SAVED"), Some("old".into()));
+        assert_eq!(exported_of(&environment, "SAVED"), None);
     }
 
     #[test]
@@ -867,10 +1004,11 @@ mod session_environment_tests {
                     .assign_variables(&[(name, value.clone()), (other, value)])
                     .unwrap(),
                 _ => environment
-                    .import_exported(BTreeMap::from([(
-                        OsString::from(name),
-                        OsString::from(value),
-                    )]))
+                    .import_shell_state(
+                        BTreeMap::from([(OsString::from(name), OsString::from(value))]),
+                        BTreeMap::from([(OsString::from(other.clone()), OsString::new())]),
+                        &BTreeSet::from([OsString::from(other)]),
+                    )
                     .unwrap(),
             }
             assert_cached_totals(&environment);
@@ -2933,7 +3071,7 @@ mod platform {
         }
 
         /// Run `eval` or `source` in `/bin/sh` as one foreground pipeline,
-        /// then import the exported environment and directory it reported.
+        /// then import the variables and directory it reported.
         fn execute_posix_island(
             &mut self,
             kind: super::posix_island::IslandKind,
@@ -2946,7 +3084,12 @@ mod platform {
             self.environment.ensure_valid()?;
             let state = super::posix_island::IslandState::create()?;
             let operands = command.words.get(1..).unwrap_or_default();
-            let words = state.command_words(kind, operands, self.environment.local_variables())?;
+            let words = state.command_words(
+                kind,
+                operands,
+                self.environment.local_variables(),
+                self.environment.allexport(),
+            )?;
             let word_ir = words
                 .iter()
                 .map(|word| Word {
@@ -2976,25 +3119,32 @@ mod platform {
             Ok(outcome)
         }
 
-        /// Adopt what a POSIX shell island ended with. Variables whose names
-        /// a shell cannot express are kept, since the island could not have
-        /// changed them and may simply have dropped them.
+        /// Adopt what a POSIX shell island ended with: its exports, the
+        /// unexported variables it assigned or unset, and its directory.
+        /// Exports whose names a shell cannot express, or that the island
+        /// reserves for itself, are kept, since the island could not have
+        /// changed them. Every variable change commits at once, before the
+        /// directory changes, so a limit error leaves the session as it was.
         fn import_island(
             &mut self,
             reported: super::posix_island::IslandOutcome,
         ) -> Result<(), ShellError> {
+            let changes =
+                reported.local_changes(&self.environment.variables, &self.environment.locals);
             let mut exported = reported.exported;
             for (name, value) in &self.environment.variables {
-                let expressible = name
-                    .to_str()
-                    .is_some_and(super::posix_island::is_shell_name);
-                if !expressible {
+                let island_owned = name.to_str().is_some_and(|name| {
+                    super::posix_island::is_shell_name(name)
+                        && !name.starts_with(super::posix_island::RESERVED_PREFIX)
+                });
+                if !island_owned {
                     exported
                         .entry(name.clone())
                         .or_insert_with(|| value.clone());
                 }
             }
-            self.environment.import_exported(exported)?;
+            self.environment
+                .import_shell_state(exported, changes.assigned, &changes.removed)?;
             let current = std::env::current_dir().ok();
             if current.as_deref() != Some(reported.directory.as_path()) {
                 builtin::change_directory(&reported.directory)?;
@@ -3761,6 +3911,11 @@ mod platform {
                     let operands = builtin::export_operands(&command.words)?;
                     self.environment.set_variables(&operands.assignments)?;
                     self.environment.export_names(&operands.names)?;
+                    Some(outcome(0, Some(String::new()), Some(String::new())))
+                }
+                "set" => {
+                    let enabled = builtin::set_allexport_operand(&command.words)?;
+                    self.environment.set_allexport(enabled);
                     Some(outcome(0, Some(String::new()), Some(String::new())))
                 }
                 "unset" => {
@@ -8966,6 +9121,256 @@ mod platform {
                 }
             }
         }
+
+        /// Reference shells for island differentials: the platform `sh`
+        /// (Bash 3.2 in POSIX mode on macOS), plus Dash where installed,
+        /// because Debian's `/bin/sh` is Dash.
+        fn island_reference_shells() -> Vec<&'static str> {
+            ["/bin/sh", "/bin/dash", "/usr/bin/dash"]
+                .into_iter()
+                .filter(|shell| std::path::Path::new(shell).is_file())
+                .collect()
+        }
+
+        /// A private directory of sourced files, removed on drop.
+        struct SourcedFiles {
+            directory: std::path::PathBuf,
+        }
+
+        impl SourcedFiles {
+            fn new(files: &[(&str, &str)]) -> Self {
+                let directory = temporary_path("sourced");
+                fs::create_dir_all(&directory).unwrap();
+                for (name, contents) in files {
+                    fs::write(directory.join(name), contents).unwrap();
+                }
+                Self { directory }
+            }
+
+            /// The program text with every `@name` replaced by that file's path.
+            fn program(&self, template: &str) -> String {
+                let mut program = template.to_owned();
+                for entry in fs::read_dir(&self.directory).unwrap() {
+                    let name = entry.unwrap().file_name().into_string().unwrap();
+                    let path = self.directory.join(&name).display().to_string();
+                    program = program.replace(&format!("@{name}"), &path);
+                }
+                program
+            }
+        }
+
+        impl Drop for SourcedFiles {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.directory);
+            }
+        }
+
+        /// Run `program` in a fresh Quirl session and in every reference
+        /// shell, and require the same output and status from each. The
+        /// reference runs the whole program in one shell, so it shows what a
+        /// sourced file leaves behind in Bash or Zsh.
+        fn assert_session_matches_reference_shells(program: &str, expected: &str) {
+            let outcome = NativeExecutor::default().execute_capture(program).unwrap();
+            assert_eq!(
+                outcome.stdout.as_deref(),
+                Some(expected),
+                "quirl: {program}"
+            );
+            assert_eq!(outcome.status, 0, "quirl: {program}");
+            for shell in island_reference_shells() {
+                let reference = Command::new(shell).arg("-c").arg(program).output().unwrap();
+                assert_eq!(
+                    String::from_utf8_lossy(&reference.stdout),
+                    expected,
+                    "{shell}: {program}"
+                );
+                assert!(reference.status.success(), "{shell}: {program}");
+            }
+        }
+
+        #[test]
+        fn sourcing_a_dotenv_without_export_sets_variables_like_sh() {
+            let files = SourcedFiles::new(&[("dotenv", "QUIRL_GREETING=hello\n")]);
+            let expected = "direct:[hello]\nloop 1:[hello]\nloop 2:[hello]\nchild:[unset]\n";
+            let program = files.program(
+                ". @dotenv\n\
+                 echo \"direct:[$QUIRL_GREETING]\"\n\
+                 for i in 1 2; do echo \"loop $i:[$QUIRL_GREETING]\"; done\n\
+                 sh -c 'echo \"child:[${QUIRL_GREETING-unset}]\"'\n",
+            );
+            assert_session_matches_reference_shells(&program, expected);
+
+            // The issue's spelling, which Dash lacks, behaves the same.
+            let mut executor = NativeExecutor::default();
+            let outcome = executor
+                .execute_capture(&program.replacen(". ", "source ", 1))
+                .unwrap();
+            assert_eq!(outcome.stdout.as_deref(), Some(expected));
+        }
+
+        #[test]
+        fn sourced_values_are_never_parsed_or_evaluated() {
+            let files = SourcedFiles::new(&[(
+                "values",
+                "QUIRL_MULTI='first\nQUIRL_FAKE=spoofed'\n\
+                 QUIRL_HOSTILE='$(id) `id` \"q\" '\\''s \\'\n\
+                 QUIRL_EMPTY=\n\
+                 QUIRL_NOT_SET=x\n\
+                 unset QUIRL_NOT_SET\n",
+            )]);
+            let program = files.program(
+                ". @values\n\
+                 printf '[%s]\\n' \"$QUIRL_MULTI\" \"${QUIRL_FAKE-unset}\" \"$QUIRL_HOSTILE\" \
+                 \"${QUIRL_EMPTY-unset}\" \"${QUIRL_NOT_SET-unset}\"\n",
+            );
+            assert_session_matches_reference_shells(
+                &program,
+                "[first\nQUIRL_FAKE=spoofed]\n[unset]\n[$(id) `id` \"q\" 's \\]\n[]\n[unset]\n",
+            );
+        }
+
+        #[test]
+        fn sourced_unset_removes_locals_and_reassignment_drops_the_export() {
+            let files = SourcedFiles::new(&[(
+                "changes",
+                "unset QUIRL_SESSION_LOCAL\nunset QUIRL_DEMOTED\nQUIRL_DEMOTED=same\n",
+            )]);
+            let program = files.program(
+                "QUIRL_SESSION_LOCAL=1\n\
+                 export QUIRL_DEMOTED=same\n\
+                 . @changes\n\
+                 echo \"[${QUIRL_SESSION_LOCAL-unset}][$QUIRL_DEMOTED]\"\n\
+                 sh -c 'echo \"child:[${QUIRL_DEMOTED-unset}]\"'\n",
+            );
+            assert_session_matches_reference_shells(&program, "[unset][same]\nchild:[unset]\n");
+        }
+
+        #[test]
+        fn allexport_exports_sourced_and_bare_assignments_until_turned_off() {
+            let files = SourcedFiles::new(&[("dotenv", "QUIRL_AUTO=exported\n")]);
+            let program = files.program(
+                "QUIRL_UNTOUCHED=private\n\
+                 set -a\n\
+                 . @dotenv\n\
+                 QUIRL_BARE=bare\n\
+                 set +a\n\
+                 QUIRL_AFTER=local\n\
+                 QUIRL_BARE=still\n\
+                 sh -c 'echo \"[$QUIRL_AUTO][$QUIRL_BARE][${QUIRL_AFTER-unset}][${QUIRL_UNTOUCHED-unset}]\"'\n\
+                 for f in @dotenv; do set -a; . \"$f\"; QUIRL_LOOP=1; set +a; done\n\
+                 sh -c 'echo \"[$QUIRL_LOOP]\"'\n",
+            );
+            assert_session_matches_reference_shells(
+                &program,
+                "[exported][still][unset][unset]\n[1]\n",
+            );
+        }
+
+        #[test]
+        fn eval_imports_unexported_assignments_like_sh() {
+            assert_session_matches_reference_shells(
+                "eval 'QUIRL_EVAL_PLAIN=\"a b\"; QUIRL_EVAL_INC=$((1 + 1))'\n\
+                 echo \"[$QUIRL_EVAL_PLAIN][$QUIRL_EVAL_INC]\"\n\
+                 sh -c 'echo \"[${QUIRL_EVAL_PLAIN-unset}]\"'\n",
+                "[a b][2]\n[unset]\n",
+            );
+        }
+
+        #[test]
+        fn exit_inside_a_sourced_file_still_imports_what_ran_before_it() {
+            let files = SourcedFiles::new(&[(
+                "exits",
+                "QUIRL_BEFORE_EXIT=1\nexit 3\nQUIRL_AFTER_EXIT=2\n",
+            )]);
+            let mut executor = NativeExecutor::default();
+            let outcome = executor
+                .execute_capture(&files.program(". @exits"))
+                .unwrap();
+            assert_eq!(outcome.status, 3);
+            let outcome = executor
+                .execute_capture("echo \"[$QUIRL_BEFORE_EXIT][${QUIRL_AFTER_EXIT-unset}]\"")
+                .unwrap();
+            assert_eq!(outcome.stdout.as_deref(), Some("[1][unset]\n"));
+        }
+
+        #[test]
+        fn overridden_printf_or_a_killed_island_leaves_the_session_unchanged() {
+            let changes = "QUIRL_KEPT_LOCAL=changed\n\
+                           export QUIRL_KEPT_EXPORT=changed\n\
+                           QUIRL_NEVER_IMPORTED=1\n";
+            let files = SourcedFiles::new(&[
+                ("printf", &format!("{changes}printf() {{ :; }}\n")),
+                ("killed", &format!("{changes}kill -9 $$\n")),
+            ]);
+            for file in ["@printf", "@killed"] {
+                let mut executor = NativeExecutor::default();
+                executor
+                    .execute_capture("QUIRL_KEPT_LOCAL=kept; export QUIRL_KEPT_EXPORT=kept")
+                    .unwrap();
+                let exported = executor.environment.variables.clone();
+                let locals = executor.environment.locals.clone();
+
+                let _ = executor.execute_capture(&files.program(&format!(". {file}")));
+
+                assert_eq!(executor.environment.variables, exported, "{file}");
+                assert_eq!(executor.environment.locals, locals, "{file}");
+            }
+        }
+
+        #[test]
+        fn imported_locals_over_the_variable_limit_leave_the_session_unchanged() {
+            let files = SourcedFiles::new(&[(
+                "many",
+                "export QUIRL_LIMIT_EXPORT=1\nQUIRL_LIMIT_A=1\nQUIRL_LIMIT_B=2\n",
+            )]);
+            let mut executor = NativeExecutor::default();
+            // An empty island first drops what a shell maintains itself, such
+            // as `SHLVL`, so the limit below counts only the sourced names.
+            executor.execute_capture("eval :").unwrap();
+            executor.environment.variables_max = executor.environment.variable_count() + 2;
+            let exported = executor.environment.variables.clone();
+            let locals = executor.environment.locals.clone();
+
+            let error = executor
+                .execute_capture(&files.program(". @many"))
+                .unwrap_err();
+
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert_eq!(executor.environment.variables, exported);
+            assert_eq!(executor.environment.locals, locals);
+        }
+
+        #[test]
+        fn islands_import_no_shell_bookkeeping_but_keep_changed_ifs() {
+            let mut executor = NativeExecutor::default();
+            executor
+                .execute_capture("QUIRL_BOOKKEEPING_LOCAL=1")
+                .unwrap();
+            let locals = executor.environment.locals.clone();
+
+            executor
+                .execute_capture(
+                    "eval 'while false; do :; done; : \"$RANDOM$SECONDS$LINENO\"; f() { :; }; f; getopts a QUIRL_OPT -a; unset QUIRL_OPT'",
+                )
+                .unwrap();
+            assert_eq!(executor.environment.locals, locals);
+
+            executor.execute_capture("eval 'IFS=:'").unwrap();
+            assert_eq!(
+                executor.environment.locals.get(std::ffi::OsStr::new("IFS")),
+                Some(&std::ffi::OsString::from(":"))
+            );
+        }
+
+        #[test]
+        fn plain_set_forms_other_than_allexport_explain_themselves() {
+            let mut executor = NativeExecutor::default();
+            for source in ["set -e", "set", "set -- a b", "set -ae"] {
+                let error = executor.execute_capture(source).unwrap_err();
+                assert_eq!(error.code, ErrorCode::InvalidArgument, "{source}");
+                assert!(error.message.contains("`-a` or `+a`"), "{source}");
+            }
+        }
     }
 }
 
@@ -9579,6 +9984,11 @@ mod platform {
                         stderr: None,
                     }))
                 }
+                "set" => Err(ShellError::new(
+                    ErrorCode::InvalidCommand,
+                    "`set` is not supported by the Windows executor",
+                )
+                .with_help("Use `export NAME=value` to export variables")),
                 "eval" | "source" | "." => Err(ShellError::new(
                     ErrorCode::InvalidCommand,
                     format!("`{name}` needs a POSIX shell, which Windows does not provide"),
@@ -10767,7 +11177,7 @@ mod backend_contract_tests {
 
     #[cfg(unix)]
     #[test]
-    fn source_runs_a_file_with_arguments_and_keeps_unexported_values_inside() {
+    fn source_runs_a_file_with_arguments_and_imports_its_variables() {
         let directory =
             std::env::temp_dir().join(format!("quirl-source-test-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -10797,7 +11207,11 @@ mod backend_contract_tests {
                 &mut executor,
                 "echo \"[$QUIRL_SOURCED_LOCAL][$QUIRL_SOURCE_REMOVED]\""
             ),
-            "[][]\n"
+            "[hidden][]\n"
+        );
+        assert_eq!(
+            read_test_environment(&mut executor, "QUIRL_SOURCED_LOCAL"),
+            ""
         );
         std::fs::remove_dir_all(directory).unwrap();
     }

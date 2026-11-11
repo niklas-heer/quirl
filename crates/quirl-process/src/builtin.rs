@@ -8,8 +8,8 @@ use std::{
 
 /// Built-ins that change session state or job control, and therefore must run
 /// in the shell's own process rather than in a pipeline stage.
-pub(crate) const STATEFUL_BUILTINS: [&str; 9] = [
-    "cd", "export", "unset", "eval", "source", ".", "jobs", "fg", "bg",
+pub(crate) const STATEFUL_BUILTINS: [&str; 10] = [
+    "cd", "export", "unset", "set", "eval", "source", ".", "jobs", "fg", "bg",
 ];
 
 /// Whether `name` is one of [`STATEFUL_BUILTINS`].
@@ -50,6 +50,36 @@ pub(crate) fn export_operands(words: &[String]) -> Result<ExportOperands, ShellE
         .with_help("Use `export NAME=value` or `export NAME`"));
     }
     Ok(ExportOperands { assignments, names })
+}
+
+/// The allexport state one `set` command selects.
+///
+/// Only `set -a` and `set +a` are native; when several are given, the last
+/// wins, as in `sh`. Every other form is refused with a diagnostic rather
+/// than run as an external program, which would fail with "not found".
+pub(crate) fn set_allexport_operand(words: &[String]) -> Result<bool, ShellError> {
+    let mut enabled = None;
+    for operand in words.iter().skip(1) {
+        enabled = match operand.as_str() {
+            "-a" => Some(true),
+            "+a" => Some(false),
+            _ => None,
+        };
+        if enabled.is_none() {
+            break;
+        }
+    }
+    enabled.ok_or_else(|| {
+        let command = words.join(" ");
+        ShellError::new(
+            ErrorCode::InvalidArgument,
+            format!("`{command}` is not supported; Quirl's `set` only takes `-a` or `+a`"),
+        )
+        .with_command(command)
+        .with_help(
+            "Use `set -a` to export later assignments and `set +a` to stop; run other shell options inside `sh -c '...'` or a `bash { ... }` island",
+        )
+    })
 }
 
 /// Operands of one `unset [-v | -f] NAME...` command.

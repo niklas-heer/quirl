@@ -12,6 +12,25 @@ which versions are published.
 
 ## [Unreleased]
 
+### Changed
+
+- `source`, `.`, and `eval` keep the variables their code sets without
+  `export`, as Bash and Zsh do: a plain `source .env` now makes its variables
+  available to later commands, directly and in loops, without passing them to
+  child processes. Variables the code unsets are removed. Pasted lines that run
+  in the `/bin/sh` island behave the same way. Values are never parsed: the
+  shell prints each one itself, and a dump that is incomplete, oversized, or
+  produced by a sourced file that redefines `printf` imports nothing
+  ([#25](https://github.com/niklas-heer/quirl/issues/25)).
+
+### Added
+
+- `set -a` and `set +a` work natively, so `set -a; source .env; set +a`
+  exports a dotenv file. While allexport is on, every assignment, including
+  those of sourced code, is exported; `set +a` keeps variables it already
+  exported. Other `set` options explain that only `-a` and `+a` are supported
+  instead of failing with `exec: set: not found`.
+
 ## [0.6.1] - 2026-11-10
 
 A patch release: `printf "a\n"` now prints a line feed, as in Bash and Zsh,

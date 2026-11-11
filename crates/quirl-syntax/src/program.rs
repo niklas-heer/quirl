@@ -350,6 +350,15 @@ const ISLAND_ONLY_COMMANDS: [&str; 12] = [
     "typeset", "let",
 ];
 
+/// Whether `words` is `set` with only `-a` and `+a` operands, which the
+/// executor runs natively as the session's allexport flag. Other `set` forms
+/// still send a compound program to a reference shell.
+fn is_native_set(words: &[String]) -> bool {
+    matches!(words, [name, operands @ ..] if name == "set"
+        && !operands.is_empty()
+        && operands.iter().all(|operand| operand == "-a" || operand == "+a"))
+}
+
 fn classify_lexer_error(error: CommandSyntaxError) -> ProgramError {
     let unfinished =
         error.message.starts_with("unclosed ") || error.message.contains("ends with an escape");
@@ -1170,6 +1179,7 @@ impl Parser<'_> {
         }
         if let Some(name) = words.first()
             && ISLAND_ONLY_COMMANDS.contains(&name.as_str())
+            && !is_native_set(&words)
             && let Some(opener) = &opener
         {
             let form = unsupported(opener, name, "this built-in is not native yet");
@@ -1748,6 +1758,29 @@ mod tests {
     fn read_outside_a_compound_command_stays_a_plain_command() {
         assert!(parse("read -r line").is_simple());
         assert!(parse("set -x; echo hi").is_simple());
+    }
+
+    #[test]
+    fn allexport_set_stays_native_inside_and_around_compound_programs() {
+        for source in [
+            "set -a; for f in a b; do :; done; set +a",
+            "for f in a; do set -a; X=1; set +a; done",
+            "if true; then set +a -a; fi",
+        ] {
+            assert!(parse_program(source, &NoAliases).is_ok(), "{source}");
+        }
+        for source in [
+            "set -ae; if true; then :; fi",
+            "if true; then set -a -e; fi",
+        ] {
+            assert!(
+                matches!(
+                    parse_program(source, &NoAliases),
+                    Err(ProgramError::Unsupported(_))
+                ),
+                "{source}"
+            );
+        }
     }
 
     #[test]
