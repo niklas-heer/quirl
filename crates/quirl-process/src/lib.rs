@@ -3129,6 +3129,15 @@ mod platform {
                             .stderr
                             .get_or_insert_with(String::new)
                             .push_str(&warning);
+                        // A streaming caller shows what the observer
+                        // delivered and skips the returned stderr once
+                        // anything streamed, so the warning travels both ways.
+                        if let Some(observer) = observer {
+                            (observer.callback.borrow_mut())(ObservedActivity::Output {
+                                stream: quirl_core::OutputStream::Stderr,
+                                bytes: warning.as_bytes(),
+                            })?;
+                        }
                     } else {
                         io_write_all(std::io::stderr(), warning.as_bytes(), "standard error")?;
                     }
@@ -9504,6 +9513,39 @@ mod platform {
             assert_eq!(outcome.status, 0, "{:?}", outcome.stderr);
             assert_eq!(outcome.stdout.as_deref(), Some("1024 1024"));
             assert_eq!(outcome.stderr.as_deref(), Some(""));
+        }
+
+        #[test]
+        fn an_island_warning_reaches_a_streaming_observer() {
+            let request = ProcessRequest {
+                command: "eval 'printf result; trap : EXIT'".to_owned(),
+                deadline: Duration::from_secs(5),
+                cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                max_output_bytes: 4096,
+            };
+            let mut streamed_stderr = Vec::new();
+            let outcome = NativeExecutor::default()
+                .execute_capture_request_streaming(request, &mut |activity| {
+                    if let ObservedActivity::Output { stream, bytes } = activity
+                        && stream == OutputStream::Stderr
+                    {
+                        streamed_stderr.extend_from_slice(bytes);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(outcome.stdout.as_deref(), Some("result"));
+            let streamed = String::from_utf8(streamed_stderr).unwrap();
+            assert!(
+                streamed.contains("warning: `eval` imported no variables"),
+                "{streamed}"
+            );
+            assert!(
+                outcome
+                    .stderr
+                    .unwrap_or_default()
+                    .contains("imported no variables")
+            );
         }
 
         #[test]
