@@ -84,7 +84,7 @@ pub(crate) fn refuse_set_in_pipeline(
     let in_pipeline = commands.len() > 1
         && commands
             .iter()
-            .any(|command| command.words.first().is_some_and(|name| name == "set"));
+            .any(|command| command_name(&command.words).is_some_and(|name| name == "set"));
     if !in_pipeline {
         return Ok(());
     }
@@ -96,6 +96,30 @@ pub(crate) fn refuse_set_in_pipeline(
     .with_help(
         "Run `set -a` or `set +a` as its own command, for example `set -a; source .env; set +a`; use `env` to list exported variables",
     ))
+}
+
+/// The command a stage runs, past the runner and the `NAME=value` words
+/// that expansion puts in front of it, so `A=1 set -a` names `set`.
+fn command_name(words: &[String]) -> Option<&str> {
+    let words = match words.split_first() {
+        Some((runner, rest)) if runner == crate::PREFIX_ASSIGNMENT_RUNNER => rest,
+        _ => words,
+    };
+    words
+        .iter()
+        .map(String::as_str)
+        .find(|word| !is_assignment_word(word))
+}
+
+/// Whether `word` has the `NAME=value` shape of a prefix assignment.
+fn is_assignment_word(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        let mut characters = name.chars();
+        characters
+            .next()
+            .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+            && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+    })
 }
 
 /// Operands of one `unset [-v | -f] NAME...` command.

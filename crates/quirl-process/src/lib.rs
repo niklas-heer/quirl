@@ -9450,7 +9450,13 @@ mod platform {
         #[test]
         fn set_inside_a_pipeline_explains_itself_instead_of_running_a_program() {
             let mut executor = NativeExecutor::default();
-            for source in ["set -a | cat", "echo x | set +a", "set | grep PATH"] {
+            for source in [
+                "set -a | cat",
+                "echo x | set +a",
+                "set | grep PATH",
+                "A=1 set -a | cat",
+                "echo x | A=1 B=2 set +a",
+            ] {
                 let error = executor.execute_capture(source).unwrap_err();
                 assert_eq!(error.code, ErrorCode::InvalidArgument, "{source}");
                 assert_eq!(error.message, "`set` cannot run inside a pipeline");
