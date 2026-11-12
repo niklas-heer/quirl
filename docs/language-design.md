@@ -9,9 +9,9 @@ performance, and a well-tooled Lua extension language with an IDE-grade editing
 experience. Completion, diagnostics, documentation, prompt context, and
 interactive views are one product—not a pile of plugins.
 
-## Current 0.6 release contract
+## Current 0.7 release contract
 
-This is the implemented contract for the 0.6 release line. The supported
+This is the implemented contract for the 0.7 release line. The supported
 artifact is the immutable
 [`v0.7.0` GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.7.0);
 untagged source remains candidate or development work:
