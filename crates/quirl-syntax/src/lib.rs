@@ -18,7 +18,7 @@ pub use program::{
     CommandNode, CompoundCommand, CompoundList, ConditionalBranch, ConnectedPipeline, ForClause,
     FunctionDefinition, IfClause, ListItem, LoopClause, NoAliases, PROGRAM_NESTING_MAX,
     PipelineNode, Program, ProgramError, RedirectedCompound, is_function_name, is_incomplete,
-    is_reserved_word, is_shell_name, parse_program,
+    is_reserved_word, is_shell_name, native_set_allexport, parse_program,
 };
 
 /// Versioned, machine-readable evidence for Quirl's current native compatibility subset and

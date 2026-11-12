@@ -82,5 +82,6 @@
   "architecture/decisions/0041-posix-shell-invocation.mdx",
   "architecture/decisions/0042-rust-1.99-compatibility.mdx",
   "architecture/decisions/0043-run-posix-control-flow-functions-and-aliases-natively.mdx",
-  "architecture/decisions/0044-start-process-group-anchors-with-a-trusted-fast-shell.mdx"
+  "architecture/decisions/0044-start-process-group-anchors-with-a-trusted-fast-shell.mdx",
+  "architecture/decisions/0045-import-unexported-variables-from-posix-islands.mdx"
 ]

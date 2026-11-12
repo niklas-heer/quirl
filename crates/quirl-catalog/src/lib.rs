@@ -1710,10 +1710,35 @@ impl Catalog {
                     Provenance::Builtin,
                 ),
                 command(
+                    "set",
+                    "set -a | set +a | set -o allexport | set +o allexport",
+                    "Export every later assignment, or stop",
+                    "`set -a` (or `set -o allexport`) turns on allexport: each later `NAME=value`, including the assignments of code run by `source` or `eval`, sets and exports the variable. Existing unexported variables stay private until assigned again. `set +a` (or `set +o allexport`) turns allexport off without removing the export from variables it already exported, as in Bash. `set` changes the session, so it must run as its own command, not as a pipeline stage. Other `set` options are not native and are refused with an explanation; run them inside `sh -c '...'` or a `bash { ... }` island.",
+                    vec![
+                        option(&["-a"], None, "Export every later variable assignment"),
+                        option(&["+a"], None, "Stop exporting assignments automatically"),
+                        option_with_static_values(
+                            &["-o"],
+                            "text",
+                            &["allexport"],
+                            "Long form of `-a`",
+                        ),
+                        option_with_static_values(
+                            &["+o"],
+                            "text",
+                            &["allexport"],
+                            "Long form of `+a`",
+                        ),
+                    ],
+                    &["set -a; source .env; set +a"],
+                    &[],
+                    Provenance::Builtin,
+                ),
+                command(
                     "eval",
                     "eval <code...>",
                     "Run shell setup code and keep its variables",
-                    "Joins its arguments with spaces and runs them in the system POSIX shell, `/bin/sh`, as a foreground command. Afterwards the session adopts the exported environment and working directory the code ended with, so `eval \"$(ssh-agent -s)\"` and `eval \"$(brew shellenv)\"` work as in Bash or Zsh. Session variables are visible to the code. Variables it sets without `export`, functions, and aliases stay inside it.",
+                    "Joins its arguments with spaces and runs them in the system POSIX shell, `/bin/sh`, as a foreground command. Afterwards the session adopts the exported environment and working directory the code ended with, so `eval \"$(ssh-agent -s)\"` and `eval \"$(brew shellenv)\"` work as in Bash or Zsh. Session variables are visible to the code. Variables it sets without `export` become session variables that later commands expand but child processes do not inherit, and variables it unsets are removed. Functions, aliases, arrays, traps, and shell options stay inside it. After `set -a`, its assignments are exported. Shell bookkeeping is never imported: `_`, `SHLVL`, `PPID`, `UID`, `EUID`, `OPTIND`, `OPTARG`, `LINENO`, `RANDOM`, `SRANDOM`, `SECONDS`, `EPOCHREALTIME`, `EPOCHSECONDS`, `PIPESTATUS`, `FUNCNAME`, `GROUPS`, `DIRSTACK`, `HISTCMD`, `SHELLOPTS`, `POSIXLY_CORRECT`, `BASH`, `BASHOPTS`, `BASHPID`, names beginning with `BASH_` or `__quirl_`, and `PWD` and `OLDPWD`, which follow the working directory instead. Session variables named `PPID`, `UID`, `EUID`, `SHELLOPTS`, `BASHOPTS`, `GROUPS` or `FUNCNAME`, or beginning with `BASH_` or `__quirl_`, are not passed to the code either, because the shell owns them. If the shell cannot report its variables, for example after `readonly IFS`, nothing is imported and a warning says why.",
                     vec![],
                     &["eval \"$(ssh-agent -s)\"", "eval \"$(brew shellenv)\""],
                     &[Effect::SpawnProcess],
@@ -1723,9 +1748,13 @@ impl Catalog {
                     "source",
                     "source <file> [args...]",
                     "Run a shell script and keep its variables",
-                    "Runs the file in the system POSIX shell, `/bin/sh`, with any arguments as its positional parameters. Afterwards the session adopts the exported environment and working directory the script ended with, so `source .venv/bin/activate` or `source .env` work. A name without a slash refers to the file in the current directory when one exists. Variables set without `export`, functions such as a virtual environment's `deactivate`, and aliases stay inside the script.",
+                    "Runs the file in the system POSIX shell, `/bin/sh`, with any arguments as its positional parameters. Afterwards the session adopts the exported environment and working directory the script ended with, so `source .venv/bin/activate` works. Variables the file sets without `export`, such as the lines of a `.env` file, become session variables: later commands expand them, as in Bash or Zsh, but child processes do not inherit them. To export every variable a dotenv file sets, write `set -a; source .env; set +a`. A name without a slash refers to the file in the current directory when one exists. Functions such as a virtual environment's `deactivate`, aliases, arrays, traps, and shell options stay inside the script. Shell bookkeeping is never imported: `_`, `SHLVL`, `PPID`, `UID`, `EUID`, `OPTIND`, `OPTARG`, `LINENO`, `RANDOM`, `SRANDOM`, `SECONDS`, `EPOCHREALTIME`, `EPOCHSECONDS`, `PIPESTATUS`, `FUNCNAME`, `GROUPS`, `DIRSTACK`, `HISTCMD`, `SHELLOPTS`, `POSIXLY_CORRECT`, `BASH`, `BASHOPTS`, `BASHPID`, names beginning with `BASH_` or `__quirl_`, and `PWD` and `OLDPWD`, which follow the working directory instead. Session variables named `PPID`, `UID`, `EUID`, `SHELLOPTS`, `BASHOPTS`, `GROUPS` or `FUNCNAME`, or beginning with `BASH_` or `__quirl_`, are not passed to the code either, because the shell owns them. If the shell cannot report its variables, for example after `readonly IFS`, nothing is imported and a warning says why.",
                     vec![],
-                    &["source .venv/bin/activate", "source .env"],
+                    &[
+                        "source .venv/bin/activate",
+                        "source .env",
+                        "set -a; source .env; set +a",
+                    ],
                     &[Effect::SpawnProcess, Effect::ReadFilesystem],
                     Provenance::Builtin,
                 ),
@@ -2662,7 +2691,10 @@ impl Catalog {
             index.saturating_add(whitespace_width_at(query, index))
         });
         let token = query.get(token_start..)?;
-        if !token.starts_with('-') {
+        // `+` turns a shell option off, as in `set +a`; it starts an option
+        // only for commands that declare such a flag.
+        let plus_option = token.starts_with('+');
+        if !token.starts_with('-') && !plus_option {
             return None;
         }
         let command_text = query.get(..token_start)?.trim_end();
@@ -2674,6 +2706,15 @@ impl Catalog {
                     || command_text.starts_with(&format!("{} ", command.path))
             })
             .max_by_key(|command| command.path.len())?;
+        let declares_plus_option = || {
+            command
+                .options
+                .iter()
+                .any(|option| option.names.iter().any(|name| name.starts_with('+')))
+        };
+        if plus_option && !declares_plus_option() {
+            return None;
+        }
         Some((
             command,
             leading_whitespace.saturating_add(token_start),
@@ -2761,7 +2802,9 @@ impl Catalog {
                     preceding.get(..option_start)?.trim_end(),
                 )
             };
-        if !option_name.starts_with('-') {
+        // `+` spells the off form of a shell option, as in `set +o`; only
+        // names the command declares below can match either way.
+        if !option_name.starts_with(['-', '+']) {
             return None;
         }
         let command = self
@@ -3454,6 +3497,20 @@ mod tests {
         assert_eq!(completions[0].replace_start, 11);
     }
 
+    #[test]
+    fn plus_option_completion_offers_declared_plus_flags_only() {
+        let completions = Catalog::builtin().complete("set +", 5);
+        assert_eq!(completions[0].value, "+a");
+        assert_eq!(completions[0].replace_start, 4);
+        assert_eq!(completions[0].replace_end, 5);
+        assert!(
+            Catalog::builtin()
+                .complete("git commit +", 12)
+                .iter()
+                .all(|completion| !completion.value.starts_with('+'))
+        );
+    }
+
     fn bundle_test_catalog() -> Catalog {
         Catalog {
             schema_version: CATALOG_SCHEMA_VERSION,
@@ -3754,6 +3811,15 @@ mod tests {
         let equals = Catalog::builtin().complete("quirl index build --format=j", 28);
         assert_eq!(equals[0].value, "json");
         assert_eq!(equals[0].replace_start, 27);
+    }
+
+    #[test]
+    fn declared_plus_options_complete_their_static_values() {
+        for line in ["set -o al", "set +o al"] {
+            let completions = Catalog::builtin().complete(line, line.len());
+            assert_eq!(completions[0].value, "allexport", "{line}");
+            assert_eq!(completions[0].replace_start, "set +o ".len(), "{line}");
+        }
     }
 
     #[test]

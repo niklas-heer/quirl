@@ -34,6 +34,7 @@
     "0041-posix-shell-invocation",
     "0042-rust-1.99-compatibility",
     "0043-run-posix-control-flow-functions-and-aliases-natively",
-    "0044-start-process-group-anchors-with-a-trusted-fast-shell"
+    "0044-start-process-group-anchors-with-a-trusted-fast-shell",
+    "0045-import-unexported-variables-from-posix-islands"
   ]
 }
