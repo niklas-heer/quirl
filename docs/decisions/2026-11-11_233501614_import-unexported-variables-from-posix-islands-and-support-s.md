@@ -30,9 +30,10 @@ Bash and Zsh, and `set -a; source .env; set +a` exports them.
 - Shell bookkeeping never counts: `_`, `SHLVL`, `PPID`, `UID`, `EUID`,
   `OPTIND`, `OPTARG`, `LINENO`, `RANDOM`, `SRANDOM`, `SECONDS`,
   `EPOCHREALTIME`, `EPOCHSECONDS`, `PIPESTATUS`, `FUNCNAME`, `GROUPS`,
-  `DIRSTACK`, `HISTCMD`, `SHELLOPTS`, `POSIXLY_CORRECT`, `COLUMNS`, `LINES`,
-  every name beginning with `BASH`, and the wrapper's `__quirl_*` scratch
-  variables. `PWD` and `OLDPWD` reach the session through the existing
+  `DIRSTACK`, `HISTCMD`, `SHELLOPTS`, `POSIXLY_CORRECT`, `BASH`, `BASHOPTS`,
+  `BASHPID`, every name beginning with `BASH_`, and the wrapper's `__quirl_*`
+  scratch variables. Look-alikes such as `BASHFUL`, `COLUMNS`, and `LINES`
+  count like any other variable. `PWD` and `OLDPWD` reach the session through the existing
   directory handling. `IFS`, `PS1`, and other shell defaults count only when
   the code changes them, because the baseline already holds them.
 - Functions, aliases, arrays, readonly attributes, traps, positional
@@ -44,18 +45,34 @@ is a shell name. The shell confirms each candidate with `${NAME+x}` and prints
 `NAME=value` NUL-terminated with its builtin `printf`; a multi-line value that
 contains a line such as `FAKE=spoofed` nominates `FAKE`, which is dropped
 unless it is really set. Bash lists arrays as `NAME=(...)` and quotes every
-scalar beginning with `(`, so those lines are skipped. The `EXIT` trap saves
-`IFS` and `LC_ALL` first, then turns off `-a`, `-e`, and `-u` so options the
-code left on cannot stop the dump. Both dumps run under `LC_ALL=C`, which keeps
-the name check byte-wise in every locale; the baseline restores the session's
-`IFS` and `LC_ALL` before the code runs.
+scalar beginning with `(`, so those lines are skipped; because a line inside a
+multi-line value can also nominate an array's name with a scalar-looking value,
+every name some line lists as `NAME=(` is checked with Bash's own
+`declare -p`, and real arrays are skipped. The `EXIT` trap first turns off
+`-x` and `-v`, so tracing the code left on never prints values, and removes
+every alias and any function shadowing `printf`, `unalias`, `builtin`, or
+`declare`; the special builtins it also uses cannot be shadowed by functions in
+`sh`, and it quotes their names against aliases. It then saves `IFS` and
+`LC_ALL` and turns off `-a`, `-e`, and `-u` so options the code left on cannot
+stop the dump. `env -0` reports the exports before the dump changes `IFS`, so
+an exported `IFS` keeps the code's value. Both dumps run under `LC_ALL=C`,
+which keeps the name check byte-wise in every locale; the baseline restores the
+session's `IFS` and `LC_ALL` before the code runs.
 
-Import fails closed. Both dumps are framed by fixed header and trailer
-records, and Rust revalidates every name. A truncated or malformed dump, a dump
-above its byte bound, a shell killed before its trap ran, or a `printf` the code
-overrode imports nothing: exports, locals, and the directory stay as they were.
-Every variable change commits in one transaction that checks the session's
-variable and byte limits, so an import over a limit also changes nothing.
+The trust boundary is the code, not the dump. Sourced code is trusted: it runs
+with the user's rights and can already set any variable it likes, so the import
+does not try to defend against it. What the import guarantees is narrower:
+variable values are data, so no value can spoof another variable's name or
+inject code into the session, and a broken or interrupted dump imports nothing.
+Both dumps are framed by fixed header and trailer records, and Rust revalidates
+every name. A truncated or malformed dump (for example after the code ran
+`readonly IFS` or `unset PWD`), a dump above its byte bound, or a shell that
+ended before its trap wrote the dump (killed by a signal, `exec`, or a
+replaced `EXIT` trap) imports nothing: exports, locals, and the directory stay
+as they were, and the session prints a one-line warning saying no variables
+were imported and why. Every variable change commits in one transaction that
+checks the session's variable and byte limits, so an import over a limit also
+changes nothing.
 
 **`set -a` and `set +a`.** The session keeps a native allexport flag. While it
 is on, every assignment (bare `NAME=value`, `for` variables, `${NAME:=word}`,
@@ -63,9 +80,10 @@ and arithmetic assignments) sets and exports; existing unexported variables
 stay private until assigned again. Islands start their code with `set -a` after
 the session locals are injected, so their assignments come back exported.
 `set +a` stops automatic export without removing the export attribute from
-variables it already exported, as in Bash. Other `set` forms in a plain command
-list fail with a diagnostic naming the supported forms, instead of
-`exec: set: not found`.
+variables it already exported, as in Bash. `set -o allexport` and
+`set +o allexport` are the same options. Other `set` forms in a plain command
+list, and `set` as a pipeline stage, fail with a diagnostic naming the
+supported forms, instead of `exec: set: not found`.
 
 ## Amendments
 
@@ -77,7 +95,7 @@ the island". Its other clauses, including running `eval` and `source` in
 
 It also amends two clauses of the
 [native control-flow decision](2026-11-08_020630501_run-posix-control-flow-functions-and-aliases-natively-in-int.md):
-`set` with only `-a` and `+a` operands no longer sends a compound program to the
+`set` with only allexport operands no longer sends a compound program to the
 island, because the executor runs it natively; other `set` forms still do. Of
 its "two intended differences" between native and island execution, unexported
 variables assigned in a loop no longer differ, because islands now import them
@@ -119,13 +137,22 @@ Alternatives considered:
   Apple Silicon Mac with 40 to 100 environment variables, 20 session locals,
   and a 30-line dotenv file, the median island grew from 4.9–5.2 ms to
   10.8–12.8 ms under `/bin/sh` (Bash 3.2), and from 3.3–3.4 ms to 5.9–7.1 ms
-  under Dash. Bash 3.2's per-variable loop cost dominates; running the loop
-  under `LC_ALL=C` cut it by about 40%.
+  under Dash. The cost is linear in the number of set variables; Bash 3.2's
+  per-variable loop dominates, at roughly 10 to 15 ms per island for a 30-line
+  dotenv file including the array check, and running the loop under
+  `LC_ALL=C` cut it by about 40%. Checking array-looking names
+  with `declare -p` adds one subshell per such name, which only Bash arrays and
+  spoofing values produce.
 - The dump file can hold the session environment twice, so its byte bound is
   twice the session byte limit plus framing.
 - A variable the code sets to the value it already had, and that was not
   exported before, is indistinguishable from an untouched one and is not
   re-imported; the session already holds that value.
-- Names beginning with `BASH` and `__quirl_` cannot be set through an island.
-- A sourced file that defines `printf` imports nothing; such files are expected
-  to be rare, and failing closed is preferable to importing a forged dump.
+- `BASH`, `BASHOPTS`, `BASHPID`, names beginning with `BASH_` or `__quirl_`,
+  and the other bookkeeping names cannot be set through an island. Session
+  locals named `__quirl_*` are not passed in, and neither are the shell's
+  read-only `PPID`, `UID`, `EUID`, `SHELLOPTS`, `BASHOPTS`, and
+  `BASH_VERSINFO`, which would otherwise stop every island.
+- A sourced file that redefines `printf` or aliases `eval` still imports its
+  real values. One that leaves the shell unable to report (`readonly IFS`,
+  `unset PWD`, its own `EXIT` trap) imports nothing and says so.

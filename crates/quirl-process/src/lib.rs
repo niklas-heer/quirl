@@ -2980,6 +2980,7 @@ mod platform {
                     "background execution is unavailable to isolated Lua",
                 ));
             }
+            builtin::refuse_set_in_pipeline(&pipeline.commands, source)?;
             // Background pipelines keep every stage a process so job control
             // can observe, suspend, and resume each one.
             if pipeline.commands.len() > 1
@@ -3112,9 +3113,26 @@ mod platform {
             // the command ends, and setup code such as `ssh-agent -s` leaves a
             // daemon that only escapes the group after forking. The daemon must
             // outlive `eval`, as it does in any shell.
-            let outcome = self.spawn_pipeline(&island, source, capture, request, observer)?;
-            if let Some(reported) = state.outcome()? {
-                self.import_island(reported)?;
+            let mut outcome = self.spawn_pipeline(&island, source, capture, request, observer)?;
+            match state.outcome()? {
+                Ok(reported) => self.import_island(reported)?,
+                Err(missing) => {
+                    // All or nothing: a partial report never reaches the
+                    // session, but the user learns why nothing changed.
+                    let name = command.words.first().map_or("source", String::as_str);
+                    let warning = format!(
+                        "quirl: warning: `{name}` imported no variables: {}\n",
+                        missing.reason()
+                    );
+                    if capture {
+                        outcome
+                            .stderr
+                            .get_or_insert_with(String::new)
+                            .push_str(&warning);
+                    } else {
+                        io_write_all(std::io::stderr(), warning.as_bytes(), "standard error")?;
+                    }
+                }
             }
             Ok(outcome)
         }
@@ -9294,27 +9312,56 @@ mod platform {
         }
 
         #[test]
-        fn overridden_printf_or_a_killed_island_leaves_the_session_unchanged() {
-            let changes = "QUIRL_KEPT_LOCAL=changed\n\
-                           export QUIRL_KEPT_EXPORT=changed\n\
-                           QUIRL_NEVER_IMPORTED=1\n";
-            let files = SourcedFiles::new(&[
-                ("printf", &format!("{changes}printf() {{ :; }}\n")),
-                ("killed", &format!("{changes}kill -9 $$\n")),
-            ]);
-            for file in ["@printf", "@killed"] {
-                let mut executor = NativeExecutor::default();
-                executor
-                    .execute_capture("QUIRL_KEPT_LOCAL=kept; export QUIRL_KEPT_EXPORT=kept")
-                    .unwrap();
-                let exported = executor.environment.variables.clone();
-                let locals = executor.environment.locals.clone();
+        fn a_killed_island_leaves_the_session_unchanged() {
+            let files = SourcedFiles::new(&[(
+                "killed",
+                "QUIRL_KEPT_LOCAL=changed\n\
+                 export QUIRL_KEPT_EXPORT=changed\n\
+                 QUIRL_NEVER_IMPORTED=1\n\
+                 kill -9 $$\n",
+            )]);
+            let mut executor = NativeExecutor::default();
+            executor
+                .execute_capture("QUIRL_KEPT_LOCAL=kept; export QUIRL_KEPT_EXPORT=kept")
+                .unwrap();
+            let exported = executor.environment.variables.clone();
+            let locals = executor.environment.locals.clone();
 
-                let _ = executor.execute_capture(&files.program(&format!(". {file}")));
+            let outcome = executor
+                .execute_capture(&files.program(". @killed"))
+                .unwrap();
 
-                assert_eq!(executor.environment.variables, exported, "{file}");
-                assert_eq!(executor.environment.locals, locals, "{file}");
-            }
+            assert!(
+                outcome
+                    .stderr
+                    .unwrap_or_default()
+                    .contains("imported no variables")
+            );
+            assert_eq!(executor.environment.variables, exported);
+            assert_eq!(executor.environment.locals, locals);
+        }
+
+        #[test]
+        fn aliases_and_overridden_commands_cannot_rewrite_the_import() {
+            // The code shadows what the dump runs: an alias turns `eval` into
+            // a no-op, and a forwarding `printf` swaps one value. The trap
+            // removes both first, so the session gets the real values.
+            let files = SourcedFiles::new(&[(
+                "overrides",
+                "QUIRL_OVERRIDE_SECRET=real\n\
+                 alias eval=:\n\
+                 printf() { if [ \"$2\" = QUIRL_OVERRIDE_SECRET ]; then command printf \"$1\" \"$2\" spoofed; \
+                 else command printf \"$@\"; fi; }\n\
+                 QUIRL_OVERRIDE_NEW=1\n",
+            )]);
+            assert_session_matches_reference_shells(
+                &files.program(
+                    "QUIRL_OVERRIDE_KEPT=keep\n\
+                     . @overrides\n\
+                     echo \"[$QUIRL_OVERRIDE_KEPT][$QUIRL_OVERRIDE_SECRET][$QUIRL_OVERRIDE_NEW]\"\n",
+                ),
+                "[keep][real][1]\n",
+            );
         }
 
         #[test]
@@ -9365,11 +9412,106 @@ mod platform {
         #[test]
         fn plain_set_forms_other_than_allexport_explain_themselves() {
             let mut executor = NativeExecutor::default();
-            for source in ["set -e", "set", "set -- a b", "set -ae"] {
+            for source in [
+                "set -e",
+                "set",
+                "set -- a b",
+                "set -ae",
+                "set -o errexit",
+                "set -o",
+            ] {
                 let error = executor.execute_capture(source).unwrap_err();
                 assert_eq!(error.code, ErrorCode::InvalidArgument, "{source}");
-                assert!(error.message.contains("`-a` or `+a`"), "{source}");
+                assert!(error.message.contains("`-o allexport`"), "{source}");
             }
+        }
+
+        #[test]
+        fn long_allexport_option_spellings_match_sh() {
+            assert_session_matches_reference_shells(
+                "set -o allexport\n\
+                 QUIRL_LONG_ON=1\n\
+                 set +o allexport\n\
+                 QUIRL_LONG_OFF=2\n\
+                 sh -c 'echo \"[$QUIRL_LONG_ON][${QUIRL_LONG_OFF-unset}]\"'\n",
+                "[1][unset]\n",
+            );
+        }
+
+        #[test]
+        fn set_inside_a_pipeline_explains_itself_instead_of_running_a_program() {
+            let mut executor = NativeExecutor::default();
+            for source in ["set -a | cat", "echo x | set +a", "set | grep PATH"] {
+                let error = executor.execute_capture(source).unwrap_err();
+                assert_eq!(error.code, ErrorCode::InvalidArgument, "{source}");
+                assert_eq!(error.message, "`set` cannot run inside a pipeline");
+            }
+            assert!(!executor.environment.allexport());
+        }
+
+        #[test]
+        fn an_island_that_reports_nothing_warns_and_changes_nothing() {
+            // Each code reaches a state the dump cannot describe; the session
+            // keeps its variables and says why on standard error.
+            for (code, reason) in [
+                ("readonly IFS", "incomplete"),
+                ("unset PWD", "incomplete"),
+                ("trap : EXIT", "`EXIT` trap"),
+            ] {
+                let mut executor = NativeExecutor::default();
+                executor.execute_capture("QUIRL_WARN_LOCAL=kept").unwrap();
+                let exported = executor.environment.variables.clone();
+                let locals = executor.environment.locals.clone();
+
+                let outcome = executor
+                    .execute_capture(&format!("eval '{code}; QUIRL_WARN_LOCAL=changed'"))
+                    .unwrap();
+
+                let stderr = outcome.stderr.unwrap_or_default();
+                assert!(
+                    stderr.contains("warning: `eval` imported no variables"),
+                    "{code}: {stderr}"
+                );
+                assert!(stderr.contains(reason), "{code}: {stderr}");
+                assert_eq!(executor.environment.variables, exported, "{code}");
+                assert_eq!(executor.environment.locals, locals, "{code}");
+            }
+            let outcome = NativeExecutor::default()
+                .execute_capture("eval 'QUIRL_FINE=1'")
+                .unwrap();
+            assert_eq!(outcome.stderr.as_deref(), Some(""));
+        }
+
+        #[test]
+        fn reserved_or_shell_readonly_locals_never_break_an_island() {
+            let mut executor = NativeExecutor::default();
+            executor
+                .execute_capture(
+                    "__quirl_dump=/nonexistent/dump; __quirl_kind=x; __quirl_baseline=/nonexistent/b; \
+                     SHELLOPTS=x; BASHOPTS=y; BASH_VERSINFO=z",
+                )
+                .unwrap();
+            let outcome = executor
+                .execute_capture("eval 'QUIRL_AFTER_RESERVED=1'")
+                .unwrap();
+            assert_eq!(outcome.status, 0);
+            assert_eq!(outcome.stderr.as_deref(), Some(""));
+            let outcome = executor
+                .execute_capture("echo \"[$QUIRL_AFTER_RESERVED][$__quirl_dump][$SHELLOPTS]\"")
+                .unwrap();
+            assert_eq!(
+                outcome.stdout.as_deref(),
+                Some("[1][/nonexistent/dump][x]\n")
+            );
+        }
+
+        #[test]
+        fn islands_import_variables_that_only_resemble_bash_bookkeeping() {
+            assert_session_matches_reference_shells(
+                "eval 'BASHFUL=1 COLUMNS=80 LINES=24'\n\
+                 echo \"[$BASHFUL][$COLUMNS][$LINES]\"\n",
+                "[1][80][24]\n",
+            );
         }
     }
 }

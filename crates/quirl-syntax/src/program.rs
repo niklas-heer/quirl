@@ -350,13 +350,38 @@ const ISLAND_ONLY_COMMANDS: [&str; 12] = [
     "typeset", "let",
 ];
 
-/// Whether `words` is `set` with only `-a` and `+a` operands, which the
-/// executor runs natively as the session's allexport flag. Other `set` forms
-/// still send a compound program to a reference shell.
+/// The allexport state a native `set` command selects, or `None` when
+/// `words` is not one.
+///
+/// Native `set` takes only the allexport option, spelled `-a`/`+a` or
+/// `-o allexport`/`+o allexport`, at least once; when several are given, the
+/// last wins, as in `sh`. Other `set` forms still send a compound program to a
+/// reference shell, and the executor refuses them as simple commands.
+pub fn native_set_allexport(words: &[String]) -> Option<bool> {
+    let [name, operands @ ..] = words else {
+        return None;
+    };
+    if name != "set" {
+        return None;
+    }
+    let mut enabled = None;
+    let mut operands = operands.iter();
+    while let Some(operand) = operands.next() {
+        enabled = Some(match operand.as_str() {
+            "-a" => true,
+            "+a" => false,
+            "-o" | "+o" if operands.next().is_some_and(|option| option == "allexport") => {
+                operand == "-o"
+            }
+            _ => return None,
+        });
+    }
+    enabled
+}
+
+/// Whether `words` is a `set` command the executor runs natively.
 fn is_native_set(words: &[String]) -> bool {
-    matches!(words, [name, operands @ ..] if name == "set"
-        && !operands.is_empty()
-        && operands.iter().all(|operand| operand == "-a" || operand == "+a"))
+    native_set_allexport(words).is_some()
 }
 
 fn classify_lexer_error(error: CommandSyntaxError) -> ProgramError {
@@ -1766,12 +1791,15 @@ mod tests {
             "set -a; for f in a b; do :; done; set +a",
             "for f in a; do set -a; X=1; set +a; done",
             "if true; then set +a -a; fi",
+            "set -o allexport; for f in a; do :; done; set +o allexport",
         ] {
             assert!(parse_program(source, &NoAliases).is_ok(), "{source}");
         }
         for source in [
             "set -ae; if true; then :; fi",
             "if true; then set -a -e; fi",
+            "if true; then set -o errexit; fi",
+            "if true; then set -o; fi",
         ] {
             assert!(
                 matches!(

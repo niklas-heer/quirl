@@ -12,12 +12,18 @@
 //!   A variable counts as assigned when, at exit, it is set, unexported, and
 //!   its value or export attribute differs from a baseline taken after the
 //!   session locals were injected and before the code ran. Shell bookkeeping
-//!   such as `RANDOM`, `LINENO`, or `BASH_*` never counts, and `IFS` or `PS1`
-//!   count only when the code changed them, because the baseline already
-//!   holds the shell's defaults.
+//!   such as `RANDOM`, `LINENO`, `BASHPID`, or `BASH_*` never counts, and
+//!   `IFS` or `PS1` count only when the code changed them, because the
+//!   baseline already holds the shell's defaults.
 //!
 //! Functions, aliases, arrays, readonly attributes, traps, positional
 //! parameters, and shell options stay inside the island.
+//!
+//! Trust boundary: sourced code is trusted. It runs with the user's rights and
+//! can already set any variable, so the import does not defend against it.
+//! The import guarantees only that variable values stay data, so no value can
+//! spoof another variable's name or inject code into the session, and that a
+//! broken or interrupted dump imports nothing.
 //!
 //! Failure model and invariants:
 //!
@@ -33,13 +39,24 @@
 //!   candidate names; the shell confirms each one with `${NAME+x}` and prints
 //!   `NAME=value` with its builtin `printf`, NUL-terminated. A multi-line value
 //!   containing a line such as `FAKE=spoofed` nominates `FAKE`, which is then
-//!   dropped unless the code really set it. The only `eval` in the dump code
-//!   receives a name that matched ASCII ranges under `LC_ALL=C`.
+//!   dropped unless the code really set it. A name that some line lists as a
+//!   Bash array is checked with `declare -p`, so a value cannot make an array
+//!   look scalar. The only `eval` in the dump code receives a name that
+//!   matched ASCII ranges under `LC_ALL=C`.
+//! - The `EXIT` trap turns off tracing and removes aliases and functions
+//!   shadowing the commands it runs before it reads any variable, so code
+//!   that left `set -x` on or redefined `printf` neither prints values nor
+//!   rewrites the dump.
 //! - Nothing is imported unless both dumps are complete and well formed:
 //!   framed by fixed header and trailer records, with every variable name
 //!   valid. A shell killed by a signal, a truncated record, a dump above its
-//!   byte bound, or a `printf` the code overrode leaves the session
-//!   unchanged, and the command's status stands.
+//!   byte bound, or a state the trap cannot report (`readonly IFS`,
+//!   `unset PWD`, a replaced `EXIT` trap) leaves the session unchanged, the
+//!   command's status stands, and the executor warns that nothing was
+//!   imported, with the [`MissingState`] reason.
+//! - Each island costs two `set` snapshots and two dump loops, linear in the
+//!   number of set variables: about 10 to 15 ms for a 30-line dotenv file
+//!   under Bash 3.2 on an Apple Silicon Mac.
 //! - Session locals are passed to the shell as single-quoted assignments, so
 //!   sourced code sees the parameters Quirl expands.
 //! - With the session's allexport flag on, the code runs after `set -a`, so
@@ -77,9 +94,11 @@ const SHELL_MAINTAINED_VARIABLES: [&str; 2] = ["_", "SHLVL"];
 
 /// Variables a shell maintains for itself, or that describe the island's
 /// process rather than the session. They never become session locals and are
-/// never removed from the session. Names beginning with `BASH` are excluded
-/// too, because Bash adds such variables between versions.
-const SHELL_BOOKKEEPING_VARIABLES: [&str; 24] = [
+/// never removed from the session. Bash's own `BASH`, `BASHOPTS`, `BASHPID`,
+/// and every `BASH_*` name are excluded too, because Bash adds such variables
+/// between versions; see [`is_bookkeeping`]. Keep the `source` and `eval`
+/// help in `quirl-catalog` in step with this list.
+const SHELL_BOOKKEEPING_VARIABLES: [&str; 25] = [
     "_",
     "SHLVL",
     "PPID",
@@ -100,8 +119,9 @@ const SHELL_BOOKKEEPING_VARIABLES: [&str; 24] = [
     "HISTCMD",
     "SHELLOPTS",
     "POSIXLY_CORRECT",
-    "COLUMNS",
-    "LINES",
+    "BASH",
+    "BASHOPTS",
+    "BASHPID",
     // The working directory reaches the session through `cd`, not as text.
     "PWD",
     "OLDPWD",
@@ -112,8 +132,15 @@ const SHELL_BOOKKEEPING_VARIABLES: [&str; 24] = [
 pub(crate) const RESERVED_PREFIX: &str = "__quirl_";
 
 /// Session locals the island's shell sets itself and treats as read-only,
-/// so passing them in would fail before the user's code runs.
-const SHELL_READONLY_VARIABLES: [&str; 3] = ["PPID", "UID", "EUID"];
+/// so passing them in would stop the island before the user's code runs.
+const SHELL_READONLY_VARIABLES: [&str; 6] = [
+    "PPID",
+    "UID",
+    "EUID",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "BASH_VERSINFO",
+];
 
 /// First record of the final dump.
 const DUMP_HEADER: &[u8] = b"quirl-island-v1";
@@ -128,34 +155,42 @@ const DUMP_TRAILER: &[u8] = b"quirl-island-end";
 /// as quoted data, `@ALLEXPORT@` becomes `set -a; ` when the session exports
 /// every assignment, and `@VARIABLES@` becomes [`VARIABLES_DUMP`].
 ///
-/// The `EXIT` trap first records the status and the code's `IFS` and
-/// `LC_ALL`, then turns off options that would stop the dump (`-e`, `-u`) or
-/// export its own scratch variables (`-a`). The code's functions and options
-/// cannot outlive the shell, so changing them at exit is invisible. Both dumps
-/// run with a newline `IFS` and `LC_ALL=C`, set only after `env -0` has
-/// reported the code's exported values, which
-/// makes Bash's pattern matching byte-wise and roughly 40% faster; the
-/// baseline puts the session's `IFS` and `LC_ALL` back before the code runs.
+/// The `EXIT` trap first records the status, then turns off tracing (`-x`,
+/// `-v`) so the dump never echoes values to standard error, and removes every
+/// alias and any function shadowing a command the dump uses, so code that
+/// redefined `printf` or aliased `eval` cannot rewrite the dump. Special
+/// builtins such as `unset` and `set` cannot be shadowed by functions in
+/// `sh`, and quoting their names bypasses aliases. It then records the code's
+/// `IFS` and `LC_ALL` and turns off options that would stop the dump (`-e`,
+/// `-u`) or export its own scratch variables (`-a`). The code's functions and
+/// options cannot outlive the shell, so changing them at exit is invisible.
+/// Both dumps run with a newline `IFS` and `LC_ALL=C`, set only after `env -0`
+/// has reported the code's exported values, which makes Bash's pattern
+/// matching byte-wise and roughly 40% faster; the baseline puts the session's
+/// `IFS` and `LC_ALL` back before the code runs.
 const ISLAND_SCRIPT: &str = r#"__quirl_dump=$1
 __quirl_baseline=$2
 __quirl_kind=$3
 shift 3
 trap '__quirl_status=$?
+{ \set +x +v; } 2>/dev/null
+\unset -f unalias printf builtin declare 2>/dev/null
+\unalias -a 2>/dev/null
 __quirl_ifs_set=${IFS+x}
 __quirl_ifs=${IFS-}
 __quirl_lc_set=${LC_ALL+x}
 __quirl_lc=${LC_ALL-}
-set +a +e +u
-__quirl_set=$(set)
-{ printf "%s\0" quirl-island-v1 "$PWD"
+\set +a +e +u
+__quirl_set=$(\set)
+{ \printf "%s\0" quirl-island-v1 "$PWD"
 /usr/bin/env -0
 IFS="
 "
-set -f
+\set -f
 LC_ALL=C
 @VARIABLES@
 } >"$__quirl_dump"
-exit "$__quirl_status"' EXIT
+\exit "$__quirl_status"' EXIT
 @LOCALS@
 __quirl_ifs_set=${IFS+x}
 __quirl_ifs=${IFS-}
@@ -171,7 +206,7 @@ LC_ALL=C
 set +f
 case $__quirl_ifs_set in x) IFS=$__quirl_ifs ;; *) unset IFS ;; esac
 case $__quirl_lc_set in x) LC_ALL=$__quirl_lc ;; *) unset LC_ALL ;; esac
-unset __quirl_set __quirl_line __quirl_name __quirl_value __quirl_isset __quirl_ifs __quirl_ifs_set __quirl_lc __quirl_lc_set
+unset __quirl_set __quirl_line __quirl_name __quirl_value __quirl_isset __quirl_arrays __quirl_flags __quirl_ifs __quirl_ifs_set __quirl_lc __quirl_lc_set
 case $__quirl_kind in
 eval) __quirl_code=$1; shift; @ALLEXPORT@eval "$__quirl_code" ;;
 source) __quirl_file=$1; shift; @ALLEXPORT@. "$__quirl_file" ;;
@@ -186,12 +221,22 @@ esac
 /// and the bracket ranges below cover ASCII bytes only, whatever the user's
 /// locale. A line only nominates the name before its first `=`; the name must
 /// be a shell name, and the shell then confirms it is set before printing
-/// the value. Bash lists arrays as
-/// `NAME=(...)`, while every scalar value beginning with `(` is quoted, so
-/// those lines are skipped. `IFS` and `LC_ALL` report the values saved
-/// before the dump replaced them. The code contains no single quote, because it is spliced
-/// into the single-quoted `EXIT` trap.
-const VARIABLES_DUMP: &str = r#"printf "%s\0" quirl-island-variables
+/// the value. `IFS` and `LC_ALL` report the values saved before the dump
+/// replaced them.
+///
+/// Bash lists arrays as `NAME=(...)`, while every scalar value beginning with
+/// `(` is quoted, so those lines are skipped. A line inside a multi-line value
+/// can still nominate an array's name with a scalar-looking value, so the
+/// first pass collects every name some line lists as `NAME=(`, and the second
+/// asks Bash's own `declare -p` whether each such name really is an array.
+/// That costs one subshell per collected name only; Dash has no `declare`, and
+/// no arrays either, so there the check finds a scalar. The code contains no
+/// single quote, because it is spliced into the single-quoted `EXIT` trap.
+const VARIABLES_DUMP: &str = r#"\printf "%s\0" quirl-island-variables
+__quirl_arrays=" "
+for __quirl_line in $__quirl_set
+do case ${__quirl_line#*=} in "("*) __quirl_arrays="$__quirl_arrays${__quirl_line%%=*} " ;; esac
+done
 for __quirl_line in $__quirl_set
 do case $__quirl_line in *=*) ;; *) continue ;; esac
 __quirl_name=${__quirl_line%%=*}
@@ -201,11 +246,16 @@ __quirl_*) continue ;;
 IFS) __quirl_isset=$__quirl_ifs_set __quirl_value=$__quirl_ifs ;;
 LC_ALL) __quirl_isset=$__quirl_lc_set __quirl_value=$__quirl_lc ;;
 *) case ${__quirl_line#*=} in "("*) continue ;; esac
-eval "__quirl_isset=\${$__quirl_name+x} __quirl_value=\${$__quirl_name-}" ;;
+case $__quirl_arrays in *" $__quirl_name "*)
+__quirl_flags=$(\builtin declare -p "$__quirl_name" 2>/dev/null)
+__quirl_flags=${__quirl_flags#declare -}
+case ${__quirl_flags%% *} in *[aA]*) continue ;; esac ;;
 esac
-case $__quirl_isset in x) printf "%s=%s\0" "$__quirl_name" "$__quirl_value" ;; esac
+\eval "__quirl_isset=\${$__quirl_name+x} __quirl_value=\${$__quirl_name-}" ;;
+esac
+case $__quirl_isset in x) \printf "%s=%s\0" "$__quirl_name" "$__quirl_value" ;; esac
 done
-printf "%s\0" quirl-island-end"#;
+\printf "%s\0" quirl-island-end"#;
 
 static ISLAND_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -240,6 +290,33 @@ pub(crate) struct IslandOutcome {
     variables: BTreeMap<OsString, OsString>,
     /// Every scalar variable set before the code ran.
     baseline: BTreeMap<OsString, OsString>,
+}
+
+/// Why an island reported no complete state, so the session imported
+/// nothing from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MissingState {
+    /// The shell stopped before the code ran, so no baseline exists.
+    NoBaseline,
+    /// The shell ended without its `EXIT` trap writing the final dump.
+    NoFinalDump,
+    /// A dump exists but is incomplete or malformed.
+    Malformed,
+}
+
+impl MissingState {
+    /// A short explanation for the warning the session prints.
+    pub(crate) const fn reason(self) -> &'static str {
+        match self {
+            Self::NoBaseline => "the shell stopped before the code ran",
+            Self::NoFinalDump => {
+                "the shell ended before reporting its variables, as when it is killed by a signal, runs `exec`, or the code replaces the `EXIT` trap"
+            }
+            Self::Malformed => {
+                "the shell's report of its variables was incomplete, as after `readonly IFS` or `unset PWD`"
+            }
+        }
+    }
 }
 
 /// How an island changed the session's unexported variables.
@@ -369,16 +446,16 @@ impl IslandState {
         Ok(words)
     }
 
-    /// Read what the island reported, or `None` when it reported nothing
-    /// complete, such as after being killed by a signal.
-    pub(crate) fn outcome(&self) -> Result<Option<IslandOutcome>, ShellError> {
-        let Some(final_dump) = read_dump(&self.dump_path())? else {
-            return Ok(None);
-        };
+    /// Read what the island reported, or why it reported nothing complete,
+    /// such as after being killed by a signal.
+    pub(crate) fn outcome(&self) -> Result<Result<IslandOutcome, MissingState>, ShellError> {
         let Some(baseline) = read_dump(&self.baseline_path())? else {
-            return Ok(None);
+            return Ok(Err(MissingState::NoBaseline));
         };
-        Ok(parse_outcome(&final_dump, &baseline))
+        let Some(final_dump) = read_dump(&self.dump_path())? else {
+            return Ok(Err(MissingState::NoFinalDump));
+        };
+        Ok(parse_outcome(&final_dump, &baseline).ok_or(MissingState::Malformed))
     }
 }
 
@@ -544,7 +621,7 @@ fn os_string(bytes: &[u8]) -> OsString {
 /// which never becomes or removes a session local.
 fn is_bookkeeping(name: &OsStr) -> bool {
     let bytes = name.as_bytes();
-    bytes.starts_with(b"BASH")
+    bytes.starts_with(b"BASH_")
         || bytes.starts_with(RESERVED_PREFIX.as_bytes())
         || SHELL_BOOKKEEPING_VARIABLES
             .iter()
@@ -656,6 +733,12 @@ mod tests {
                 ("UNEXPORTED", "kept"),
                 ("RANDOM", "42"),
                 ("BASH_LINENO", "9"),
+                ("BASH", "/bin/sh"),
+                ("BASHOPTS", "x"),
+                ("BASHPID", "9"),
+                ("BASHFUL", "shy"),
+                ("COLUMNS", "80"),
+                ("LINES", "24"),
                 ("IFS", " \t\n"),
                 ("EMPTY", ""),
             ]),
@@ -677,8 +760,11 @@ mod tests {
         assert_eq!(
             changes.assigned,
             map(&[
+                ("BASHFUL", "shy"),
                 ("CHANGED", "after"),
+                ("COLUMNS", "80"),
                 ("EMPTY", ""),
+                ("LINES", "24"),
                 ("NEW", "hello"),
                 ("UNEXPORTED", "kept"),
             ])
@@ -692,12 +778,14 @@ mod tests {
         let value = OsString::from("it's $(rm -rf /)");
         let invalid = OsString::from("not-a-name");
         let readonly = OsString::from("PPID");
+        let shell_options = OsString::from("SHELLOPTS");
         let reserved = OsString::from("__quirl_baseline");
         let rendered = local_assignments(
             [
                 (&name, &value),
                 (&invalid, &value),
                 (&readonly, &value),
+                (&shell_options, &value),
                 (&reserved, &value),
             ]
             .into_iter(),
@@ -753,8 +841,11 @@ mod tests {
     fn every_reference_shell_reports_the_same_local_changes() {
         // Spoofed names inside values, hostile quoting, empty values, unset
         // locals, a changed IFS, and forms that must stay inside: a function,
-        // a readonly attribute, and (in Bash only) an array.
-        let code = "QUIRL_MULTI='a\nQUIRL_FAKE=spoofed\nQUIRL_KEPT=spoofed'\n\
+        // a readonly attribute, and (in Bash only) an array. The multi-line
+        // value also nominates the array with a scalar-looking line and marks
+        // a real scalar with an array-looking one; neither may change the
+        // result.
+        let code = "QUIRL_MULTI='a\nQUIRL_FAKE=spoofed\nQUIRL_KEPT=spoofed\nQUIRL_ARRAY=spoofed\nQUIRL_EMPTY=(x'\n\
                     QUIRL_HOSTILE='$(id) `id` \\'\n\
                     QUIRL_EMPTY=\n\
                     unset QUIRL_GONE\n\
@@ -788,7 +879,10 @@ mod tests {
                     ("QUIRL_EMPTY", ""),
                     ("QUIRL_HOSTILE", "$(id) `id` \\"),
                     ("QUIRL_KEPT", "kept"),
-                    ("QUIRL_MULTI", "a\nQUIRL_FAKE=spoofed\nQUIRL_KEPT=spoofed"),
+                    (
+                        "QUIRL_MULTI",
+                        "a\nQUIRL_FAKE=spoofed\nQUIRL_KEPT=spoofed\nQUIRL_ARRAY=spoofed\nQUIRL_EMPTY=(x"
+                    ),
                     ("QUIRL_RO", "ro"),
                 ]),
                 "{shell}"
@@ -831,18 +925,32 @@ mod tests {
 
     #[test]
     fn exported_ifs_and_lc_all_keep_the_values_the_code_exported() {
-        let code = "export IFS=: LC_ALL=POSIX".to_owned();
-        let (state, status) = run_island(IslandKind::Eval, &[code], &BTreeMap::new(), false);
-        assert!(status.success());
-        let outcome = state.outcome().unwrap().unwrap();
-        assert_eq!(
-            outcome.exported.get(OsStr::new("IFS")),
-            Some(&OsString::from(":"))
-        );
-        assert_eq!(
-            outcome.exported.get(OsStr::new("LC_ALL")),
-            Some(&OsString::from("POSIX"))
-        );
+        // Explicit export, allexport inside the code, and the session's
+        // allexport flag all export the code's value, not the dump's.
+        for (code, allexport) in [
+            ("export IFS=: LC_ALL=POSIX", false),
+            ("set -a; IFS=: LC_ALL=POSIX", false),
+            ("IFS=: LC_ALL=POSIX", true),
+        ] {
+            let (state, status) = run_island(
+                IslandKind::Eval,
+                &[code.to_owned()],
+                &BTreeMap::new(),
+                allexport,
+            );
+            assert!(status.success(), "{code}");
+            let outcome = state.outcome().unwrap().unwrap();
+            assert_eq!(
+                outcome.exported.get(OsStr::new("IFS")),
+                Some(&OsString::from(":")),
+                "{code}"
+            );
+            assert_eq!(
+                outcome.exported.get(OsStr::new("LC_ALL")),
+                Some(&OsString::from("POSIX")),
+                "{code}"
+            );
+        }
     }
 
     #[test]
@@ -929,15 +1037,93 @@ mod tests {
     }
 
     #[test]
-    fn overridden_printf_or_a_killed_shell_reports_nothing() {
-        for code in ["printf() { :; }", "printf() { echo spoof; }", "kill -9 $$"] {
+    fn overridden_commands_and_aliases_cannot_rewrite_the_dump() {
+        // Each override would empty, spoof, or freeze the dump if the trap
+        // used it: a silent or forwarding `printf`, an `eval` alias that
+        // leaves the previous value in place, and a shadowed `declare`.
+        let forwarding = "printf() { if [ \"$2\" = QUIRL_SECRET ]; then \
+                          command printf \"$1\" \"$2\" spoofed; else command printf \"$@\"; fi; }";
+        let locals = map(&[("QUIRL_KEPT", "keep")]);
+        for override_code in [
+            "printf() { :; }",
+            "printf() { echo spoof; }",
+            forwarding,
+            "alias eval=: printf=: set=:",
+            "declare() { :; }; builtin() { :; }",
+        ] {
+            let code = format!("QUIRL_SECRET=real\n{override_code}\nQUIRL_NEW=1");
+            let (state, status) = run_island(IslandKind::Eval, &[code], &locals, false);
+            assert!(status.success(), "{override_code}");
+            let outcome = state.outcome().unwrap().unwrap();
+            let changes = outcome.local_changes(&BTreeMap::new(), &locals);
+            assert_eq!(
+                changes.assigned,
+                map(&[("QUIRL_NEW", "1"), ("QUIRL_SECRET", "real")]),
+                "{override_code}"
+            );
+        }
+    }
+
+    #[test]
+    fn tracing_left_on_by_the_code_never_prints_variables() {
+        let locals = map(&[("QUIRL_SESSION_SECRET", "hunter2")]);
+        let state = IslandState::create().unwrap();
+        let code = "QUIRL_CODE_SECRET=swordfish; set -xv".to_owned();
+        let words = state
+            .command_words(IslandKind::Eval, &[code], locals.iter(), false)
+            .unwrap();
+        let output = std::process::Command::new(POSIX_SHELL_PATH)
+            .args(&words[1..])
+            .env_remove("LC_ALL")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("hunter2"), "{stderr}");
+        assert!(!stderr.contains("swordfish"), "{stderr}");
+        assert!(state.outcome().unwrap().is_ok());
+    }
+
+    #[test]
+    fn reserved_and_shell_readonly_locals_leave_the_wrapper_working() {
+        let locals = map(&[
+            ("__quirl_dump", "/nonexistent/dump"),
+            ("__quirl_baseline", "/nonexistent/baseline"),
+            ("__quirl_kind", "x"),
+            ("SHELLOPTS", "x"),
+            ("BASHOPTS", "x"),
+            ("BASH_VERSINFO", "x"),
+            ("UID", "0"),
+        ]);
+        let (state, status) = run_island(
+            IslandKind::Eval,
+            &["QUIRL_RAN=1".to_owned()],
+            &locals,
+            false,
+        );
+        assert!(status.success());
+        let outcome = state.outcome().unwrap().unwrap();
+        assert_eq!(
+            outcome.local_changes(&BTreeMap::new(), &locals).assigned,
+            map(&[("QUIRL_RAN", "1")])
+        );
+    }
+
+    #[test]
+    fn a_killed_or_broken_shell_reports_why_nothing_came_back() {
+        for (code, missing) in [
+            ("kill -9 $$", MissingState::NoFinalDump),
+            ("trap : EXIT", MissingState::NoFinalDump),
+            ("readonly IFS", MissingState::Malformed),
+            ("unset PWD", MissingState::Malformed),
+        ] {
             let (state, _) = run_island(
                 IslandKind::Eval,
                 &[code.to_owned()],
                 &BTreeMap::new(),
                 false,
             );
-            assert_eq!(state.outcome().unwrap(), None, "{code}");
+            assert_eq!(state.outcome().unwrap(), Err(missing), "{code}");
         }
     }
 

@@ -54,32 +54,48 @@ pub(crate) fn export_operands(words: &[String]) -> Result<ExportOperands, ShellE
 
 /// The allexport state one `set` command selects.
 ///
-/// Only `set -a` and `set +a` are native; when several are given, the last
-/// wins, as in `sh`. Every other form is refused with a diagnostic rather
+/// Only the allexport option is native: `set -a`, `set +a`,
+/// `set -o allexport`, and `set +o allexport`; when several are given, the
+/// last wins, as in `sh`. Every other form is refused with a diagnostic rather
 /// than run as an external program, which would fail with "not found".
 pub(crate) fn set_allexport_operand(words: &[String]) -> Result<bool, ShellError> {
-    let mut enabled = None;
-    for operand in words.iter().skip(1) {
-        enabled = match operand.as_str() {
-            "-a" => Some(true),
-            "+a" => Some(false),
-            _ => None,
-        };
-        if enabled.is_none() {
-            break;
-        }
-    }
-    enabled.ok_or_else(|| {
+    quirl_syntax::native_set_allexport(words).ok_or_else(|| {
         let command = words.join(" ");
         ShellError::new(
             ErrorCode::InvalidArgument,
-            format!("`{command}` is not supported; Quirl's `set` only takes `-a` or `+a`"),
+            format!(
+                "`{command}` is not supported; Quirl's `set` only takes `-a`, `+a`, `-o allexport`, or `+o allexport`"
+            ),
         )
         .with_command(command)
         .with_help(
             "Use `set -a` to export later assignments and `set +a` to stop; run other shell options inside `sh -c '...'` or a `bash { ... }` island",
         )
     })
+}
+
+/// Refuse `set` as a stage of a multi-command pipeline. It changes session
+/// state, which a pipeline stage cannot do, and without this check it would
+/// run as an external program and fail with "not found".
+pub(crate) fn refuse_set_in_pipeline(
+    commands: &[quirl_syntax::SimpleCommand],
+    source: &str,
+) -> Result<(), ShellError> {
+    let in_pipeline = commands.len() > 1
+        && commands
+            .iter()
+            .any(|command| command.words.first().is_some_and(|name| name == "set"));
+    if !in_pipeline {
+        return Ok(());
+    }
+    Err(ShellError::new(
+        ErrorCode::InvalidArgument,
+        "`set` cannot run inside a pipeline",
+    )
+    .with_command(source)
+    .with_help(
+        "Run `set -a` or `set +a` as its own command, for example `set -a; source .env; set +a`; use `env` to list exported variables",
+    ))
 }
 
 /// Operands of one `unset [-v | -f] NAME...` command.
