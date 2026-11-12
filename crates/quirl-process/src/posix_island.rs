@@ -142,6 +142,18 @@ const SHELL_READONLY_VARIABLES: [&str; 6] = [
     "BASH_VERSINFO",
 ];
 
+/// Whether the island's shell owns `name`, so assigning it at `@LOCALS@`
+/// would stop the island before the user's code runs. Bash 3.2 exits with
+/// status 127 and no message on an assignment to `GROUPS`, `FUNCNAME`, or
+/// one of its `BASH_*` arrays such as `BASH_ARGV`, so every `BASH_*` name is
+/// skipped rather than only those known to be fatal today.
+fn is_shell_special_variable(name: &str) -> bool {
+    SHELL_READONLY_VARIABLES.contains(&name)
+        || name == "GROUPS"
+        || name == "FUNCNAME"
+        || name.starts_with("BASH_")
+}
+
 /// First record of the final dump.
 const DUMP_HEADER: &[u8] = b"quirl-island-v1";
 /// Record that opens a variable section, in both dumps.
@@ -158,11 +170,15 @@ const DUMP_TRAILER: &[u8] = b"quirl-island-end";
 /// The `EXIT` trap first records the status, then turns off tracing (`-x`,
 /// `-v`) so the dump never echoes values to standard error, and removes every
 /// alias and any function shadowing a command the dump uses, so code that
-/// redefined `printf` or aliased `eval` cannot rewrite the dump. Special
-/// builtins such as `unset` and `set` cannot be shadowed by functions in
-/// `sh`, and quoting their names bypasses aliases. It then records the code's
-/// `IFS` and `LC_ALL` and turns off options that would stop the dump (`-e`,
-/// `-u`) or export its own scratch variables (`-a`). The code's functions and
+/// redefined `printf` or aliased `eval` cannot rewrite the dump. In POSIX
+/// mode, special builtins such as `unset` and `set` cannot be shadowed by
+/// functions, and quoting their names bypasses aliases. Code that leaves
+/// POSIX mode (`set +o posix`) and then redefines `set`, or marks a function
+/// read-only with `readonly -f`, can still defeat this scrub; such code is
+/// trusted, and the reader rejects the empty or malformed dump it leaves. It
+/// then records the code's `IFS` and `LC_ALL` and turns off options that
+/// would stop the dump (`-e`, `-u`) or export its own scratch variables
+/// (`-a`). The code's functions and
 /// options cannot outlive the shell, so changing them at exit is invisible.
 /// Both dumps run with a newline `IFS` and `LC_ALL=C`, set only after `env -0`
 /// has reported the code's exported values, which makes Bash's pattern
@@ -302,6 +318,8 @@ pub(crate) enum MissingState {
     NoFinalDump,
     /// A dump exists but is incomplete or malformed.
     Malformed,
+    /// A dump exceeds its byte bound, so it was not read.
+    Oversized,
 }
 
 impl MissingState {
@@ -315,6 +333,7 @@ impl MissingState {
             Self::Malformed => {
                 "the shell's report of its variables was incomplete, as after `readonly IFS` or `unset PWD`"
             }
+            Self::Oversized => "the shell's report of its variables exceeded its size limit",
         }
     }
 }
@@ -449,11 +468,13 @@ impl IslandState {
     /// Read what the island reported, or why it reported nothing complete,
     /// such as after being killed by a signal.
     pub(crate) fn outcome(&self) -> Result<Result<IslandOutcome, MissingState>, ShellError> {
-        let Some(baseline) = read_dump(&self.baseline_path())? else {
-            return Ok(Err(MissingState::NoBaseline));
+        let baseline = match read_dump(&self.baseline_path(), MissingState::NoBaseline)? {
+            Ok(baseline) => baseline,
+            Err(missing) => return Ok(Err(missing)),
         };
-        let Some(final_dump) = read_dump(&self.dump_path())? else {
-            return Ok(Err(MissingState::NoFinalDump));
+        let final_dump = match read_dump(&self.dump_path(), MissingState::NoFinalDump)? {
+            Ok(final_dump) => final_dump,
+            Err(missing) => return Ok(Err(missing)),
         };
         Ok(parse_outcome(&final_dump, &baseline).ok_or(MissingState::Malformed))
     }
@@ -466,12 +487,17 @@ impl Drop for IslandState {
     }
 }
 
-/// Read one dump file within [`DUMP_BYTES_MAX`], or `None` when the shell
-/// never wrote it.
-fn read_dump(path: &Path) -> Result<Option<Vec<u8>>, ShellError> {
+/// Read one dump file within [`DUMP_BYTES_MAX`]. A file the shell never
+/// wrote reports `absent`; a file above the bound reports
+/// [`MissingState::Oversized`], so the command's status stands and the
+/// session only warns, as for any other dump it cannot import.
+fn read_dump(
+    path: &Path,
+    absent: MissingState,
+) -> Result<Result<Vec<u8>, MissingState>, ShellError> {
     let file = match File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Err(absent)),
         Err(error) => {
             return Err(ShellError::new(
                 ErrorCode::Io,
@@ -489,16 +515,9 @@ fn read_dump(path: &Path) -> Result<Option<Vec<u8>>, ShellError> {
             .with_help("Retry the command")
     })?;
     if bytes.len() > DUMP_BYTES_MAX {
-        return Err(ShellError::new(
-            ErrorCode::ResourceLimit,
-            "the POSIX shell island's variables exceed their limit",
-        )
-        .with_context(format!(
-            "limit {DUMP_BYTES_MAX} bytes; observed more than {DUMP_BYTES_MAX}"
-        ))
-        .with_help("Set fewer or shorter variables in the sourced code"));
+        return Ok(Err(MissingState::Oversized));
     }
-    Ok(Some(bytes))
+    Ok(Ok(bytes))
 }
 
 /// `sh`'s `.` searches only `PATH` for a name without a slash, but people
@@ -520,7 +539,7 @@ fn local_assignments<'a>(locals: impl Iterator<Item = (&'a OsString, &'a OsStrin
         };
         // A reserved name would overwrite the wrapper's own dump paths.
         let reserved = name.starts_with(RESERVED_PREFIX);
-        if !is_shell_name(name) || reserved || SHELL_READONLY_VARIABLES.contains(&name) {
+        if !is_shell_name(name) || reserved || is_shell_special_variable(name) {
             continue;
         }
         rendered.push_str(name);
@@ -567,6 +586,13 @@ fn parse_outcome(final_dump: &[u8], baseline: &[u8]) -> Option<IslandOutcome> {
         exported.insert(os_string(name), os_string(value));
     }
     let variables = parse_variables(&mut records)?;
+    // A real shell always has variables, such as `PWD` and `IFS`. An empty
+    // section means something other than the dump code answered, as when
+    // code outside POSIX mode replaced `set` with a function, and importing
+    // it would remove every session local.
+    if variables.is_empty() {
+        return None;
+    }
 
     let mut baseline_records = dump_records(baseline)?;
     if baseline_records.next()? != VARIABLES_HEADER {
@@ -706,6 +732,12 @@ mod tests {
         );
         assert_eq!(
             parse_outcome(&final_dump("", "B=2\0"), b"B=1\0quirl-island-end\0"),
+            None
+        );
+        // A real shell always has variables; an empty section, as when code
+        // outside POSIX mode replaced `set`, must not remove every local.
+        assert_eq!(
+            parse_outcome(&final_dump("A=1\0", ""), EMPTY_BASELINE),
             None
         );
         let mut trailing = valid.clone();
@@ -1094,6 +1126,13 @@ mod tests {
             ("BASHOPTS", "x"),
             ("BASH_VERSINFO", "x"),
             ("UID", "0"),
+            // Bash 3.2 exits with status 127 and no message on these.
+            ("GROUPS", "x"),
+            ("FUNCNAME", "x"),
+            ("BASH_ARGC", "x"),
+            ("BASH_ARGV", "x"),
+            ("BASH_LINENO", "x"),
+            ("BASH_SOURCE", "x"),
         ]);
         let (state, status) = run_island(
             IslandKind::Eval,
@@ -1125,6 +1164,38 @@ mod tests {
             );
             assert_eq!(state.outcome().unwrap(), Err(missing), "{code}");
         }
+    }
+
+    #[test]
+    fn a_shell_that_replaces_set_outside_posix_mode_reports_a_malformed_dump() {
+        // Outside POSIX mode Bash lets a function shadow `set`, and a
+        // read-only function survives the trap's scrub. The empty variable
+        // section must not read as "the code unset every local".
+        let code = "set +o posix 2>/dev/null; set() { :; }; readonly -f set 2>/dev/null";
+        let locals = map(&[("KEEP", "1")]);
+        let (state, _) = run_island(IslandKind::Eval, &[code.to_owned()], &locals, false);
+        match state.outcome().unwrap() {
+            Ok(outcome) => assert!(
+                outcome
+                    .local_changes(&BTreeMap::new(), &locals)
+                    .removed
+                    .is_empty(),
+                "a shell that kept POSIX `set` must report its locals"
+            ),
+            Err(missing) => assert_eq!(missing, MissingState::Malformed),
+        }
+    }
+
+    #[test]
+    fn an_oversized_dump_reports_missing_state_instead_of_failing() {
+        let state = IslandState::create().unwrap();
+        fs::write(state.baseline_path(), EMPTY_BASELINE).unwrap();
+        let file = File::create(state.dump_path()).unwrap();
+        let oversized = u64::try_from(DUMP_BYTES_MAX + 1).unwrap();
+        file.set_len(oversized).unwrap();
+        assert_eq!(state.outcome().unwrap(), Err(MissingState::Oversized));
+        fs::write(state.baseline_path(), vec![b'x'; DUMP_BYTES_MAX + 1]).unwrap();
+        assert_eq!(state.outcome().unwrap(), Err(MissingState::Oversized));
     }
 
     #[test]

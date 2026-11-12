@@ -51,8 +51,11 @@ every name some line lists as `NAME=(` is checked with Bash's own
 `declare -p`, and real arrays are skipped. The `EXIT` trap first turns off
 `-x` and `-v`, so tracing the code left on never prints values, and removes
 every alias and any function shadowing `printf`, `unalias`, `builtin`, or
-`declare`; the special builtins it also uses cannot be shadowed by functions in
-`sh`, and it quotes their names against aliases. It then saves `IFS` and
+`declare`; in POSIX mode the special builtins it also uses cannot be shadowed
+by functions, and it quotes their names against aliases. Code that leaves POSIX
+mode and redefines `set`, or protects a function with `readonly -f`, can defeat
+that scrub; such code is inside the trust boundary below, and a final dump with
+no variables, which a real shell never writes, counts as malformed. It then saves `IFS` and
 `LC_ALL` and turns off `-a`, `-e`, and `-u` so options the code left on cannot
 stop the dump. `env -0` reports the exports before the dump changes `IFS`, so
 an exported `IFS` keeps the code's value. Both dumps run under `LC_ALL=C`,
