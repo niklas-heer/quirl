@@ -9483,6 +9483,30 @@ mod platform {
         }
 
         #[test]
+        fn locals_beyond_the_argument_size_limit_still_reach_the_next_island() {
+            // Linux rejects any single exec argument above 128 KiB, so 200 KiB
+            // of locals must not travel inside the `sh -c` script.
+            let files = SourcedFiles::new(&[("big", "")]);
+            let value = "v".repeat(1024);
+            let mut contents = String::new();
+            for index in 0..200 {
+                contents.push_str(&format!("QUIRL_BIG_{index}={value}\n"));
+            }
+            fs::write(files.directory.join("big"), contents).unwrap();
+            let mut executor = NativeExecutor::default();
+            let outcome = executor.execute_capture(&files.program(". @big")).unwrap();
+            assert_eq!(outcome.status, 0);
+            let outcome = executor
+                .execute_capture(
+                    "eval 'printf \"%s %s\" \"${#QUIRL_BIG_0}\" \"${#QUIRL_BIG_199}\"'",
+                )
+                .unwrap();
+            assert_eq!(outcome.status, 0, "{:?}", outcome.stderr);
+            assert_eq!(outcome.stdout.as_deref(), Some("1024 1024"));
+            assert_eq!(outcome.stderr.as_deref(), Some(""));
+        }
+
+        #[test]
         fn reserved_or_shell_readonly_locals_never_break_an_island() {
             let mut executor = NativeExecutor::default();
             executor

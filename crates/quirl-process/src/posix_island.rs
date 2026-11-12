@@ -57,8 +57,12 @@
 //! - Each island costs two `set` snapshots and two dump loops, linear in the
 //!   number of set variables: about 10 to 15 ms for a 30-line dotenv file
 //!   under Bash 3.2 on an Apple Silicon Mac.
-//! - Session locals are passed to the shell as single-quoted assignments, so
-//!   sourced code sees the parameters Quirl expands.
+//! - Session locals reach the shell as single-quoted assignments in a third
+//!   private (0600) file in the same directory, which the wrapper reads with
+//!   `.` before the code runs, so sourced code sees the parameters Quirl
+//!   expands. A file rather than the `sh -c` script keeps large sessions
+//!   below the kernel's per-argument limit (128 KiB on Linux), and the
+//!   locals are bounded by [`LOCALS_BYTES_MAX`].
 //! - With the session's allexport flag on, the code runs after `set -a`, so
 //!   its bare assignments come back exported, as `set -a; source .env` does
 //!   in Bash.
@@ -68,10 +72,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fs::{self, DirBuilder, File},
-    io::Read,
+    io::{Read, Write},
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
-        fs::DirBuilderExt,
+        fs::{DirBuilderExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -87,6 +91,10 @@ pub(crate) const POSIX_SHELL_PATH: &str = "/bin/sh";
 const DUMP_BYTES_MAX: usize = crate::SESSION_ENVIRONMENT_BYTES_MAX
     .saturating_mul(2)
     .saturating_add(64 * 1024);
+
+/// Largest total of session local name and value bytes passed to an island,
+/// the same bound the session applies to its retained environment.
+const LOCALS_BYTES_MAX: usize = crate::SESSION_ENVIRONMENT_BYTES_MAX;
 
 /// Exported variables a shell maintains for itself; importing them would
 /// describe the island rather than the session.
@@ -142,7 +150,7 @@ const SHELL_READONLY_VARIABLES: [&str; 6] = [
     "BASH_VERSINFO",
 ];
 
-/// Whether the island's shell owns `name`, so assigning it at `@LOCALS@`
+/// Whether the island's shell owns `name`, so assigning it in the locals file
 /// would stop the island before the user's code runs. Bash 3.2 exits with
 /// status 127 and no message on an assignment to `GROUPS`, `FUNCNAME`, or
 /// one of its `BASH_*` arrays such as `BASH_ARGV`, so every `BASH_*` name is
@@ -162,10 +170,11 @@ const VARIABLES_HEADER: &[u8] = b"quirl-island-variables";
 const DUMP_TRAILER: &[u8] = b"quirl-island-end";
 
 /// Wrapper run by `sh -c`. Positional parameters are the final dump path,
-/// the baseline path, the island kind, the code or file, then arguments for
-/// sourced code. The session's local variables are spliced in at `@LOCALS@`
-/// as quoted data, `@ALLEXPORT@` becomes `set -a; ` when the session exports
-/// every assignment, and `@VARIABLES@` becomes [`VARIABLES_DUMP`].
+/// the baseline path, the locals file, the island kind, the code or file,
+/// then arguments for sourced code. The locals file holds the session's local
+/// variables as quoted assignments and is read with `.` before anything
+/// else, `@ALLEXPORT@` becomes `set -a; ` when the session exports every
+/// assignment, and `@VARIABLES@` becomes [`VARIABLES_DUMP`].
 ///
 /// The `EXIT` trap first records the status, then turns off tracing (`-x`,
 /// `-v`) so the dump never echoes values to standard error, and removes every
@@ -186,8 +195,9 @@ const DUMP_TRAILER: &[u8] = b"quirl-island-end";
 /// `IFS` and `LC_ALL` back before the code runs.
 const ISLAND_SCRIPT: &str = r#"__quirl_dump=$1
 __quirl_baseline=$2
-__quirl_kind=$3
-shift 3
+__quirl_locals=$3
+__quirl_kind=$4
+shift 4
 trap '__quirl_status=$?
 { \set +x +v; } 2>/dev/null
 \unset -f unalias printf builtin declare 2>/dev/null
@@ -207,7 +217,7 @@ LC_ALL=C
 @VARIABLES@
 } >"$__quirl_dump"
 \exit "$__quirl_status"' EXIT
-@LOCALS@
+. "$__quirl_locals"
 __quirl_ifs_set=${IFS+x}
 __quirl_ifs=${IFS-}
 __quirl_lc_set=${LC_ALL+x}
@@ -222,7 +232,7 @@ LC_ALL=C
 set +f
 case $__quirl_ifs_set in x) IFS=$__quirl_ifs ;; *) unset IFS ;; esac
 case $__quirl_lc_set in x) LC_ALL=$__quirl_lc ;; *) unset LC_ALL ;; esac
-unset __quirl_set __quirl_line __quirl_name __quirl_value __quirl_isset __quirl_arrays __quirl_flags __quirl_ifs __quirl_ifs_set __quirl_lc __quirl_lc_set
+unset __quirl_locals __quirl_set __quirl_line __quirl_name __quirl_value __quirl_isset __quirl_arrays __quirl_flags __quirl_ifs __quirl_ifs_set __quirl_lc __quirl_lc_set
 case $__quirl_kind in
 eval) __quirl_code=$1; shift; @ALLEXPORT@eval "$__quirl_code" ;;
 source) __quirl_file=$1; shift; @ALLEXPORT@. "$__quirl_file" ;;
@@ -412,10 +422,15 @@ impl IslandState {
         self.directory.join("baseline")
     }
 
+    fn locals_path(&self) -> PathBuf {
+        self.directory.join("locals")
+    }
+
     /// Command words that run `kind` with `operands` in `/bin/sh`.
     ///
     /// `operands` are the builtin's arguments after its name. `locals` are the
-    /// session's unexported variables, already validated as shell names.
+    /// session's unexported variables, already validated as shell names;
+    /// they are written to the private locals file, never into the words.
     /// `allexport` runs the code after `set -a`.
     pub(crate) fn command_words<'a>(
         &self,
@@ -432,10 +447,12 @@ impl IslandState {
         };
         let dump = utf8_path(self.dump_path())?;
         let baseline = utf8_path(self.baseline_path())?;
+        let locals_path = self.locals_path();
+        write_private_file(&locals_path, local_assignments(locals)?.as_bytes())?;
+        let locals_path = utf8_path(locals_path)?;
         let script = ISLAND_SCRIPT
             .replace("@VARIABLES@", VARIABLES_DUMP)
-            .replace("@ALLEXPORT@", if allexport { "set -a; " } else { "" })
-            .replace("@LOCALS@", &local_assignments(locals));
+            .replace("@ALLEXPORT@", if allexport { "set -a; " } else { "" });
         let mut words = vec![
             POSIX_SHELL_PATH.to_owned(),
             "-c".to_owned(),
@@ -443,6 +460,7 @@ impl IslandState {
             "quirl".to_owned(),
             dump,
             baseline,
+            locals_path,
         ];
         match kind {
             IslandKind::Eval => {
@@ -529,10 +547,31 @@ fn source_operand(file: &str) -> String {
     file.to_owned()
 }
 
+/// Create `path` readable only by this user and write `bytes` to it. The
+/// file must not exist yet, so a planted file or link is never followed.
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ShellError> {
+    let io_error = |error: std::io::Error| {
+        ShellError::new(ErrorCode::Io, "could not prepare a POSIX shell island")
+            .with_context(format!("{}: {error}", path.display()))
+            .with_help("Check that the temporary directory is writable")
+    };
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(io_error)?;
+    file.write_all(bytes).map_err(io_error)
+}
+
 /// Render locals as `NAME='value'` lines. Names are validated identifiers
 /// and every value is single-quoted, so no session data becomes code.
-fn local_assignments<'a>(locals: impl Iterator<Item = (&'a OsString, &'a OsString)>) -> String {
+/// Fails when the passed names and values exceed [`LOCALS_BYTES_MAX`].
+fn local_assignments<'a>(
+    locals: impl Iterator<Item = (&'a OsString, &'a OsString)>,
+) -> Result<String, ShellError> {
     let mut rendered = String::new();
+    let mut passed_bytes = 0_usize;
     for (name, value) in locals {
         let (Some(name), Some(value)) = (name.to_str(), value.to_str()) else {
             continue;
@@ -542,12 +581,25 @@ fn local_assignments<'a>(locals: impl Iterator<Item = (&'a OsString, &'a OsStrin
         if !is_shell_name(name) || reserved || is_shell_special_variable(name) {
             continue;
         }
+        passed_bytes = passed_bytes
+            .saturating_add(name.len())
+            .saturating_add(value.len());
+        if passed_bytes > LOCALS_BYTES_MAX {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                "session variables are too large to pass to a POSIX shell island",
+            )
+            .with_context(format!(
+                "limit {LOCALS_BYTES_MAX} bytes; at least {passed_bytes} bytes of unexported variables"
+            ))
+            .with_help("Unset large unexported variables before `eval` or `source`"));
+        }
         rendered.push_str(name);
         rendered.push_str("='");
         rendered.push_str(&value.replace('\'', r"'\''"));
         rendered.push_str("'\n");
     }
-    rendered
+    Ok(rendered)
 }
 
 /// The NUL-terminated records of a dump, or `None` when the last record is
@@ -821,8 +873,42 @@ mod tests {
                 (&reserved, &value),
             ]
             .into_iter(),
-        );
+        )
+        .unwrap();
         assert_eq!(rendered, "GREETING='it'\\''s $(rm -rf /)'\n");
+    }
+
+    #[test]
+    fn locals_travel_in_a_private_file_and_never_in_the_command_words() {
+        use std::os::unix::fs::PermissionsExt;
+        let state = IslandState::create().unwrap();
+        let locals = BTreeMap::from([(OsString::from("QUIRL_SECRET"), OsString::from("v'1"))]);
+        let words = state
+            .command_words(IslandKind::Eval, &["true".to_owned()], locals.iter(), false)
+            .unwrap();
+        assert!(words.iter().all(|word| !word.contains("QUIRL_SECRET")));
+        let metadata = fs::metadata(state.locals_path()).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::read_to_string(state.locals_path()).unwrap(),
+            "QUIRL_SECRET='v'\\''1'\n"
+        );
+        let directory = state.directory.clone();
+        drop(state);
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn locals_above_the_session_bound_fail_with_a_resource_limit() {
+        let half = "x".repeat(LOCALS_BYTES_MAX / 2);
+        let (first, second) = (OsString::from("QUIRL_A"), OsString::from("QUIRL_B"));
+        let value = OsString::from(half);
+        let error =
+            local_assignments([(&first, &value), (&second, &value)].into_iter()).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        // At the bound exactly, the locals still pass.
+        let fits = OsString::from("x".repeat(LOCALS_BYTES_MAX - "QUIRL_A".len()));
+        assert!(local_assignments([(&first, &fits)].into_iter()).is_ok());
     }
 
     #[test]
