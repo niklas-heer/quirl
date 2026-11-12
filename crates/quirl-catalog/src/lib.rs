@@ -2802,7 +2802,9 @@ impl Catalog {
                     preceding.get(..option_start)?.trim_end(),
                 )
             };
-        if !option_name.starts_with('-') {
+        // `+` spells the off form of a shell option, as in `set +o`; only
+        // names the command declares below can match either way.
+        if !option_name.starts_with(['-', '+']) {
             return None;
         }
         let command = self
@@ -3809,6 +3811,15 @@ mod tests {
         let equals = Catalog::builtin().complete("quirl index build --format=j", 28);
         assert_eq!(equals[0].value, "json");
         assert_eq!(equals[0].replace_start, 27);
+    }
+
+    #[test]
+    fn declared_plus_options_complete_their_static_values() {
+        for line in ["set -o al", "set +o al"] {
+            let completions = Catalog::builtin().complete(line, line.len());
+            assert_eq!(completions[0].value, "allexport", "{line}");
+            assert_eq!(completions[0].replace_start, "set +o ".len(), "{line}");
+        }
     }
 
     #[test]
