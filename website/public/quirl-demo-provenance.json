@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "quirl_version": "0.6.1",
-  "source_commit": "d09b2da951998108f58ac05216ad33722c4e0494",
+  "quirl_version": "0.7.0",
+  "source_commit": "bbfc8259c7cdea2044b1d804f76a388aacb39b31",
   "target": "aarch64-apple-darwin",
   "source_dirty": false,
-  "binary_bytes": 10878192,
-  "binary_sha256": "7eb0d9af0e6c985a1a8e99e41b5e0fd15399fa684d0a7f48046d7c95d7ab0383",
+  "binary_bytes": 10894768,
+  "binary_sha256": "c2ddc1772bf4b8540426ff8857558078681f2bbf6a7be2c9f616e94b30c99a6c",
   "vhs_version": "0.11.0",
   "recorded_recipe_sha256": "388bffec9da24bd9bb9bb2d174c4e4cd6dd69150247642a61e60812c4ff3145c",
   "recipe_change": "None; recorded the checked-in scripts/demo.tape and scripts/screenshots.tape through scripts/record-demo.sh.",
@@ -17,31 +17,31 @@
   },
   "width": 1200,
   "height": 720,
-  "duration_seconds": 70.12,
+  "duration_seconds": 67.68,
   "media": {
     "gif": {
       "source_file": "assets/quirl-demo.gif",
       "publication_file": "assets/quirl-demo.gif",
-      "bytes": 1848147,
-      "sha256": "cf429077a8bec60cb19f6fa68b671f54c27a5d6eee8e6fe78037b0d1abcbf3e7"
+      "bytes": 1571295,
+      "sha256": "5cedf707b8871f9ee9ff9b90e69e2998235167e7d5a8d0edead009067d9363ba"
     },
     "mp4": {
       "source_file": "website/public/quirl-demo.mp4",
       "publication_file": "website/public/quirl-demo.mp4",
-      "bytes": 909259,
-      "sha256": "e2394ec93f8059d4345040340ac3cc56276f89b8773f40fe0b4cdcaba48a3d8c"
+      "bytes": 857616,
+      "sha256": "c6546e432b0499f660c33f9dba793d21d1be2a69305a2fcaa037f6ef0432758f"
     },
     "webm": {
       "source_file": "website/public/quirl-demo.webm",
       "publication_file": "website/public/quirl-demo.webm",
-      "bytes": 1052503,
-      "sha256": "7b3444354ff902a2999f7d5a8c0e7cd63b87cf2dd7495e7379d446dbdeba173c"
+      "bytes": 996797,
+      "sha256": "080bb1008453329edc7c255c210e27dbbeff77962daa033332c7a0ba67447123"
     },
     "poster": {
       "source_file": "website/public/quirl-demo-poster.png",
       "publication_file": "website/public/quirl-demo-poster.png",
-      "bytes": 123608,
-      "sha256": "a5a93d7c8d562d8bcae5add4fd4ea6f299ca75d9ebf1410e1de288478ce570d2"
+      "bytes": 123930,
+      "sha256": "430c247c8d67ab9f677b8d921a925fd6886a2e3b59c5f48028e1917e9fc7e467"
     }
   },
   "screenshots": {
@@ -50,36 +50,36 @@
       "sha256": "e6b4f7a170cee00fade84de918a717c8926cfe40f80c3d98d567bd5e8b1be245"
     },
     "data-pipeline.png": {
-      "bytes": 156767,
-      "sha256": "f19b207673e45f5f72baa45f7ce86cac399e536282de0157e603bdfff6641d5a"
+      "bytes": 156839,
+      "sha256": "8f1ef197e4d96b1810081b280f424169b9d46c5ea1855a4652be58014ea4a2fa"
     },
     "data-table.png": {
-      "bytes": 101229,
-      "sha256": "154d6ac5f2e860d39b5e13bb8e69738ebbbf5a965c34952b9e52dc31b03749ee"
+      "bytes": 101351,
+      "sha256": "887f6412ca5e91c67e6b628247e44d85178dda28428228f47dd9b5449721cfc3"
     },
     "history.png": {
-      "bytes": 124526,
-      "sha256": "3d5a52aff131d8cac94adf54982e25be0a28a92073247bae5821a06f39c44646"
+      "bytes": 124512,
+      "sha256": "dede327206cf533ead9a10e6e59bf5a5cc1dfc0f5bf7ff1214ac484974686e81"
     },
     "posix-habits.png": {
-      "bytes": 136482,
-      "sha256": "520ca2da76153a9baa10cb73916f5ca7b11fff744b5ac87d277cebae6d678d6a"
+      "bytes": 136629,
+      "sha256": "0e2ccc9539b3efa90e5956beb71d1e2d0d84387f2912771a41432cd6d4f96ae7"
     }
   },
-  "review_method": "AI visual inspection of contact sheets sampled every 4 seconds across the complete MP4, of the poster frame, and of every screenshot at full resolution. MP4, WebM, and GIF decoded without errors. VHS screen assertions verified startup and each title card.",
+  "review_method": "AI visual inspection of contact sheets sampled every 4 seconds across the complete MP4, of the poster frame at full resolution, and of every screenshot in a montage at three quarters of full size. MP4, WebM, and GIF decoded without errors. VHS screen assertions verified startup and each title card.",
   "physical_terminal_qa": false,
   "human_qa": false,
   "official_release_profile": true,
   "artifact_origin": "published_release_asset",
-  "release_workflow_run_id": 42885038548,
-  "release_package_file": "quirl-v0.6.1-aarch64-apple-darwin.tar",
-  "release_package_sha256": "4af60e7c0954613da38e95b771ff3b998deacecd21be8f2f8e48a2a13cb9f8fc",
-  "release_package_provenance_sha256": "fc68512f705a4c0f806a89ad3f0fcc88da71b0ae0665fb627ce89ea3e952d43f",
-  "native_performance_report_sha256": "e756a65e0b80451f227deb1806e178d16edbf3676aa7d21d58f92d50dcf5a0c8",
+  "release_workflow_run_id": 43185798988,
+  "release_package_file": "quirl-v0.7.0-aarch64-apple-darwin.tar",
+  "release_package_sha256": "07fcd148d4b5a8c9c469b7963dda9dc21c8caaa788b7a06e12cc29641c16d128",
+  "release_package_provenance_sha256": "f6485eb91159f6b27189a9571a31f32b87c797ec45e1a88037aa6efa2cb9119d",
+  "native_performance_report_sha256": "a759a74e6404212ede8192859a5f426548985061177c88ebbebfa99d4d729494",
   "published_release_asset": true,
-  "artifact_scope": "Recorded the exact executable installed by Homebrew from the macOS ARM package published in the immutable v0.6.1 GitHub release. Its digest matches the passing native performance report.",
+  "artifact_scope": "Recorded the exact executable installed by Homebrew from the macOS ARM package published in the immutable v0.7.0 GitHub release. Its digest matches the passing native performance report.",
   "session_scope": "Isolated temporary HOME, config, history, plugin directories, cache, a small Git repository, and a .env file. Real PTY and key input through VHS/ttyd. No authenticated AI planning was invoked.",
   "presentation_notes": "The loop is typed out of view and appears whole, as a paste would. The agent line ends with an echo because ssh-add -l exits 1 when the new agent holds no keys. Ctrl-L hides earlier output from view in this version.",
-  "release_url": "https://github.com/niklas-heer/quirl/releases/tag/v0.6.1",
-  "release_asset_url": "https://github.com/niklas-heer/quirl/releases/download/v0.6.1/quirl-v0.6.1-aarch64-apple-darwin.tar"
+  "release_url": "https://github.com/niklas-heer/quirl/releases/tag/v0.7.0",
+  "release_asset_url": "https://github.com/niklas-heer/quirl/releases/download/v0.7.0/quirl-v0.7.0-aarch64-apple-darwin.tar"
 }

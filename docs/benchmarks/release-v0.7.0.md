@@ -1,0 +1,67 @@
+# Quirl 0.7.0 native release evidence
+
+Recorded 2026-11-12 for the published [v0.7.0 release](https://github.com/niklas-heer/quirl/releases/tag/v0.7.0). All four native artifacts passed the enforcing release benchmark on their first attempt, with 101 successful PTY samples each. These results measure the exact published executables on the hosted runners below; they do not establish universal latency guarantees.
+
+## Release identity
+
+- Candidate and resolved tag commit: `bbfc8259c7cdea2044b1d804f76a388aacb39b31`.
+- Native build and performance run: [43185798988](https://github.com/niklas-heer/quirl/actions/runs/43185798988).
+- GitHub release ID: `442712045`; published at `2026-11-12T09:12:19Z` as a nondraft, non-prerelease, immutable release.
+- [Release manifest](https://github.com/niklas-heer/quirl/releases/download/v0.7.0/release-manifest-v1.json) SHA-256: `d27319457af49961e6c7f3cd12578d6005d2b151d2112a7f527e1f74f3e3a7f8`. Release notes SHA-256: `4be4d3d2c25429c2aa94c2ca518914ecc2ba5ec9bac490d1068f5c5953f37899`.
+- Every entry in the bundle's `SHA256SUMS` verified before publication was approved. All 15 published assets were downloaded afterwards and matched the reviewed bundle byte for byte, and the four formula hashes in [tap PR 48](https://github.com/niklas-heer/homebrew-tap/pull/48) matched the archives.
+
+Each report records the candidate as its clean source revision, with artifact digest, profile, source, and harness identity checks passing.
+
+## Native results
+
+All values below are milliseconds except executable bytes. Limits were startup P50 ≤25 ms, first-prompt paint P95 ≤21 ms, and keystroke-to-frame P95 ≤8 ms. Each row completed 101 of 101 requested PTY samples with no recorded sample failure.
+
+| Target | Executable bytes | Startup P50 | First-prompt P95 | Keystroke P95 | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Linux ARM64 | 12,820,968 | 5.968836 | 4.437939 | 0.514188 | Pass |
+| Linux x86_64 | 14,982,840 | 6.276555 | 4.665788 | 0.505195 | Pass |
+| macOS ARM64 | 10,894,768 | 13.607250 | 15.766375 | 1.248958 | Pass |
+| macOS x86_64 | 13,158,768 | 12.523410 | 12.131567 | 1.273134 | Pass |
+
+Size follows [ADR 0036](../decisions/2026-09-05_192326199_track-release-binary-size-without-a-project-hard-ceiling.md): there is no default executable-size ceiling, and every size above the advisory 8 MiB threshold retained its warning.
+
+The macOS x86_64 startup P50 fell from 19.51 ms in 0.6.1 to 12.52 ms, close to where the macOS ARM64 runner measured, and the macOS ARM64 first-prompt P95 fell from 17.86 ms to 15.77 ms. The source change between the releases is the variable import after `source`, `.`, `eval`, and POSIX islands, which is not on the startup path, so the reports alone do not attribute either difference to Quirl. The Linux x86_64 runner again reported a different CPU than for the previous release.
+
+## Runners and toolchain
+
+| Target | GitHub runner label | CPU reported by harness | Logical CPUs | Operating system |
+| --- | --- | --- | ---: | --- |
+| Linux ARM64 | `ubuntu-24.04-arm` | unknown | 4 | Ubuntu 24.04.5 LTS |
+| Linux x86_64 | `ubuntu-24.04` | AMD EPYC 9V74 80-Core Processor | 4 | Ubuntu 24.04.5 LTS |
+| macOS ARM64 | `macos-15` | Apple M1 (Virtual) | 3 | macOS 15.8.2 (24H232) |
+| macOS x86_64 | `macos-15-intel` | Intel(R) Core(TM) i7-8700B CPU @ 3.20GHz | 4 | macOS 15.7.9 (24G830) |
+
+All builds used Rust 1.99.0 (b940084d7 2026-09-28) and LLVM 23.1.1 with the official release profile: optimization `z`, fat LTO, one codegen unit, stripped symbols, and `panic = "unwind"`.
+
+## Exact report files
+
+These are byte-for-byte copies of the reports uploaded by the passing native jobs.
+
+| Target and exact report | JSON SHA-256 | Native job |
+| --- | --- | --- |
+| [aarch64-unknown-linux-gnu](https://quirl.vercel.app/release-evidence/v0.7.0/aarch64-unknown-linux-gnu.json) | `abf02141881544b7d8f356a9fe800b72940499e767677930fc29e9851f3eabfb` | [131076614519](https://github.com/niklas-heer/quirl/actions/runs/43185798988/job/131076614519) |
+| [x86_64-unknown-linux-gnu](https://quirl.vercel.app/release-evidence/v0.7.0/x86_64-unknown-linux-gnu.json) | `8fb54a12dad19e3f7788c76290b028654deb0f025f7c825b7c602ca9342de535` | [131076614353](https://github.com/niklas-heer/quirl/actions/runs/43185798988/job/131076614353) |
+| [aarch64-apple-darwin](https://quirl.vercel.app/release-evidence/v0.7.0/aarch64-apple-darwin.json) | `a759a74e6404212ede8192859a5f426548985061177c88ebbebfa99d4d729494` | [131076614281](https://github.com/niklas-heer/quirl/actions/runs/43185798988/job/131076614281) |
+| [x86_64-apple-darwin](https://quirl.vercel.app/release-evidence/v0.7.0/x86_64-apple-darwin.json) | `137a34bbf99a4edb1413fa1f56033825e15f39bf2a21c1965eb87200e87248ae` | [131076614339](https://github.com/niklas-heer/quirl/actions/runs/43185798988/job/131076614339) |
+
+## Published executable hashes
+
+Each digest below is the `bin/quirl` executable inside the published archive. It equals the digest the passing report measured.
+
+| Target | Executable SHA-256 |
+| --- | --- |
+| aarch64-unknown-linux-gnu | `5b1120232387dd55341ea2a36e40016311208ff6032d0ef71084d00a27dc2ae6` |
+| x86_64-unknown-linux-gnu | `cf076095c8b77416f1041adccab783d394c626cbd9d72f47488d6da25dda17b4` |
+| aarch64-apple-darwin | `c2ddc1772bf4b8540426ff8857558078681f2bbf6a7be2c9f616e94b30c99a6c` |
+| x86_64-apple-darwin | `4379340f2d64e1f0d16d23f06e8e24b0bba18999c9857877db1aee4ffaa7bf7d` |
+
+## Method and limitations
+
+The PTY harness uses a private, initially empty home, configuration, history, catalog, project database, and XDG directories shared across its samples. Each sample starts a fresh native process in a 120×40 terminal, answers cursor-position queries, reconstructs the screen, checks the prompt and exact binary identity, then proves editability. Percentiles use nearest-rank selection. Hosted scheduling, virtualization, CPU frequency, other machine load, and filesystem caches are not controlled beyond the documented indexing and settling steps. The reconstructed PTY frame does not measure physical terminal-emulator scheduling or display. This automated evidence does not cover every terminal, visual accessibility scenario, clipboard, IME, or sustained human session, and no human checklist item is inferred from it.
+
+The website [recording](https://quirl.vercel.app/quirl-demo.mp4), its poster, and the README and website screenshots were recorded from the published macOS ARM64 executable of this release, SHA-256 `c2ddc1772bf4b8540426ff8857558078681f2bbf6a7be2c9f616e94b30c99a6c`, through `scripts/record-demo.sh`; [their provenance](https://quirl.vercel.app/quirl-demo-provenance.json) records every digest.

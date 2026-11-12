@@ -26,7 +26,7 @@ export default function HomePage() {
       <section className="hero">
         <div className="pill">
           <span className="dot" />
-          v0.6.1 · Linux and macOS
+          v0.7.0 · Linux and macOS
         </div>
         <p className="kicker">A well-stirred shell</p>
         <h1 className="glitch-h1">
@@ -67,18 +67,18 @@ export default function HomePage() {
       <div className="demo-wrap">
         <div
           className="cassette demo-cassette"
-          aria-label="Quirl v0.6.1 recording"
+          aria-label="Quirl v0.7.0 recording"
         >
           <div className="cassette-label">
-            <span>SIDE A — QUIRL v0.6.1</span>
+            <span>SIDE A — QUIRL v0.7.0</span>
             <CassetteReels />
           </div>
           <HeroDemo />
           <p id="demo-recording-context" style={{ padding: '1rem', margin: 0 }}>
-            Recorded with the published macOS ARM release package for v0.6.1 from commit <code>d09b2da</code>.
+            Recorded with the published macOS ARM release package for v0.7.0 from commit <code>bbfc825</code>.
             {' '}See the <a href="/quirl-demo-provenance.json">recording provenance</a>,
             {' '}<Link href="/docs/getting-started/first-session">first-session guide</Link>,
-            {' '}and <Link href="/docs/research/benchmarks/release-v0.6.1">release measurements</Link>.
+            {' '}and <Link href="/docs/research/benchmarks/release-v0.7.0">release measurements</Link>.
           </p>
         </div>
       </div>
@@ -159,7 +159,7 @@ export default function HomePage() {
         <div className="section-heading">
           <h2 id="gallery-title">Real sessions, real output.</h2>
           <p>
-            Every image comes from the published v0.6.1 release binary running
+            Every image comes from the published v0.7.0 release binary running
             an isolated demo workspace.
           </p>
         </div>

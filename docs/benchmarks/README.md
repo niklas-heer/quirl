@@ -2,6 +2,7 @@
 
 Release measurements apply to one exact executable, source revision, harness, and runner. A later documentation commit records that evidence without rebuilding or relabeling the released artifact.
 
+- [Quirl 0.7.0 native release evidence](release-v0.7.0.md): all four published native executables passing on their first attempt.
 - [Quirl 0.6.1 native release evidence](release-v0.6.1.md): all four published native executables passing on their first attempt.
 - [Quirl 0.6.0 native release evidence](release-v0.6.0.md): all four published native executables passing on their first attempt.
 - [Quirl 0.5.1 native release evidence](release-v0.5.1.md): all four published native executables passing on their first attempt, with the recording and screenshots made from the macOS ARM64 executable.
